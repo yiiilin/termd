@@ -4,6 +4,7 @@
 //! pairing/auth/session/control 的最终业务判断仍只在 daemon 内执行。
 
 mod args;
+mod installer_helper;
 mod router;
 mod ws;
 
@@ -23,6 +24,10 @@ use crate::ws::{RelayDaemonCredential, RelayState};
 
 #[derive(Debug, Error)]
 enum MainError {
+    #[error(transparent)]
+    InstallHelperProtocol(#[from] terminstall::InternalHelperError),
+    #[error(transparent)]
+    InstallHelper(#[from] installer_helper::InstallerHelperError),
     #[error(transparent)]
     Install(#[from] terminstall::Error),
     #[error(transparent)]
@@ -57,14 +62,22 @@ struct TlsPaths {
     key_path: PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), MainError> {
+fn main() -> Result<(), MainError> {
     install_rustls_crypto_provider();
+    if let Some(request) = terminstall::internal_helper_request(std::env::args_os())? {
+        installer_helper::run(request)?;
+        return Ok(());
+    }
     if let Some(options) = installer_options(std::env::args_os()) {
         terminstall::run(terminstall::Component::Termrelay, options)?;
         return Ok(());
     }
 
+    runtime_main()
+}
+
+#[tokio::main]
+async fn runtime_main() -> Result<(), MainError> {
     init_tracing();
 
     let args = match RelayCommand::from_env()? {

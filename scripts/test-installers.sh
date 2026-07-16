@@ -105,12 +105,45 @@ grep -Fq 'Validate exact release asset set' "${ROOT_DIR}/.github/workflows/relea
 ! grep -Eq 'sha256sum .*checksums\.txt' "${ROOT_DIR}/.github/workflows/release.yml"
 ! grep -Eq 'gh release (upload|create).*install-.*\.sh' "${ROOT_DIR}/.github/workflows/release.yml"
 grep -Fq 'releases/latest/download/${asset}' "${ROOT_DIR}/README.md"
-grep -Fq 'releases/latest/download/${asset}' "${ROOT_DIR}/docs/installation.md"
-grep -Fq 'sudo termrelay upgrade' "${ROOT_DIR}/docs/installation.md"
-grep -Fq 'sudo termd upgrade' "${ROOT_DIR}/docs/installation.md"
+grep -Fq '### 1. 安装 termrelay' "${ROOT_DIR}/README.md"
+grep -Fq '### 2. 安装 termd' "${ROOT_DIR}/README.md"
+grep -Fq '### 3. 安装 termctl' "${ROOT_DIR}/README.md"
+[[ "$(grep -Fc 'trap '\''rm -f -- "$tmp"'\'' EXIT' "${ROOT_DIR}/README.md")" -eq 3 ]]
+[[ "$(grep -Fc 'sudo "$tmp" install' "${ROOT_DIR}/README.md")" -eq 3 ]]
+python3 - "${ROOT_DIR}/README.md" <<'PY'
+import pathlib
+import sys
+
+readme = pathlib.Path(sys.argv[1]).read_text()
+for number, component in enumerate(("termrelay", "termd", "termctl"), start=1):
+    heading = f"### {number}. 安装 {component}"
+    section = readme.split(heading, 1)[1]
+    block = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    lines = [line for line in block.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise SystemExit(f"{heading} must contain exactly one physical shell command line")
+    command = lines[0]
+    required = (
+        "(set -eu;",
+        'case "$(uname -m)" in',
+        f'asset="{component}-linux-${{arch}}"',
+        'tmp="$(mktemp)"',
+        'trap \'rm -f -- "$tmp"\' EXIT',
+        "curl --proto '=https' --tlsv1.2 -fL",
+        'sudo "$tmp" install)',
+    )
+    missing = [fragment for fragment in required if fragment not in command]
+    if missing:
+        raise SystemExit(f"{heading} is missing safe installer fragments: {missing}")
+PY
+! grep -Fq 'python3' "${ROOT_DIR}/README.md"
+grep -Fq 'sudo termrelay upgrade' "${ROOT_DIR}/README.md"
+grep -Fq 'sudo termd upgrade' "${ROOT_DIR}/README.md"
 ! grep -Fq 'sha256sum --ignore-missing --check checksums.txt' "${ROOT_DIR}/README.md"
-! grep -Fq 'sha256sum --ignore-missing --check checksums.txt' "${ROOT_DIR}/docs/installation.md"
-! grep -Fq 'releases/latest/download/install-termd.sh' "${ROOT_DIR}/docs/installation.md"
+! grep -Fq 'releases/latest/download/install-termd.sh' "${ROOT_DIR}/README.md"
+test ! -e "${ROOT_DIR}/docs/installation.md"
+! grep -Fq 'installation.md' "${ROOT_DIR}/README.md"
+! grep -Fq 'installation.md' "${ROOT_DIR}/docs/deployment.md"
 test -s "${ROOT_DIR}/SUPERVISOR_VERSION"
 python3 - "${ROOT_DIR}" <<'PY'
 import json
@@ -285,9 +318,9 @@ test_termctl_embedded_self_binary_is_strict_and_isolated() (
     output="$(
       exec {self_binary_fd}<"$pinned_binary"
       TERMD_INSTALL_PREFIX="${root}/rejected-prefix" \
-        TERMD_VERSION=0.8.2 \
-        TERMD_INSTALL_SELF_MODE=embedded-v1 \
-        TERMD_INSTALL_SELF_BINARY="/proc/${BASHPID}/fd/${self_binary_fd}" \
+      TERMD_VERSION=0.8.2 \
+      TERMD_INSTALL_SELF_MODE=embedded-v1 \
+      TERMD_INSTALL_SELF_BINARY="/proc/${BASHPID}/fd/${self_binary_fd}" \
         SELF_ENV_PROBE="${root}/rejected-probe" \
         SELF_BINARY_VERSION="$reported_version" \
         bash -c '
@@ -444,6 +477,7 @@ test_termrelay_embedded_self_binary_stages_in_isolation() (
     TERMD_VERSION=0.8.2 \
       TERMD_INSTALL_SELF_MODE=embedded-v1 \
       TERMD_INSTALL_SELF_BINARY="/proc/${BASHPID}/fd/${self_binary_fd}" \
+      TERMD_INSTALL_HELPER_NONCE=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
       TERMD_INSTALL_ARG_SETUP_TOKEN_FILE="$setup_token" \
       TERMD_INSTALL_ARG_TLS_KEY="$tls_key" \
       SELF_ENV_PROBE="$probe" \
@@ -494,6 +528,7 @@ test_termd_embedded_self_binary_stages_in_isolation() (
     TERMD_VERSION=0.8.2 \
       TERMD_INSTALL_SELF_MODE=embedded-v1 \
       TERMD_INSTALL_SELF_BINARY="/proc/${BASHPID}/fd/${self_binary_fd}" \
+      TERMD_INSTALL_HELPER_NONCE=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
       TERMD_INSTALL_ARG_RELAY_URL="$relay" \
       TERMD_INSTALL_ARG_RELAY_DAEMON_TOKEN_FILE="$daemon_token" \
       TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN="$setup_token" \
@@ -526,6 +561,65 @@ test_termd_embedded_self_binary_stages_in_isolation() (
   [[ -x "$candidate" ]]
   cmp "$source_binary" "$candidate"
   [[ ! -s "$probe" ]]
+)
+
+test_embedded_service_installers_run_without_python3() (
+  local root mock_bin component script self_binary output status command_path
+  root="$(mktemp -d)"
+  trap 'rm -rf "$root"' EXIT
+  mock_bin="${root}/bin"
+  mkdir -p "$mock_bin"
+  for component in install systemctl useradd mktemp; do
+    command_path="$(command -v "$component")"
+    ln -s "$command_path" "${mock_bin}/${component}"
+  done
+
+  for component in termrelay termd; do
+    script="${ROOT_DIR}/scripts/install-${component}.sh"
+    self_binary="${root}/${component}"
+    printf '%s\n' \
+      '#!/bin/bash' \
+      'if [[ "${1:-}" == "--version" ]]; then printf "%s 0.8.2\n" "'"$component"'"; exit 0; fi' \
+      'exit 64' >"$self_binary"
+    chmod 0755 "$self_binary"
+
+    set +e
+    output="$(
+      exec {self_binary_fd}<"$self_binary"
+      ROOT_DIR="$ROOT_DIR" \
+        TERMD_VERSION=0.8.2 \
+        TERMD_INSTALL_SELF_MODE=embedded-v1 \
+        TERMD_INSTALL_SELF_BINARY="/proc/${BASHPID}/fd/${self_binary_fd}" \
+        TERMD_INSTALL_HELPER_NONCE=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+        INSTALLER_TEST_PATH="$mock_bin" \
+        /bin/bash -c '
+          PATH="$INSTALLER_TEST_PATH"
+          export PATH
+          source <(/bin/sed '\''/^main "\$@"/,$d'\'' "$1")
+          require_root() { :; }
+          inherit_existing_service_identity() { :; }
+          resolve_service_identity() { :; }
+          resolve_supervisor_version() { :; }
+          assert_session_ownership_quiescent() { :; }
+          ensure_system_user() { :; }
+          install_from_self_binary() { : >"$1"; }
+          build_install_candidates() { :; }
+          install_staged_candidate() { :; }
+          cleanup_install_staging() { /bin/rm -rf "${INSTALL_STAGING_DIR:-}"; }
+          complete_post_install() { :; }
+          print_relay_setup_token() { :; }
+          main
+        ' bash "$script" 2>&1
+    )"
+    status=$?
+    set -e
+
+    if [[ "$status" -ne 0 ]]; then
+      printf '%s embedded install failed without python3:\n%s\n' "$component" "$output" >&2
+      return 1
+    fi
+    [[ "$output" != *"missing required command: python3"* ]]
+  done
 )
 
 test_termd_installer_supports_stdin_pipe_execution() (
@@ -3808,6 +3902,7 @@ run_test test_termctl_embedded_self_binary_is_strict_and_isolated
 run_test test_termctl_self_install_replacement_is_atomic
 run_test test_termrelay_embedded_self_binary_stages_in_isolation
 run_test test_termd_embedded_self_binary_stages_in_isolation
+run_test test_embedded_service_installers_run_without_python3
 run_test test_termd_fresh_install_initializes_schema_before_supervisor_baseline
 run_test test_termd_reinstall_recovers_installer_poisoned_state
 run_test test_termd_poisoned_state_repair_never_modifies_user_state

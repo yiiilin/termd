@@ -117,8 +117,8 @@ Installer network access honors http_proxy, https_proxy, all_proxy and no_proxy,
 plus their uppercase variants. Lowercase values take precedence when both are set.
 
 Examples:
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh | sudo bash
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termctl.sh | sudo bash -s -- --uninstall
+  sudo termctl install
+  sudo termctl uninstall
 EOF
 }
 

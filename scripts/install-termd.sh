@@ -63,6 +63,10 @@ SELF_INSTALL_BINARY_SET=0
 SELF_INSTALL_ENABLED=0
 SELF_INSTALL_MODE=""
 SELF_INSTALL_BINARY=""
+INSTALL_HELPER_NONCE_SET=0
+INSTALL_HELPER_NONCE=""
+INSTALL_HELPER_VERIFY_SET=0
+INSTALL_HELPER_VERIFY=0
 INSTALL_ALLOW_SESSION_LOSS=0
 INTERNAL_INSTALL_ARGUMENT_INVALID=0
 INTERNAL_INSTALL_ARGUMENTS_PRESENT=0
@@ -80,6 +84,14 @@ fi
 if [[ -v TERMD_INSTALL_SELF_BINARY ]]; then
   SELF_INSTALL_BINARY_SET=1
   SELF_INSTALL_BINARY="$TERMD_INSTALL_SELF_BINARY"
+fi
+if [[ -v TERMD_INSTALL_HELPER_NONCE ]]; then
+  INSTALL_HELPER_NONCE_SET=1
+  INSTALL_HELPER_NONCE="$TERMD_INSTALL_HELPER_NONCE"
+fi
+if [[ -v TERMD_INSTALL_VERIFY_HELPER ]]; then
+  INSTALL_HELPER_VERIFY_SET=1
+  INSTALL_HELPER_VERIFY="$TERMD_INSTALL_VERIFY_HELPER"
 fi
 if [[ -v TERMD_INSTALL_ARG_RELAY_URL ]]; then
   INTERNAL_INSTALL_ARGUMENTS_PRESENT=1
@@ -111,7 +123,8 @@ if [[ -v TERMD_INSTALL_ARG_TLS_KEY ]]; then
   INTERNAL_ARG_TLS_KEY="$TERMD_INSTALL_ARG_TLS_KEY"
   [[ -n "$INTERNAL_ARG_TLS_KEY" ]] || INTERNAL_INSTALL_ARGUMENT_INVALID=1
 fi
-unset TERMD_INSTALL_SELF_MODE TERMD_INSTALL_SELF_BINARY TERMD_INSTALL_ASSUME_YES
+unset TERMD_INSTALL_SELF_MODE TERMD_INSTALL_SELF_BINARY TERMD_INSTALL_ASSUME_YES TERMD_INSTALL_HELPER_NONCE
+unset TERMD_INSTALL_VERIFY_HELPER
 unset TERMD_INSTALL_ARG_RELAY_URL TERMD_INSTALL_ARG_RELAY_DAEMON_TOKEN_FILE
 unset TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN_FILE TERMD_INSTALL_ARG_PROXY TERMD_INSTALL_ARG_TLS_KEY
 unset TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN
@@ -177,12 +190,16 @@ validate_internal_install_request() {
     die "embedded self-install identity is invalid"
   fi
   if [[ "$SELF_INSTALL_MODE_SET" -eq 0 ]]; then
-    [[ "$INTERNAL_INSTALL_ARGUMENTS_PRESENT" -eq 0 ]] || die "embedded installer arguments are invalid"
+    [[ "$INTERNAL_INSTALL_ARGUMENTS_PRESENT" -eq 0 && "$INSTALL_HELPER_NONCE_SET" -eq 0 && "$INSTALL_HELPER_VERIFY_SET" -eq 0 ]] || die "embedded installer arguments are invalid"
     return 0
   fi
 
   SELF_INSTALL_ENABLED=1
   [[ "$SELF_INSTALL_MODE" == "embedded-v1" ]] || die "embedded self-install identity is invalid"
+  [[ "$INSTALL_HELPER_NONCE_SET" -eq 1 && "$INSTALL_HELPER_NONCE" =~ ^[0-9a-f]{64}$ ]] || die "embedded self-install identity is invalid"
+  if [[ "$INSTALL_HELPER_VERIFY_SET" -eq 1 ]]; then
+    [[ "$INSTALL_HELPER_VERIFY" == "1" && "$INTERNAL_INSTALL_ARGUMENTS_PRESENT" -eq 0 ]] || die "embedded installer arguments are invalid"
+  fi
   [[ -n "$VERSION" ]] || die "embedded self-install identity is invalid"
   if [[ ! "$SELF_INSTALL_BINARY" =~ ^/proc/([0-9]+)/fd/([0-9]+)$ ]] || \
     [[ "${BASH_REMATCH[1]}" != "$PPID" ]]; then
@@ -194,6 +211,13 @@ validate_internal_install_request() {
     die "embedded self-install identity is invalid"
   fi
   [[ "$reported_version" == "$BIN_NAME $VERSION" ]] || die "embedded self-install identity is invalid"
+}
+
+run_installer_helper() {
+  [[ "$SELF_INSTALL_ENABLED" -eq 1 ]] || die "internal installer helper is unavailable outside embedded installation"
+  TERMD_INSTALL_HELPER_NONCE="$INSTALL_HELPER_NONCE" \
+    TERMD_INSTALL_HELPER_SELF_BINARY="$SELF_INSTALL_BINARY" \
+    "$SELF_INSTALL_BINARY" __terminstall-helper-v1 "$@"
 }
 
 apply_internal_install_arguments() {
@@ -333,11 +357,10 @@ Installer network access honors http_proxy, https_proxy, all_proxy and no_proxy,
 plus their uppercase variants. Lowercase values take precedence when both are set.
 
 Examples:
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web --user alice
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web --listen 0.0.0.0:8765
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --web --supervisor-version 0.1.0
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termd.sh | sudo bash -s -- --uninstall
+  sudo termd install
+  sudo termd install --web --user alice
+  sudo termd install --web --listen 0.0.0.0:8765
+  sudo termd uninstall
 EOF
 }
 
@@ -504,6 +527,11 @@ read_sqlite_meta_value() {
 
   [[ -f "$sqlite_path" ]] || return 0
 
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    run_installer_helper sqlite-meta-read "$sqlite_path" "$key"
+    return
+  fi
+
   python3 - "$sqlite_path" "$key" <<'PY'
 import sqlite3
 import sys
@@ -531,6 +559,11 @@ upsert_sqlite_meta_value() {
   local sqlite_path="$1"
   local key="$2"
   local value="$3"
+
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    run_installer_helper sqlite-meta-upsert "$sqlite_path" "$key" "$value"
+    return
+  fi
 
   python3 - "$sqlite_path" "$key" "$value" <<'PY'
 import sqlite3
@@ -574,6 +607,10 @@ repair_installer_poisoned_state_db() {
   local supervisor_dir="$2"
 
   [[ -f "$sqlite_path" ]] || return 1
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    run_installer_helper sqlite-repair-installer-state "$sqlite_path" "$supervisor_dir"
+    return
+  fi
   python3 - "$sqlite_path" "$supervisor_dir" <<'PY'
 import sqlite3
 import stat
@@ -642,6 +679,11 @@ sqlite_has_runtime_sessions() {
   local sqlite_path="$1"
 
   [[ -f "$sqlite_path" ]] || return 1
+
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    [[ "$(run_installer_helper sqlite-has-runtime-sessions "$sqlite_path")" == "true" ]]
+    return
+  fi
 
   python3 - "$sqlite_path" <<'PY'
 import sqlite3
@@ -864,6 +906,10 @@ write_service_secret_file() {
 }
 
 generate_secret_token() {
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    run_installer_helper generate-secret-token
+    return
+  fi
   python3 - <<'PY'
 import secrets
 
@@ -984,6 +1030,10 @@ clear_runtime_session_state() {
   local _supervisor_dir="$2"
 
   if [[ -f "$sqlite_path" ]]; then
+    if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+      run_installer_helper sqlite-clear-runtime-state "$sqlite_path"
+      return
+    fi
     python3 - "$sqlite_path" <<'PY'
 import sqlite3
 import sys
@@ -1042,6 +1092,11 @@ terminate_session_supervisors() {
   local supervisor_dir="$1"
 
   [[ -d "$supervisor_dir" ]] || return 0
+
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    run_installer_helper terminate-session-supervisors "$supervisor_dir"
+    return
+  fi
 
   python3 - "$supervisor_dir" <<'PY'
 import os
@@ -1148,6 +1203,9 @@ clear_runtime_session_state_for_supervisor_upgrade() {
   terminate_session_supervisors "$supervisor_dir"
 
   if [[ -f "$sqlite_path" ]]; then
+    if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+      run_installer_helper sqlite-clear-all-session-state "$sqlite_path"
+    else
     python3 - "$sqlite_path" <<'PY'
 import sqlite3
 import sys
@@ -1172,6 +1230,7 @@ try:
 finally:
     conn.close()
 PY
+    fi
   fi
 
   if [[ -d "$supervisor_dir" ]]; then
@@ -1230,7 +1289,11 @@ assert_session_ownership_quiescent() {
   [[ -f "$sqlite_path" ]] || return 0
 
   local pending
-  if ! pending="$(python3 - "$sqlite_path" <<'PY'
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    if ! pending="$(run_installer_helper sqlite-pending-ownership-count "$sqlite_path")"; then
+      die "failed to run the read-only session ownership rollback precheck for ${sqlite_path}; installed binary was not changed"
+    fi
+  elif ! pending="$(python3 - "$sqlite_path" <<'PY'
 import sqlite3
 import sys
 from pathlib import Path
@@ -1728,6 +1791,11 @@ local_pairing_base_url() {
   local listen="$1"
   local scheme="$2"
 
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    printf '%s' "$listen" | run_installer_helper local-pairing-base-url "$scheme"
+    return
+  fi
+
   python3 - "$listen" "$scheme" <<'PY'
 import ipaddress
 import sys
@@ -1763,6 +1831,11 @@ PY
 get_local_healthz() {
   local endpoint="$1"
 
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    printf '%s' "$endpoint" | run_installer_helper local-health-get
+    return
+  fi
+
   python3 - "$endpoint" <<'PY'
 from urllib.request import urlopen, Request
 import sys
@@ -1780,6 +1853,11 @@ PY
 relay_api_url() {
   local relay_url="$1"
   local api_path="$2"
+
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    printf '%s' "$relay_url" | run_installer_helper relay-api-url "$api_path"
+    return
+  fi
 
   python3 - "$relay_url" "$api_path" <<'PY'
 from urllib.parse import urlsplit, urlunsplit
@@ -1863,6 +1941,7 @@ relay_connection_verification_requested() {
 register_daemon_with_relay() (
   local health_response="$1"
   local server_id daemon_public_key relay_url register_url setup_token tmp_dir header_file payload_file
+  local -a identity=()
   tmp_dir=""
   setup_token=""
   export -n TERMD_RELAY_SETUP_TOKEN setup_token
@@ -1892,8 +1971,15 @@ register_daemon_with_relay() (
   fi
 
   # daemon registry 只接收稳定身份材料，不注册或同步 pair/device/access credential。
-  server_id="$(printf '%s' "$health_response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["server_id"])')" || return 1
-  daemon_public_key="$(printf '%s' "$health_response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["daemon_public_key"])')" || return 1
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    mapfile -t identity < <(printf '%s' "$health_response" | run_installer_helper health-identity) || return 1
+    [[ "${#identity[@]}" -eq 2 ]] || return 1
+    server_id="${identity[0]}"
+    daemon_public_key="${identity[1]}"
+  else
+    server_id="$(printf '%s' "$health_response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["server_id"])')" || return 1
+    daemon_public_key="$(printf '%s' "$health_response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["daemon_public_key"])')" || return 1
+  fi
   read -r -a relay_urls <<<"${TERMD_RELAY_URLS}"
   relay_url="${relay_urls[0]:-}"
   [[ -n "$relay_url" ]] || return 0
@@ -1919,9 +2005,15 @@ register_daemon_with_relay() (
     log "failed to secure temporary directory for relay registration"
     return 1
   fi
+  umask 077
   header_file="${tmp_dir}/headers"
   payload_file="${tmp_dir}/register.json"
-  if ! python3 - "$server_id" "$daemon_public_key" "$TERMD_RELAY_DAEMON_TOKEN_FILE" >"$payload_file" <<'PY'
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    if ! printf '%s' "$health_response" | run_installer_helper relay-registration-payload "$TERMD_RELAY_DAEMON_TOKEN_FILE" >"$payload_file"; then
+      log "failed to prepare relay registration payload"
+      return 1
+    fi
+  elif ! python3 - "$server_id" "$daemon_public_key" "$TERMD_RELAY_DAEMON_TOKEN_FILE" >"$payload_file" <<'PY'
 import json
 import sys
 
@@ -1957,6 +2049,7 @@ PY
 verify_daemon_relay_connected() (
   local health_response="$1"
   local server_id relay_url status_url setup_token tmp_dir header_file payload_file response connected
+  local -a identity=()
   tmp_dir=""
   setup_token=""
   export -n TERMD_RELAY_SETUP_TOKEN setup_token
@@ -1972,7 +2065,13 @@ verify_daemon_relay_connected() (
     log "FAILED: relay URL contains CR/LF"
     return 1
   fi
-  server_id="$(printf '%s' "$health_response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["server_id"])')" || return 1
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    mapfile -t identity < <(printf '%s' "$health_response" | run_installer_helper health-identity) || return 1
+    [[ "${#identity[@]}" -eq 2 ]] || return 1
+    server_id="${identity[0]}"
+  else
+    server_id="$(printf '%s' "$health_response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["server_id"])')" || return 1
+  fi
   read -r -a relay_urls <<<"${TERMD_RELAY_URLS}"
   relay_url="${relay_urls[0]:-}"
   [[ -n "$relay_url" ]] || return 0
@@ -2001,9 +2100,15 @@ verify_daemon_relay_connected() (
     log "FAILED: failed to secure temporary directory for relay verification"
     return 1
   fi
+  umask 077
   header_file="${tmp_dir}/headers"
   payload_file="${tmp_dir}/status.json"
-  if ! printf '{"server_id":"%s"}\n' "$server_id" >"$payload_file"; then
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    if ! printf '%s' "$health_response" | run_installer_helper relay-status-payload >"$payload_file"; then
+      log "FAILED: failed to prepare relay verification payload"
+      return 1
+    fi
+  elif ! printf '{"server_id":"%s"}\n' "$server_id" >"$payload_file"; then
     log "FAILED: failed to prepare relay verification payload"
     return 1
   fi
@@ -2021,7 +2126,11 @@ verify_daemon_relay_connected() (
       --header "@${header_file}" \
       --data-binary "@${payload_file}" \
       --url "$status_url" 2>/dev/null)" && \
-      connected="$(printf '%s' "$response" | python3 -c 'import json,sys; payload=json.load(sys.stdin); print("true" if payload.get("server_id") == sys.argv[1] and payload.get("connected") is True else "false")' "$server_id")" && \
+      { if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+          connected="$(printf '%s' "$response" | run_installer_helper relay-status-connected "$server_id")"
+        else
+          connected="$(printf '%s' "$response" | python3 -c 'import json,sys; payload=json.load(sys.stdin); print("true" if payload.get("server_id") == sys.argv[1] and payload.get("connected") is True else "false")' "$server_id")"
+        fi; } && \
       [[ "$connected" == "true" ]]; then
       log "SUCCESS: daemon ${server_id} is connected to relay ${relay_url}"
       return 0
@@ -2180,6 +2289,11 @@ main() {
     die "--allow-session-loss is valid only for installation"
   fi
   validate_internal_install_request
+  if [[ "$INSTALL_HELPER_VERIFY" -eq 1 ]]; then
+    command -v python3 >/dev/null 2>&1 && die "embedded installer self-check PATH unexpectedly contains python3"
+    run_installer_helper self-check >/dev/null
+    return 0
+  fi
   apply_internal_install_arguments
   validate_relay_install_mode
   normalize_proxy_environment
@@ -2192,10 +2306,10 @@ main() {
   fi
 
   require_cmd install
-  require_cmd python3
   require_cmd systemctl
   require_cmd useradd
   if [[ "$SELF_INSTALL_ENABLED" -eq 0 ]]; then
+    require_cmd python3
     require_cmd tar
     require_cmd sha256sum
     [[ -n "$REPO" ]] || die "set TERMD_GITHUB_REPO=owner/repo before running the installer"

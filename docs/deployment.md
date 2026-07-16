@@ -1,6 +1,6 @@
 # 公网部署方案
 
-本文给出 termd / termrelay / Web 的公网部署参考。首次安装、双主机命令、验证、升级和卸载以[安装、升级与卸载](installation.md)为准。核心原则只有一条：**relay 是可信 admission/routing 层，daemon connector 必须已注册，client 认证只接受 daemon 签名的 pair/device/access credential，session/PTY 状态仍只在 daemon。** TLS 在反向代理终止后，relay 可以看到并转发明文 WebSocket/HTTP 应用流量；当前协议不存在运行时 E2EE。pairing、auth 和 session 权限仍由 daemon 最终校验。
+本文给出 termd / termrelay / Web 的公网部署参考。首次安装、双主机命令、升级和卸载以 [README 安装流程](../README.md#安装)为准。核心原则只有一条：**relay 是可信 admission/routing 层，daemon connector 必须已注册，client 认证只接受 daemon 签名的 pair/device/access credential，session/PTY 状态仍只在 daemon。** TLS 在反向代理终止后，relay 可以看到并转发明文 WebSocket/HTTP 应用流量；当前协议不存在运行时 E2EE。pairing、auth 和 session 权限仍由 daemon 最终校验。
 
 ## 推荐拓扑
 
@@ -215,7 +215,7 @@ daemon registry JSON 示例：
 2. 再在 daemon 主机运行 `sudo termd upgrade`，重新加载 Web，并验证已有 session attach。
 3. 使用 CLI 的主机最后运行 `sudo termctl upgrade`。
 
-`upgrade` 严格比较 semver、下载当前 amd64/arm64 裸二进制、校验 GitHub release asset digest，再调用新程序的内嵌 installer 原子替换并重启相关 service。普通升级保留 relay registry、daemon identity、配对设备和配置，不需要重新传 setup token；仅从旧 open relay 进行 breaking admission 迁移时按[公网 trusted relay：两主机流程](installation.md#公网-trusted-relay两主机流程)重新注册。supervisor compatibility 相同时不会清空既有 session；如果 release 确实改变 compatibility，`termd` 会额外说明会话丢失影响并要求独立确认，普通 `--yes` 不会授权该操作。不要根据旧版本号手工删除 session、SQLite 或 supervisor socket。
+`upgrade` 严格比较 semver、下载当前 amd64/arm64 裸二进制、校验 GitHub release asset digest，再调用新程序的内嵌 installer 原子替换并重启相关 service。普通升级保留 relay registry、daemon identity、配对设备和配置，不需要重新传 setup token；仅从旧 open relay 进行 breaking admission 迁移时，按 [README 安装流程](../README.md#安装)重新注册。supervisor compatibility 相同时不会清空既有 session；如果 release 确实改变 compatibility，`termd` 会额外说明会话丢失影响并要求独立确认，普通 `--yes` 不会授权该操作。不要根据旧版本号手工删除 session、SQLite 或 supervisor socket。
 
 ## Health check
 
@@ -225,7 +225,7 @@ daemon registry JSON 示例：
 
 ## 安装入口
 
-使用 release 裸二进制自带的 installer 完成 setup token、daemon token、registry 注册和 systemd 配置，不要手工生成 `server_id` 映射。两台主机的逐步命令和每一步验证统一维护在[安装、升级与卸载](installation.md#公网-trusted-relay两主机流程)，避免从本页的 Nginx 片段误推安装参数。
+使用 release 裸二进制自带的 installer 完成 setup token、daemon token、registry 注册和 systemd 配置，不要手工生成 `server_id` 映射。面向用户的逐步命令统一维护在 [README 安装流程](../README.md#安装)，避免从本页的 Nginx 片段误推安装参数。
 
 同一份 `termd pair --qr` 邀请码可用于 daemon Web 和 relay Web。pair ticket 由 daemon 最终验证，pairing 成功后浏览器保存持久 device certificate，后续请求不再复用 pair ticket。
 
@@ -239,14 +239,14 @@ daemon registry JSON 示例：
 
 ## installer 与 service 行为
 
-release 资产和 GHCR 镜像由同一个 tag 驱动。项目上传的 GitHub Release assets 恰好是 `termd`、`termrelay`、`termctl` 的 Linux amd64 与 arm64 六个裸二进制；项目不上传自有的 `tar.gz`、checksum 文件或 `install-*.sh`。GitHub 自动生成的 Source code（zip/tar.gz）归档不属于项目上传的 assets，也无法由 release workflow 禁用。首次安装按[安装、升级与卸载](installation.md#下载-linux-release)选择架构并运行二进制自带的 installer；仓库中的模板脚本只保留给源码开发和旧自动化兼容，不是 Release 安装入口。
+release 资产和 GHCR 镜像由同一个 tag 驱动。项目上传的 GitHub Release assets 恰好是 `termd`、`termrelay`、`termctl` 的 Linux amd64 与 arm64 六个裸二进制；项目不上传自有的 `tar.gz`、checksum 文件或 `install-*.sh`。GitHub 自动生成的 Source code（zip/tar.gz）归档不属于项目上传的 assets，也无法由 release workflow 禁用。首次安装按 [README 安装流程](../README.md#安装)选择架构并运行二进制自带的 installer；仓库中的模板脚本只保留给源码开发和旧自动化兼容，不是 Release 安装入口。
 
 - `termd` installer 创建 `termd.service` 和 `/etc/termd/termd.env`。`KillMode=process` 使普通 daemon restart 不会把独立 supervisor 一起终止。
 - `termrelay` installer 创建 `termrelay.service`、setup token 和 daemon registry；relay 本身不承担 supervisor 生命周期。
 - `termctl` installer 只安装 CLI 二进制，不创建 service。
 - 当前 auth、control 和六个 file routes 默认启用；installer 不接受旧 `--http-tunnel` 或长期 relay transport token 参数。
 
-面向用户的可复制命令只在[安装、升级与卸载](installation.md)维护。本页不再给出缺少 `--web`、运行用户或双主机注册步骤的简化安装命令。
+面向用户的可复制命令只在 [README 安装流程](../README.md#安装)维护。本页不再给出缺少 `--web`、运行用户或双主机注册步骤的简化安装命令。
 
 回滚到不认识私有 `session_ownership` ledger 的旧 daemon 前，必须确认没有 create 或 cleanup 正在持久收敛。installer 会在替换二进制前执行同等的只读检查；手工回滚可先运行：
 

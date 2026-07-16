@@ -37,6 +37,10 @@ SELF_INSTALL_BINARY_SET=0
 SELF_INSTALL_ENABLED=0
 SELF_INSTALL_MODE=""
 SELF_INSTALL_BINARY=""
+INSTALL_HELPER_NONCE_SET=0
+INSTALL_HELPER_NONCE=""
+INSTALL_HELPER_VERIFY_SET=0
+INSTALL_HELPER_VERIFY=0
 INTERNAL_INSTALL_ARGUMENT_INVALID=0
 INTERNAL_INSTALL_ARGUMENTS_PRESENT=0
 INTERNAL_ARG_SETUP_TOKEN_FILE=""
@@ -50,6 +54,14 @@ if [[ -v TERMD_INSTALL_SELF_BINARY ]]; then
   SELF_INSTALL_BINARY_SET=1
   SELF_INSTALL_BINARY="$TERMD_INSTALL_SELF_BINARY"
 fi
+if [[ -v TERMD_INSTALL_HELPER_NONCE ]]; then
+  INSTALL_HELPER_NONCE_SET=1
+  INSTALL_HELPER_NONCE="$TERMD_INSTALL_HELPER_NONCE"
+fi
+if [[ -v TERMD_INSTALL_VERIFY_HELPER ]]; then
+  INSTALL_HELPER_VERIFY_SET=1
+  INSTALL_HELPER_VERIFY="$TERMD_INSTALL_VERIFY_HELPER"
+fi
 if [[ -v TERMD_INSTALL_ARG_SETUP_TOKEN_FILE ]]; then
   INTERNAL_INSTALL_ARGUMENTS_PRESENT=1
   INTERNAL_ARG_SETUP_TOKEN_FILE="$TERMD_INSTALL_ARG_SETUP_TOKEN_FILE"
@@ -60,7 +72,8 @@ if [[ -v TERMD_INSTALL_ARG_TLS_KEY ]]; then
   INTERNAL_ARG_TLS_KEY="$TERMD_INSTALL_ARG_TLS_KEY"
   [[ -n "$INTERNAL_ARG_TLS_KEY" ]] || INTERNAL_INSTALL_ARGUMENT_INVALID=1
 fi
-unset TERMD_INSTALL_SELF_MODE TERMD_INSTALL_SELF_BINARY TERMD_INSTALL_ASSUME_YES
+unset TERMD_INSTALL_SELF_MODE TERMD_INSTALL_SELF_BINARY TERMD_INSTALL_ASSUME_YES TERMD_INSTALL_HELPER_NONCE
+unset TERMD_INSTALL_VERIFY_HELPER
 unset TERMD_INSTALL_ARG_SETUP_TOKEN_FILE TERMD_INSTALL_ARG_TLS_KEY
 
 log() {
@@ -113,12 +126,16 @@ validate_internal_install_request() {
     die "embedded self-install identity is invalid"
   fi
   if [[ "$SELF_INSTALL_MODE_SET" -eq 0 ]]; then
-    [[ "$INTERNAL_INSTALL_ARGUMENTS_PRESENT" -eq 0 ]] || die "embedded installer arguments are invalid"
+    [[ "$INTERNAL_INSTALL_ARGUMENTS_PRESENT" -eq 0 && "$INSTALL_HELPER_NONCE_SET" -eq 0 && "$INSTALL_HELPER_VERIFY_SET" -eq 0 ]] || die "embedded installer arguments are invalid"
     return 0
   fi
 
   SELF_INSTALL_ENABLED=1
   [[ "$SELF_INSTALL_MODE" == "embedded-v1" ]] || die "embedded self-install identity is invalid"
+  [[ "$INSTALL_HELPER_NONCE_SET" -eq 1 && "$INSTALL_HELPER_NONCE" =~ ^[0-9a-f]{64}$ ]] || die "embedded self-install identity is invalid"
+  if [[ "$INSTALL_HELPER_VERIFY_SET" -eq 1 ]]; then
+    [[ "$INSTALL_HELPER_VERIFY" == "1" && "$INTERNAL_INSTALL_ARGUMENTS_PRESENT" -eq 0 ]] || die "embedded installer arguments are invalid"
+  fi
   [[ -n "$VERSION" ]] || die "embedded self-install identity is invalid"
   if [[ ! "$SELF_INSTALL_BINARY" =~ ^/proc/([0-9]+)/fd/([0-9]+)$ ]] || \
     [[ "${BASH_REMATCH[1]}" != "$PPID" ]]; then
@@ -130,6 +147,13 @@ validate_internal_install_request() {
     die "embedded self-install identity is invalid"
   fi
   [[ "$reported_version" == "$BIN_NAME $VERSION" ]] || die "embedded self-install identity is invalid"
+}
+
+run_installer_helper() {
+  [[ "$SELF_INSTALL_ENABLED" -eq 1 ]] || die "internal installer helper is unavailable outside embedded installation"
+  TERMD_INSTALL_HELPER_NONCE="$INSTALL_HELPER_NONCE" \
+    TERMD_INSTALL_HELPER_SELF_BINARY="$SELF_INSTALL_BINARY" \
+    "$SELF_INSTALL_BINARY" __terminstall-helper-v1 "$@"
 }
 
 apply_internal_install_arguments() {
@@ -234,9 +258,9 @@ Installer network access honors http_proxy, https_proxy, all_proxy and no_proxy,
 plus their uppercase variants. Lowercase values take precedence when both are set.
 
 Examples:
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --web
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --listen 0.0.0.0:8080
-  curl -fsSL https://github.com/yiiilin/termd/releases/latest/download/install-termrelay.sh | sudo bash -s -- --uninstall
+  sudo termrelay install
+  sudo termrelay install --listen 0.0.0.0:8080
+  sudo termrelay uninstall
 EOF
 }
 
@@ -496,6 +520,10 @@ write_service_secret_file() {
 }
 
 generate_secret_token() {
+  if [[ "$SELF_INSTALL_ENABLED" -eq 1 ]]; then
+    run_installer_helper generate-secret-token
+    return
+  fi
   python3 - <<'PY'
 import secrets
 
@@ -993,6 +1021,11 @@ print_relay_setup_token() {
 main() {
   parse_args "$@"
   validate_internal_install_request
+  if [[ "$INSTALL_HELPER_VERIFY" -eq 1 ]]; then
+    command -v python3 >/dev/null 2>&1 && die "embedded installer self-check PATH unexpectedly contains python3"
+    run_installer_helper self-check >/dev/null
+    return 0
+  fi
   apply_internal_install_arguments
   normalize_proxy_environment
   require_root
@@ -1002,10 +1035,10 @@ main() {
   fi
 
   require_cmd install
-  require_cmd python3
   require_cmd systemctl
   require_cmd useradd
   if [[ "$SELF_INSTALL_ENABLED" -eq 0 ]]; then
+    require_cmd python3
     require_cmd tar
     require_cmd sha256sum
     [[ -n "$REPO" ]] || die "set TERMD_GITHUB_REPO=owner/repo before running the installer"

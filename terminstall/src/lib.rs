@@ -5,7 +5,8 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -21,8 +22,13 @@ const TERMD_INSTALLER: &str = include_str!("../../scripts/install-termd.sh");
 const TERMRELAY_INSTALLER: &str = include_str!("../../scripts/install-termrelay.sh");
 const TERMCTL_INSTALLER: &str = include_str!("../../scripts/install-termctl.sh");
 const SELF_INSTALL_MODE: &str = "embedded-v1";
+const INTERNAL_HELPER_COMMAND: &str = "__terminstall-helper-v1";
+const INTERNAL_HELPER_NONCE_ENV: &str = "TERMD_INSTALL_HELPER_NONCE";
+const INTERNAL_HELPER_SELF_BINARY_ENV: &str = "TERMD_INSTALL_HELPER_SELF_BINARY";
+const INTERNAL_HELPER_VERIFY_ENV: &str = "TERMD_INSTALL_VERIFY_HELPER";
 const INSTALLER_SHELL: &str = "/bin/bash";
 const INSTALLER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+const INSTALLER_VERIFY_PATH: &str = "/nonexistent/termd-installer-self-check";
 const INSTALLER_LOCALE: &str = "C";
 const DEFAULT_GITHUB_REPO: &str = "yiiilin/termd";
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
@@ -70,6 +76,159 @@ impl fmt::Display for Component {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.binary_name())
     }
+}
+
+#[derive(Debug)]
+pub enum InternalHelperError {
+    InvalidRequest,
+    InspectProcess(io::Error),
+}
+
+impl fmt::Display for InternalHelperError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest => {
+                formatter.write_str("invalid internal installer helper request")
+            }
+            Self::InspectProcess(_) => {
+                formatter.write_str("failed to validate internal installer helper process")
+            }
+        }
+    }
+}
+
+impl StdError for InternalHelperError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::InspectProcess(source) => Some(source),
+            Self::InvalidRequest => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct InternalHelperRequest {
+    operation: OsString,
+    args: Vec<OsString>,
+}
+
+impl InternalHelperRequest {
+    pub fn operation(&self) -> &OsStr {
+        &self.operation
+    }
+
+    pub fn args(&self) -> &[OsString] {
+        &self.args
+    }
+}
+
+pub fn internal_helper_request<I, S>(
+    args: I,
+) -> Result<Option<InternalHelperRequest>, InternalHelperError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let mut args = args.into_iter().map(Into::into);
+    let _program = args.next();
+    if args.next().as_deref() != Some(OsStr::new(INTERNAL_HELPER_COMMAND)) {
+        return Ok(None);
+    }
+
+    let nonce = std::env::var_os(INTERNAL_HELPER_NONCE_ENV);
+    let self_binary = std::env::var_os(INTERNAL_HELPER_SELF_BINARY_ENV);
+    // This runs synchronously at process entry before either binary creates its Tokio runtime.
+    unsafe {
+        std::env::remove_var(INTERNAL_HELPER_NONCE_ENV);
+        std::env::remove_var(INTERNAL_HELPER_SELF_BINARY_ENV);
+    }
+    let nonce = nonce.ok_or(InternalHelperError::InvalidRequest)?;
+    let self_binary = self_binary.ok_or(InternalHelperError::InvalidRequest)?;
+    validate_internal_helper_context(&nonce, Path::new(&self_binary))?;
+
+    let operation = args.next().ok_or(InternalHelperError::InvalidRequest)?;
+    Ok(Some(InternalHelperRequest {
+        operation,
+        args: args.collect(),
+    }))
+}
+
+fn validate_internal_helper_context(
+    nonce: &OsStr,
+    self_binary: &Path,
+) -> Result<(), InternalHelperError> {
+    if !valid_internal_helper_nonce(nonce) {
+        return Err(InternalHelperError::InvalidRequest);
+    }
+    let installer_pid =
+        pinned_self_binary_pid(self_binary).ok_or(InternalHelperError::InvalidRequest)?;
+    if !process_is_ancestor(installer_pid)? {
+        return Err(InternalHelperError::InvalidRequest);
+    }
+    let pinned_metadata = fs::metadata(self_binary).map_err(InternalHelperError::InspectProcess)?;
+    let current_metadata =
+        fs::metadata("/proc/self/exe").map_err(InternalHelperError::InspectProcess)?;
+    let installer_metadata = fs::metadata(format!("/proc/{installer_pid}/exe"))
+        .map_err(InternalHelperError::InspectProcess)?;
+    if pinned_metadata.dev() != current_metadata.dev()
+        || pinned_metadata.ino() != current_metadata.ino()
+        || pinned_metadata.dev() != installer_metadata.dev()
+        || pinned_metadata.ino() != installer_metadata.ino()
+    {
+        return Err(InternalHelperError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn valid_internal_helper_nonce(nonce: &OsStr) -> bool {
+    let bytes = nonce.as_bytes();
+    bytes.len() == 64
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn pinned_self_binary_pid(path: &Path) -> Option<u32> {
+    let parts = path
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .collect::<Vec<_>>();
+    if parts.len() != 5
+        || !parts[0].is_empty()
+        || parts[1] != b"proc"
+        || parts[3] != b"fd"
+        || parts[4].is_empty()
+        || !parts[4].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let pid = std::str::from_utf8(parts[2]).ok()?.parse::<u32>().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+fn process_is_ancestor(expected_pid: u32) -> Result<bool, InternalHelperError> {
+    let mut pid = unsafe { libc::getppid() } as u32;
+    for _ in 0..8 {
+        if pid == expected_pid {
+            return Ok(true);
+        }
+        if pid <= 1 {
+            return Ok(false);
+        }
+        pid = read_parent_pid(pid)?;
+    }
+    Ok(false)
+}
+
+fn read_parent_pid(pid: u32) -> Result<u32, InternalHelperError> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status"))
+        .map_err(InternalHelperError::InspectProcess)?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:").map(str::trim))
+        .and_then(|value| value.parse().ok())
+        .ok_or(InternalHelperError::InvalidRequest)
 }
 
 pub struct InstallOptions {
@@ -222,8 +381,11 @@ pub enum Error {
     NonInteractive,
     RelayTokenRequired,
     EmptyRelayToken,
+    InvalidRelayUrl,
     Cancelled,
     OpenSelfExecutable(io::Error),
+    InspectExistingInstall(io::Error),
+    Randomness(io::Error),
     Input(io::Error),
     Output(io::Error),
     Spawn(io::Error),
@@ -259,10 +421,17 @@ impl fmt::Display for Error {
                 "trusted relay setup token is required for non-interactive installation; pass --relay-token <TOKEN> or --relay-setup-token-file <PATH>",
             ),
             Self::EmptyRelayToken => formatter.write_str("relay setup token cannot be empty"),
+            Self::InvalidRelayUrl => formatter.write_str(
+                "relay URL must be an absolute ws:// or wss:// URL with a host",
+            ),
             Self::Cancelled => formatter.write_str("installation cancelled"),
             Self::OpenSelfExecutable(_) => {
                 formatter.write_str("failed to pin the running executable")
             }
+            Self::InspectExistingInstall(_) => {
+                formatter.write_str("failed to inspect existing managed installation")
+            }
+            Self::Randomness(_) => formatter.write_str("failed to initialize installer helper authentication"),
             Self::Input(_) => formatter.write_str("failed to read installer confirmation"),
             Self::Output(_) => formatter.write_str("failed to write installer output"),
             Self::Spawn(_) => formatter.write_str("failed to start the embedded bash installer"),
@@ -283,6 +452,8 @@ impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::OpenSelfExecutable(source)
+            | Self::InspectExistingInstall(source)
+            | Self::Randomness(source)
             | Self::Input(source)
             | Self::Output(source)
             | Self::Spawn(source)
@@ -322,6 +493,7 @@ struct ParsedOptions {
     allow_session_loss: bool,
     relay_explicit: bool,
     prompt_relay_token: bool,
+    explicit_install_settings: bool,
     script_args: Vec<OsString>,
     script_env: Vec<(&'static str, OsString)>,
     summary: Vec<String>,
@@ -350,6 +522,7 @@ impl ParsedOptions {
             allow_session_loss: false,
             relay_explicit: false,
             prompt_relay_token: false,
+            explicit_install_settings: false,
             script_args: Vec::new(),
             script_env: Vec::new(),
             summary: Vec::new(),
@@ -395,6 +568,7 @@ impl ParsedOptions {
                 _ if action == Action::Install => {
                     let specification = install_flag(component, flag)
                         .ok_or_else(|| Error::UnknownArgument(safe_unknown_argument(flag)))?;
+                    parsed.explicit_install_settings = true;
                     if specification.takes_value {
                         let value = match inline_value {
                             Some(value) => value,
@@ -606,7 +780,10 @@ trait Runtime {
     fn is_tty(&self) -> bool;
     fn open_self_binary(&mut self) -> Result<SelfBinary, Error>;
     fn install_prefix(&self) -> PathBuf;
+    fn managed_install_exists(&self, component: Component) -> Result<bool, Error>;
+    fn sudo_user(&self) -> Option<OsString>;
     fn write_output(&mut self, message: &str) -> Result<(), Error>;
+    fn read_line(&mut self, prompt: &str) -> Result<String, Error>;
     fn confirm(&mut self, prompt: &str) -> Result<bool, Error>;
     fn read_secret(&mut self, prompt: &str) -> Result<OsString, Error>;
     fn execute(&mut self, invocation: &Invocation) -> Result<ExecutionStatus, Error>;
@@ -640,6 +817,32 @@ impl Runtime for SystemRuntime {
             .unwrap_or_else(|| PathBuf::from("/usr/local"))
     }
 
+    fn managed_install_exists(&self, component: Component) -> Result<bool, Error> {
+        let paths = match component {
+            Component::Termd => vec![
+                PathBuf::from("/etc/termd/termd.env"),
+                PathBuf::from("/etc/systemd/system/termd.service"),
+            ],
+            Component::Termrelay => vec![
+                PathBuf::from("/etc/termd/termrelay.env"),
+                PathBuf::from("/etc/systemd/system/termrelay.service"),
+            ],
+            Component::Termctl => vec![self.install_prefix().join("bin/termctl")],
+        };
+        for path in paths {
+            match fs::symlink_metadata(path) {
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::InspectExistingInstall(error)),
+            }
+        }
+        Ok(false)
+    }
+
+    fn sudo_user(&self) -> Option<OsString> {
+        std::env::var_os("SUDO_USER").filter(|user| !user.is_empty() && user != OsStr::new("root"))
+    }
+
     fn write_output(&mut self, message: &str) -> Result<(), Error> {
         let mut stdout = io::stdout().lock();
         stdout
@@ -648,16 +851,18 @@ impl Runtime for SystemRuntime {
             .map_err(Error::Output)
     }
 
-    fn confirm(&mut self, prompt: &str) -> Result<bool, Error> {
+    fn read_line(&mut self, prompt: &str) -> Result<String, Error> {
         let mut stderr = io::stderr().lock();
         stderr.write_all(prompt.as_bytes()).map_err(Error::Output)?;
         stderr.flush().map_err(Error::Output)?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer).map_err(Error::Input)?;
-        Ok(matches!(
-            answer.trim().to_ascii_lowercase().as_str(),
-            "y" | "yes"
-        ))
+        Ok(answer.trim().to_owned())
+    }
+
+    fn confirm(&mut self, prompt: &str) -> Result<bool, Error> {
+        let answer = self.read_line(prompt)?;
+        Ok(matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"))
     }
 
     fn read_secret(&mut self, prompt: &str) -> Result<OsString, Error> {
@@ -704,10 +909,19 @@ impl Runtime for SystemRuntime {
     }
 
     fn execute(&mut self, invocation: &Invocation) -> Result<ExecutionStatus, Error> {
+        let installer_path = if invocation
+            .env
+            .iter()
+            .any(|(name, _)| *name == INTERNAL_HELPER_VERIFY_ENV)
+        {
+            INSTALLER_VERIFY_PATH
+        } else {
+            INSTALLER_PATH
+        };
         let mut command = Command::new(INSTALLER_SHELL);
         command
             .env_clear()
-            .env("PATH", INSTALLER_PATH)
+            .env("PATH", installer_path)
             .env("LANG", INSTALLER_LOCALE)
             .env("LC_ALL", INSTALLER_LOCALE)
             .arg("-s")
@@ -748,15 +962,127 @@ impl Runtime for SystemRuntime {
     }
 }
 
+fn apply_fresh_install_defaults(
+    component: Component,
+    parsed: &mut ParsedOptions,
+    runtime: &mut dyn Runtime,
+) -> Result<(), Error> {
+    if parsed.action != Action::Install
+        || parsed.explicit_install_settings
+        || runtime.managed_install_exists(component)?
+    {
+        return Ok(());
+    }
+
+    match component {
+        Component::Termrelay => {
+            add_script_flag(
+                parsed,
+                "--web",
+                "embedded Web UI enabled by fresh-install default",
+            );
+            add_script_value(parsed, "--listen", "127.0.0.1:8080", "listen address");
+        }
+        Component::Termd => {
+            add_script_flag(
+                parsed,
+                "--web",
+                "embedded Web UI enabled by fresh-install default",
+            );
+            add_script_value(parsed, "--listen", "127.0.0.1:8765", "listen address");
+            if parsed.dry_run || parsed.yes || !runtime.is_tty() {
+                return Ok(());
+            }
+
+            let user = match runtime.sudo_user() {
+                Some(sudo_user) => {
+                    let prompt = format!(
+                        "Use sudo login user '{}' for terminal sessions? [Y/n] ",
+                        sudo_user.to_string_lossy()
+                    );
+                    if prompt_yes_no(runtime, &prompt, true)? {
+                        Some(sudo_user)
+                    } else {
+                        optional_session_user(runtime)?
+                    }
+                }
+                None => optional_session_user(runtime)?,
+            };
+            if let Some(user) = user {
+                parsed.script_args.push(OsString::from("--user"));
+                parsed.script_args.push(user.clone());
+                parsed
+                    .summary
+                    .push(format!("service user: {}", user.to_string_lossy()));
+            }
+
+            if prompt_yes_no(
+                runtime,
+                "Connect this daemon through a trusted relay? [y/N] ",
+                false,
+            )? {
+                let relay_url = runtime.read_line("Relay WebSocket URL (wss://...): ")?;
+                let parsed_url =
+                    reqwest::Url::parse(&relay_url).map_err(|_| Error::InvalidRelayUrl)?;
+                if !matches!(parsed_url.scheme(), "ws" | "wss") || parsed_url.host().is_none() {
+                    return Err(Error::InvalidRelayUrl);
+                }
+                parsed
+                    .script_env
+                    .push(("TERMD_INSTALL_ARG_RELAY_URL", OsString::from(relay_url)));
+                parsed.relay_explicit = true;
+                parsed.prompt_relay_token = true;
+                parsed.summary.push("trusted relay: configured".to_owned());
+                parsed
+                    .summary
+                    .push("relay setup token: will prompt securely during installation".to_owned());
+            }
+        }
+        Component::Termctl => {}
+    }
+    Ok(())
+}
+
+fn add_script_flag(parsed: &mut ParsedOptions, flag: &'static str, summary: &'static str) {
+    parsed.script_args.push(OsString::from(flag));
+    parsed.summary.push(format!("{summary}: yes"));
+}
+
+fn add_script_value(
+    parsed: &mut ParsedOptions,
+    flag: &'static str,
+    value: &'static str,
+    summary: &'static str,
+) {
+    parsed.script_args.push(OsString::from(flag));
+    parsed.script_args.push(OsString::from(value));
+    parsed.summary.push(format!("{summary}: {value}"));
+}
+
+fn optional_session_user(runtime: &mut dyn Runtime) -> Result<Option<OsString>, Error> {
+    let user =
+        runtime.read_line("Session user (leave empty to use the managed termd service user): ")?;
+    Ok((!user.is_empty()).then(|| OsString::from(user)))
+}
+
+fn prompt_yes_no(runtime: &mut dyn Runtime, prompt: &str, default: bool) -> Result<bool, Error> {
+    let answer = runtime.read_line(prompt)?.to_ascii_lowercase();
+    if answer.is_empty() {
+        return Ok(default);
+    }
+    Ok(matches!(answer.as_str(), "y" | "yes"))
+}
+
 fn run_with(
     component: Component,
     options: Options,
     runtime: &mut dyn Runtime,
 ) -> Result<(), Error> {
-    let parsed = ParsedOptions::parse(component, options)?;
+    let mut parsed = ParsedOptions::parse(component, options)?;
     if parsed.help {
         return runtime.write_output(&help_text(component, parsed.action));
     }
+    apply_fresh_install_defaults(component, &mut parsed, runtime)?;
 
     let self_binary = runtime.open_self_binary()?;
     let install_prefix = runtime.install_prefix();
@@ -768,6 +1094,30 @@ fn run_with(
     );
     runtime.write_output(&plan)?;
     if parsed.dry_run {
+        if component != Component::Termctl {
+            let invocation = Invocation {
+                component,
+                script: component.installer(),
+                args: Vec::new(),
+                env: vec![
+                    ("TERMD_INSTALL_SELF_MODE", OsString::from(SELF_INSTALL_MODE)),
+                    (
+                        "TERMD_INSTALL_SELF_BINARY",
+                        self_binary.installer_path.as_os_str().to_owned(),
+                    ),
+                    ("TERMD_VERSION", OsString::from(parsed.version)),
+                    (INTERNAL_HELPER_NONCE_ENV, generate_internal_helper_nonce()?),
+                    (INTERNAL_HELPER_VERIFY_ENV, OsString::from("1")),
+                ],
+            };
+            let status = runtime.execute(&invocation)?;
+            if !status.success {
+                return Err(Error::ChildFailed {
+                    component: invocation.component,
+                    status: status.description,
+                });
+            }
+        }
         return Ok(());
     }
     if parsed.prompt_relay_token && !runtime.is_tty() {
@@ -803,6 +1153,9 @@ fn run_with(
             install_prefix.as_os_str().to_owned(),
         ),
     ];
+    if component != Component::Termctl {
+        env.push((INTERNAL_HELPER_NONCE_ENV, generate_internal_helper_nonce()?));
+    }
     env.extend(parsed.script_env);
     if let Some(token) = prompted_relay_token {
         env.push(("TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN", token));
@@ -830,6 +1183,19 @@ fn run_with(
         });
     }
     Ok(())
+}
+
+fn generate_internal_helper_nonce() -> Result<OsString, Error> {
+    let mut random = [0_u8; 32];
+    File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut random))
+        .map_err(Error::Randomness)?;
+    let mut encoded = String::with_capacity(random.len() * 2);
+    for byte in random {
+        use fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(OsString::from(encoded))
 }
 
 fn render_plan(
@@ -1689,6 +2055,7 @@ fn resolve_upgrade_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     struct FakeRuntime {
         tty: bool,
@@ -1699,6 +2066,10 @@ mod tests {
         invocation_env: Vec<(&'static str, OsString)>,
         secret_input: OsString,
         secret_reads: usize,
+        managed_install_exists: bool,
+        sudo_user: Option<OsString>,
+        input_lines: VecDeque<String>,
+        line_reads: usize,
         status: ExecutionStatus,
     }
 
@@ -1713,6 +2084,10 @@ mod tests {
                 invocation_env: Vec::new(),
                 secret_input: OsString::from("prompted-relay-setup-token"),
                 secret_reads: 0,
+                managed_install_exists: true,
+                sudo_user: None,
+                input_lines: VecDeque::new(),
+                line_reads: 0,
                 status: ExecutionStatus {
                     success: true,
                     description: "exit status: 0".to_owned(),
@@ -1738,9 +2113,22 @@ mod tests {
             PathBuf::from("/tmp/prefix")
         }
 
+        fn managed_install_exists(&self, _component: Component) -> Result<bool, Error> {
+            Ok(self.managed_install_exists)
+        }
+
+        fn sudo_user(&self) -> Option<OsString> {
+            self.sudo_user.clone()
+        }
+
         fn write_output(&mut self, message: &str) -> Result<(), Error> {
             self.output.push_str(message);
             Ok(())
+        }
+
+        fn read_line(&mut self, _prompt: &str) -> Result<String, Error> {
+            self.line_reads += 1;
+            Ok(self.input_lines.pop_front().unwrap_or_default())
         }
 
         fn confirm(&mut self, _prompt: &str) -> Result<bool, Error> {
@@ -1800,6 +2188,143 @@ mod tests {
             runtime
                 .invocation_env
                 .contains(&("TERMD_INSTALL_PREFIX", OsString::from("/tmp/prefix")))
+        );
+        let helper_nonce = runtime
+            .invocation_env
+            .iter()
+            .find_map(|(name, value)| (*name == INTERNAL_HELPER_NONCE_ENV).then_some(value))
+            .expect("service installers must receive a helper nonce");
+        assert!(valid_internal_helper_nonce(helper_nonce));
+    }
+
+    #[test]
+    fn internal_helper_protocol_rejects_malformed_capabilities() {
+        assert!(valid_internal_helper_nonce(OsStr::new(&"a".repeat(64))));
+        for invalid in [
+            "a".repeat(63),
+            "A".repeat(64),
+            "g".repeat(64),
+            "0".repeat(65),
+        ] {
+            assert!(!valid_internal_helper_nonce(OsStr::new(&invalid)));
+        }
+        assert_eq!(
+            pinned_self_binary_pid(Path::new("/proc/4242/fd/9")),
+            Some(4242)
+        );
+        for invalid in [
+            "/proc/0/fd/9",
+            "/proc/4242/fd/",
+            "/proc/4242/fd/9/extra",
+            "/tmp/4242/fd/9",
+        ] {
+            assert_eq!(pinned_self_binary_pid(Path::new(invalid)), None);
+        }
+        assert!(process_is_ancestor(unsafe { libc::getppid() } as u32).unwrap());
+    }
+
+    #[test]
+    fn termctl_does_not_receive_unused_helper_capability() {
+        let options = Options::Install(InstallOptions::new("1.2.3", None, ["--yes"]));
+        let mut runtime = FakeRuntime::default();
+
+        run_with(Component::Termctl, options, &mut runtime).unwrap();
+
+        assert!(
+            runtime
+                .invocation_env
+                .iter()
+                .all(|(name, _)| *name != INTERNAL_HELPER_NONCE_ENV)
+        );
+    }
+
+    #[test]
+    fn fresh_termrelay_without_settings_enables_loopback_web_defaults() {
+        let options = Options::Install(InstallOptions::new("1.2.3", None, ["--yes"]));
+        let mut runtime = FakeRuntime {
+            managed_install_exists: false,
+            ..FakeRuntime::default()
+        };
+
+        run_with(Component::Termrelay, options, &mut runtime).unwrap();
+
+        assert_eq!(
+            runtime.invocation_args,
+            ["--web", "--listen", "127.0.0.1:8080"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn existing_service_install_without_settings_preserves_configuration() {
+        for component in [Component::Termd, Component::Termrelay] {
+            let options = Options::Install(InstallOptions::new("1.2.3", None, ["--yes"]));
+            let mut runtime = FakeRuntime {
+                managed_install_exists: true,
+                ..FakeRuntime::default()
+            };
+
+            run_with(component, options, &mut runtime).unwrap();
+
+            assert!(runtime.invocation_args.is_empty());
+            assert_eq!(runtime.line_reads, 0);
+        }
+    }
+
+    #[test]
+    fn fresh_termd_guide_uses_confirmed_sudo_user_and_local_mode() {
+        let options = Options::Install(InstallOptions::new("1.2.3", None, [] as [&str; 0]));
+        let mut runtime = FakeRuntime {
+            managed_install_exists: false,
+            sudo_user: Some(OsString::from("alice")),
+            input_lines: VecDeque::from([String::new(), "n".to_owned()]),
+            ..FakeRuntime::default()
+        };
+
+        run_with(Component::Termd, options, &mut runtime).unwrap();
+
+        assert_eq!(
+            runtime.invocation_args,
+            ["--web", "--listen", "127.0.0.1:8765", "--user", "alice",]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(runtime.secret_reads, 0);
+        assert_eq!(runtime.line_reads, 2);
+    }
+
+    #[test]
+    fn fresh_termd_guide_accepts_relay_url_and_reads_token_securely() {
+        let options = Options::Install(InstallOptions::new("1.2.3", None, [] as [&str; 0]));
+        let mut runtime = FakeRuntime {
+            managed_install_exists: false,
+            input_lines: VecDeque::from([
+                "bob".to_owned(),
+                "y".to_owned(),
+                "wss://relay.example/ws".to_owned(),
+            ]),
+            ..FakeRuntime::default()
+        };
+
+        run_with(Component::Termd, options, &mut runtime).unwrap();
+
+        assert!(
+            runtime
+                .invocation_args
+                .ends_with(&[OsString::from("--user"), OsString::from("bob")])
+        );
+        assert!(runtime.invocation_env.contains(&(
+            "TERMD_INSTALL_ARG_RELAY_URL",
+            OsString::from("wss://relay.example/ws")
+        )));
+        assert_eq!(runtime.secret_reads, 1);
+        assert!(
+            !runtime
+                .invocation_args
+                .contains(&OsString::from("prompted-relay-setup-token"))
         );
     }
 
@@ -1960,7 +2485,7 @@ mod tests {
         };
         run_with(Component::Termd, dry_run_options, &mut dry_run).unwrap();
         assert_eq!(dry_run.secret_reads, 0);
-        assert_eq!(dry_run.execute_calls, 0);
+        assert_eq!(dry_run.execute_calls, 1);
         assert!(
             dry_run
                 .output
@@ -1975,10 +2500,16 @@ mod tests {
         let mut live = FakeRuntime::default();
         run_with(Component::Termd, live_options, &mut live).unwrap();
         assert_eq!(live.secret_reads, 1);
-        assert!(live.invocation_env.contains(&(
-            "TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN",
-            OsString::from("prompted-relay-setup-token")
-        )));
+        assert_eq!(
+            live.invocation_env
+                .iter()
+                .filter(|(name, value)| {
+                    *name == "TERMD_INSTALL_ARG_RELAY_SETUP_TOKEN"
+                        && value == OsStr::new("prompted-relay-setup-token")
+                })
+                .count(),
+            1
+        );
         assert!(!live.output.contains("prompted-relay-setup-token"));
     }
 
@@ -2277,7 +2808,7 @@ uname -m >/dev/null
     }
 
     #[test]
-    fn dry_run_has_no_side_effects_and_redacts_secret_files() {
+    fn dry_run_runs_only_helper_self_check_and_redacts_secret_files() {
         let secret_path = "/tmp/do-not-print/setup-token";
         let options = Options::Install(InstallOptions::new(
             "1.2.3",
@@ -2297,7 +2828,20 @@ uname -m >/dev/null
 
         run_with(Component::Termd, options, &mut runtime).unwrap();
 
-        assert_eq!(runtime.execute_calls, 0);
+        assert_eq!(runtime.execute_calls, 1);
+        assert!(runtime.invocation_args.is_empty());
+        assert!(
+            runtime.invocation_env.iter().any(
+                |(name, value)| *name == INTERNAL_HELPER_VERIFY_ENV && value == OsStr::new("1")
+            )
+        );
+        assert!(
+            !runtime
+                .invocation_env
+                .iter()
+                .any(|(_, value)| value == OsStr::new(secret_path)
+                    || value.to_string_lossy().contains("password"))
+        );
         assert!(runtime.output.contains("Dry run"));
         assert!(
             runtime

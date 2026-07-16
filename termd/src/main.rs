@@ -25,6 +25,7 @@ use termd::pty::{CommandSpec, PtySize};
 use termd_proto::{PairingQrPayload, PairingToken, PublicKey, ServerId, UnixTimestampMillis};
 use tokio::task::JoinHandle;
 
+mod installer_helper;
 mod process_lock;
 
 const DEFAULT_PAIRING_URL: &str = "http://127.0.0.1:8765";
@@ -82,9 +83,9 @@ const HELP_TEXT: &str = concat!(
     "  termd pair --qr\n",
 );
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    if let Err(error) = run().await {
+fn main() -> ExitCode {
+    install_rustls_crypto_provider();
+    if let Err(error) = run_entrypoint() {
         eprintln!("{error}");
         return ExitCode::FAILURE;
     }
@@ -92,13 +93,21 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn run() -> Result<(), Box<dyn Error>> {
-    install_rustls_crypto_provider();
+fn run_entrypoint() -> Result<(), Box<dyn Error>> {
+    if let Some(request) = terminstall::internal_helper_request(std::env::args_os())? {
+        installer_helper::run(request)?;
+        return Ok(());
+    }
     if let Some(options) = installer_options(std::env::args_os()) {
         terminstall::run(terminstall::Component::Termd, options)?;
         return Ok(());
     }
 
+    runtime_main()
+}
+
+#[tokio::main]
+async fn runtime_main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
