@@ -857,30 +857,30 @@ export function TerminalPane(props: TerminalPaneProps) {
     if (!Number.isFinite(rowHeight) || rowHeight <= 0) {
       return;
     }
-    const fullGridHeight = Math.ceil(rowHeight * terminal.rows + insetTop + insetBottom);
+    const terminalGridHeight = rowHeight * terminal.rows;
+    const fullGridHeight = Math.ceil(terminalGridHeight + insetTop + insetBottom);
     frame.style.height = `${fullGridHeight}px`;
     frame.style.minHeight = `${fullGridHeight}px`;
 
     const nextScrollState = rendererRef.current?.scrollState(terminal);
     const viewportY = nextScrollState?.viewportY ?? 0;
     const cursorViewportRow = clampNumber(cursorLine - viewportY, 0, Math.max(0, terminal.rows - 1));
-    const leadingSpacerHeight = Math.max(0, scrollport.clientHeight / 2 - insetTop - rowHeight / 2);
-    const trailingSpacerHeight = Math.max(0, scrollport.clientHeight / 2 - insetBottom - rowHeight / 2);
-    frame.style.top = `${leadingSpacerHeight}px`;
+    frame.style.removeProperty("top");
+    canvas.style.height = `${fullGridHeight}px`;
+    canvas.style.minHeight = `${fullGridHeight}px`;
 
-    const cursorCenter = leadingSpacerHeight + insetTop + (cursorViewportRow + 0.5) * rowHeight;
-    const targetScrollTop = Math.max(0, cursorCenter - scrollport.clientHeight / 2);
-    const scrollableHeight = Math.ceil(leadingSpacerHeight + fullGridHeight + trailingSpacerHeight);
-    canvas.style.height = `${scrollableHeight}px`;
-    canvas.style.minHeight = `${scrollableHeight}px`;
-
-    // 中文注释：外层 workspace 继续贴住标题栏和键盘边界；leading/trailing spacer
-    // 只移动完整 xterm 网格，使渲染光标、helper textarea 和 IME 锚点保持同一坐标。
-    const maxScrollTop = Math.max(
-      (Math.max(scrollport.scrollHeight, scrollableHeight) || scrollableHeight) - scrollport.clientHeight,
-      0,
+    const cursorCenter = insetTop + (cursorViewportRow + 0.5) * rowHeight;
+    const minScrollTop = Math.max(0, insetTop);
+    const maxScrollTop = minScrollTop + Math.max(0, terminalGridHeight - scrollport.clientHeight);
+    const targetScrollTop = clampNumber(
+      cursorCenter - scrollport.clientHeight / 2,
+      minScrollTop,
+      maxScrollTop,
     );
-    scrollport.scrollTop = Math.min(targetScrollTop, maxScrollTop);
+
+    // 中文注释：完整 xterm 网格只在自身上下边界之间移动。中间行尽量居中，
+    // 首行和末行分别贴住标题区与键盘上方，不能再用 spacer 制造可见空白。
+    scrollport.scrollTop = targetScrollTop;
     mobileCursorTargetScrollTopRef.current = scrollport.scrollTop;
   };
   const centerMobileViewportOnCursor = (terminal = terminalRef.current) => {

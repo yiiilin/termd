@@ -5470,13 +5470,20 @@ describe("TerminalPane terminal sizing", () => {
       expect(onResize).not.toHaveBeenCalled();
       const baseYAfterKeyboardOpen = terminal?.baseY() ?? 0;
       expect(baseYAfterKeyboardOpen).toBeGreaterThan(8);
-      // 中文注释：软键盘打开后仍保持 24 行 session 网格；光标位于第 5 行时，
-      // 外层本地 spacer 移动完整 xterm 网格，不拆开渲染光标与 IME 输入锚点。
+      // 中文注释：软键盘打开后仍保持 24 行 session 网格；第 5 行过于靠近顶部，
+      // 因此完整 xterm 网格要夹在顶部边界，不能为了居中在标题区下方留空。
       expect(terminal?.viewportY()).toBe(baseYAfterKeyboardOpen);
       expect(frame!.style.height).toBe(`${24 * 16}px`);
-      expect(frame!.style.top).toBe("88px");
-      expect(canvas!.style.height).toBe("560px");
-      expect(scrollport!.scrollTop).toBe(64);
+      expect(frame!.style.top).toBe("");
+      expect(canvas!.style.height).toBe(`${24 * 16}px`);
+      expect(scrollport!.scrollTop).toBe(0);
+
+      terminal?.forceCursorPosition(12);
+      act(() => {
+        vi.advanceTimersByTime(animationFrameMs * 12);
+      });
+      // 第 13 行不受上下边界限制，仍应位于 12 行可视窗口的中线。
+      expect(scrollport!.scrollTop).toBe(104);
 
       (globalThis as { __TERMD_TEST_FIT_DIMENSIONS__?: { rows: number; cols: number } }).__TERMD_TEST_FIT_DIMENSIONS__ = {
         rows: 24,
@@ -5514,7 +5521,7 @@ describe("TerminalPane terminal sizing", () => {
     }
   });
 
-  it("移动端光标在终端底部时会用本地尾部空间尽量保持居中", () => {
+  it("移动端光标在终端底部时会把终端底边贴住键盘上方", () => {
     vi.useFakeTimers();
     const viewport = installMutableVisualViewport(820, 820, 0);
     try {
@@ -5605,9 +5612,9 @@ describe("TerminalPane terminal sizing", () => {
       expect(onResize).not.toHaveBeenCalled();
       expect(terminal?.baseY()).toBeGreaterThan(8);
       // 中文注释：键盘打开不改变 terminal.rows；这里光标位于 buffer 最底部，
-      // canvas 只增加本地居中所需的 spacer，不把空白或 resize 写回 PTY。
+      // 外层只裁出完整网格的最后 12 行，不能追加尾部空白强行居中。
       expect(terminal?.viewportY()).toBe(57);
-      expect(scrollport?.scrollTop).toBe(368);
+      expect(scrollport?.scrollTop).toBe(12 * 16);
     } finally {
       viewport.restore();
       vi.useRealTimers();
