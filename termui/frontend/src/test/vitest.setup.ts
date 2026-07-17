@@ -707,19 +707,3 @@ vi.mock("@xterm/addon-fit", () => {
 
   return { FitAddon };
 });
-
-vi.mock("@xterm/addon-search", () => {
-  class SearchAddon {
-    constructor(_options?: unknown) {}
-
-    activate() {}
-
-    clearDecorations() {}
-
-    findNext() {}
-
-    findPrevious() {}
-  }
-
-  return { SearchAddon };
-});

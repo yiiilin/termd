@@ -1,10 +1,10 @@
-import { toSvg, type JdenticonConfig } from "jdenticon/browser";
 import { Bot, Check, CircleAlert, Cog, Pencil, Trash2, X } from "lucide-react";
-import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { flushSync } from "react-dom";
 import type { SessionAiActivityPayload, SessionSummaryPayload, UUID } from "../protocol/types";
 import { sessionDisplayName } from "../session-names";
 import { useI18n, type Translate } from "../i18n";
+import { SessionThumbsAvatar } from "./SessionThumbsAvatar";
 
 export function sessionActivityClassName(activity?: SessionAiActivityPayload | null): string {
   return activity ? `activity-${activity.state}` : "";
@@ -16,42 +16,13 @@ function sessionActivityLabel(t: Translate, activity?: SessionAiActivityPayload 
   return t(`sessions.activity.${activity.state}`, { agent });
 }
 
-const SESSION_IDENTICON_SIZE = 32;
-// 默认会话图标只使用界面的绿/青色系，身份差异主要由几何形状表达。
-const SESSION_IDENTICON_HUES = [82, 168];
-const SESSION_IDENTICON_CONFIGS = {
-  dark: {
-    hues: SESSION_IDENTICON_HUES,
-    padding: 0.08,
-    saturation: { color: 0.48, grayscale: 0.08 },
-    lightness: { color: [0.6, 0.72], grayscale: [0.56, 0.68] },
-  },
-  light: {
-    hues: SESSION_IDENTICON_HUES,
-    padding: 0.08,
-    saturation: { color: 0.48, grayscale: 0.08 },
-    lightness: { color: [0.34, 0.48], grayscale: [0.34, 0.48] },
-  },
-} satisfies Record<"dark" | "light", JdenticonConfig>;
-
-function sessionIdenticonDataUrl(sessionId: UUID, config: JdenticonConfig): string {
-  const svg = toSvg(sessionId, SESSION_IDENTICON_SIZE, config);
-  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
-}
-
-function SessionIdenticon(props: { sessionId: UUID; compact?: boolean }) {
-  const sources = useMemo(() => ({
-    dark: sessionIdenticonDataUrl(props.sessionId, SESSION_IDENTICON_CONFIGS.dark),
-    light: sessionIdenticonDataUrl(props.sessionId, SESSION_IDENTICON_CONFIGS.light),
-  }), [props.sessionId]);
+function SessionAvatar(props: { sessionId: UUID; compact?: boolean }) {
   return (
     <span
-      className={["session-identicon", props.compact ? "compact" : ""].filter(Boolean).join(" ")}
-      data-session-identicon={props.sessionId}
+      className={["session-avatar", props.compact ? "compact" : ""].filter(Boolean).join(" ")}
       aria-hidden="true"
     >
-      <img className="session-identicon-dark" data-identicon-theme="dark" src={sources.dark} alt="" draggable={false} />
-      <img className="session-identicon-light" data-identicon-theme="light" src={sources.light} alt="" draggable={false} />
+      <SessionThumbsAvatar sessionId={props.sessionId} />
     </span>
   );
 }
@@ -73,14 +44,14 @@ function SessionActivityIndicator(props: {
       aria-hidden="true"
       title={label}
     >
-      <Bot className="session-activity-bot" size={compact ? 12 : 18} strokeWidth={1.8} />
+      <Bot className="session-activity-bot" size={compact ? 8 : 10} strokeWidth={2} />
       {activity.state === "running" ? (
-        <Cog className="session-activity-work-gear" size={compact ? 8 : 11} strokeWidth={2.2} />
+        <Cog className="session-activity-work-gear" size={compact ? 6 : 7} strokeWidth={2.2} />
       ) : activity.state === "attention" ? (
-        <CircleAlert className="session-activity-attention-badge" size={compact ? 8 : 11} strokeWidth={2.4} />
+        <CircleAlert className="session-activity-attention-badge" size={compact ? 6 : 7} strokeWidth={2.4} />
       ) : (
         <span className="session-activity-ok-badge">
-          <Check size={compact ? 7 : 9} strokeWidth={3} />
+          <Check size={compact ? 5 : 6} strokeWidth={3} />
         </span>
       )}
     </span>
@@ -92,10 +63,11 @@ function SessionVisual(props: {
   activity?: SessionAiActivityPayload | null;
   compact?: boolean;
 }) {
-  return props.activity ? (
-    <SessionActivityIndicator activity={props.activity} compact={props.compact} />
-  ) : (
-    <SessionIdenticon sessionId={props.sessionId} compact={props.compact} />
+  return (
+    <span className={["session-visual", props.compact ? "compact" : ""].filter(Boolean).join(" ")}>
+      <SessionAvatar sessionId={props.sessionId} compact={props.compact} />
+      <SessionActivityIndicator activity={props.activity} compact={props.compact} />
+    </span>
   );
 }
 

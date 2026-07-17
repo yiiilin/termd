@@ -52,14 +52,6 @@ export interface TerminalRendererFitAddon {
   proposeStableDimensions?(): { cols: number; rows: number } | undefined;
 }
 
-export type TerminalSearchOptions = unknown;
-
-export interface TerminalRendererSearchAddon {
-  clearDecorations(): void;
-  findNext(query: string, options?: TerminalSearchOptions): void;
-  findPrevious(query: string, options?: TerminalSearchOptions): void;
-}
-
 export interface TerminalRendererInputAnchorOptions {
   host: HTMLElement | null;
   reason: "scroll" | "refresh";
@@ -80,7 +72,6 @@ export interface TerminalRendererInstance {
   kind: TerminalRendererKind;
   terminal: TerminalRendererTerminal;
   fit: TerminalRendererFitAddon;
-  search: TerminalRendererSearchAddon;
   getInputElement(host: HTMLElement): HTMLTextAreaElement | undefined;
   isActivationTarget(target: Element): boolean;
   setOptions(options: Record<string, unknown>): void;
@@ -90,7 +81,6 @@ export interface TerminalRendererInstance {
 
 export interface CreateTerminalRendererOptions {
   terminalOptions: Record<string, unknown>;
-  searchOptions: Record<string, unknown>;
 }
 
 export function createTerminalRendererInstance(

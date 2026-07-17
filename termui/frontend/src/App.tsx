@@ -33,7 +33,6 @@ import type {
   SessionFileEntryPayload,
   SessionGitFileChangePayload,
   SessionGitWorktreePayload,
-  SessionSearchResultPayload,
   SessionSummaryPayload,
   TerminalSize,
   UUID,
@@ -57,6 +56,14 @@ import { CollapsedSessionButton, SessionList } from "./components/SessionList";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalPane } from "./components/TerminalPane";
 import type { TerminalOutputItem, TerminalResyncOptions } from "./components/terminal/types";
+import {
+  advanceSessionOpenProgress,
+  completeSessionOpenProgress,
+  failSessionOpenProgress,
+  startSessionOpenProgress,
+  type SessionOpenProgress,
+  type SessionOpenStepId,
+} from "./session-open-progress";
 import { useWorkspaceAutoRetry, useWorkspaceConnection } from "./hooks/useWorkspaceConnection";
 import {
   useTerminalAttach,
@@ -71,7 +78,7 @@ import {
   useSessionFilesPanelActions,
   useSessionGitDiffViewer,
 } from "./hooks/useSessionFiles";
-import { sessionDisplayName } from "./session-names";
+import { fallbackSessionDisplayName, sessionDisplayName } from "./session-names";
 import { createTranslator, I18nProvider, resolveLocale, translateSafeErrorMessage, useI18n, type Translate } from "./i18n";
 import { resolveTheme } from "./theme";
 import type { BrowserPreferences } from "./protocol/types";
@@ -379,6 +386,7 @@ export default function App() {
   const [renameOriginalName, setRenameOriginalName] = useState("");
   const [terminalOutputResetVersion, setTerminalOutputResetVersion] = useState(0);
   const [terminalFocusRequest, setTerminalFocusRequest] = useState(0);
+  const [sessionOpenProgress, setSessionOpenProgress] = useState<SessionOpenProgress | undefined>();
   const sessionFilesController = useSessionFiles();
   const terminalAttachController = useTerminalAttach();
   const activeServer = useMemo<PairedServerState | undefined>(() => defaultServer(state), [state]);
@@ -534,6 +542,7 @@ export default function App() {
   const urlTouchedRef = useRef(false);
   const autoCheckedServerRef = useRef<UUID | undefined>(undefined);
   const selectedSessionIdRef = useRef<UUID | undefined>(undefined);
+  const sessionOpenAttemptIdRef = useRef(0);
   const activeSurfaceRef = useRef<AppSurface>(activeSurface);
   const statusRef = useRef(status);
   const daemonNetworkSampleRef = useRef<DaemonNetworkCounterSample | undefined>(undefined);
@@ -574,6 +583,22 @@ export default function App() {
   const selectSession = useCallback((sessionId: UUID | undefined) => {
     selectedSessionIdRef.current = sessionId;
     setSelectedSessionId(sessionId);
+  }, []);
+
+  const beginSessionOpenProgress = useCallback((sessionId: UUID) => {
+    const attemptId = sessionOpenAttemptIdRef.current + 1;
+    sessionOpenAttemptIdRef.current = attemptId;
+    const session = sessionsRef.current.find((candidate) => candidate.session_id === sessionId);
+    setSessionOpenProgress(startSessionOpenProgress({
+      attemptId,
+      sessionId,
+      sessionName: session ? sessionDisplayName(session) : fallbackSessionDisplayName(sessionId),
+    }));
+    return attemptId;
+  }, []);
+
+  const advanceSessionOpenAttempt = useCallback((attemptId: number, stepId: SessionOpenStepId) => {
+    setSessionOpenProgress((current) => advanceSessionOpenProgress(current, attemptId, stepId));
   }, []);
 
   useEffect(() => {
@@ -781,6 +806,13 @@ export default function App() {
   const toolbarSessionSize = toolbarSession ? terminalSizeDisplay(toolbarSession.size) : undefined;
   const toolbarLatency = toolbarSession ? formatLatency(daemonNetworkLatencyMs) : undefined;
   const toolbarLatencyLevel = latencyLevelClass(daemonNetworkLatencyMs);
+  const visibleSessionOpenProgress = sessionOpenProgress && (
+    sessionOpenProgress.sessionId === selectedSessionId ||
+    sessionOpenProgress.sessionId === attachedSessionId
+  )
+    ? sessionOpenProgress
+    : undefined;
+  const showFailedSessionOpenProgress = visibleSessionOpenProgress?.status === "failed";
 
   useEffect(() => {
     if (!activeServer?.url || !toolbarSession) {
@@ -842,6 +874,9 @@ export default function App() {
   }, []);
 
   const setSafeError = useCallback((caught: unknown) => {
+    setSessionOpenProgress((current) => current?.status === "opening"
+      ? failSessionOpenProgress(current, current.attemptId)
+      : current);
     setError(toSafeError(caught));
     setStatus("error");
   }, []);
@@ -1322,6 +1357,7 @@ export default function App() {
     pendingTerminalAttachSessionRef.current = undefined;
     pendingResizeKeyRef.current = undefined;
     setAttachedSessionId(undefined);
+    setSessionOpenProgress(undefined);
     setDaemonClients([]);
     setDaemonStatus(undefined);
     setDaemonCpuHistory([]);
@@ -2014,6 +2050,18 @@ export default function App() {
       return;
     }
     lastRenderedTerminalSeqRef.current.set(sessionId, terminalSeq);
+    setSessionOpenProgress((current) => {
+      const syncingStep = current?.steps.find((step) => step.id === "syncing");
+      if (
+        !current ||
+        current.sessionId !== sessionId ||
+        current.status !== "opening" ||
+        syncingStep?.startedAtMs === undefined
+      ) {
+        return current;
+      }
+      return completeSessionOpenProgress(current, current.attemptId);
+    });
   }, []);
 
   const handleTerminalSizeRendered = useCallback((size: TerminalSize) => {
@@ -2025,7 +2073,7 @@ export default function App() {
   }, [applyConfirmedSessionSize]);
 
   const performAttach = useCallback(
-    async (sessionId: UUID, options: AttachUiOptions = {}) => {
+    async (sessionId: UUID, options: AttachUiOptions = {}, progressAttemptId?: number) => {
       const shouldCloseMobilePanel = options.closeMobilePanel ?? true;
       const closeMobileAttachChrome = () => {
         if (!shouldCloseMobilePanel) {
@@ -2058,6 +2106,7 @@ export default function App() {
     const attachRequestId = attachRequestIdRef.current + 1;
     attachRequestIdRef.current = attachRequestId;
     attachingSessionIdRef.current = sessionId;
+    let sessionOpenAttemptId = progressAttemptId;
     let outputClient: V070Client | undefined;
     let attachAbortController: AbortController | undefined;
     try {
@@ -2103,6 +2152,7 @@ export default function App() {
           closeMobileAttachChrome();
           return;
         }
+        sessionOpenAttemptId ??= beginSessionOpenProgress(sessionId);
         reattachCurrentSessionOnOpenRef.current = false;
         disconnectAttach({
           closeMobilePanel: shouldCloseMobilePanel,
@@ -2112,6 +2162,7 @@ export default function App() {
         attachAbortController = new AbortController();
         pendingTerminalAttachAbortControllerRef.current = attachAbortController;
         outputClient = await authenticatedWorkspaceClient(ATTACH_CONNECTION_TIMEOUT_MS);
+        advanceSessionOpenAttempt(sessionOpenAttemptId, "attaching");
         if (!isCurrentAttachRequest()) {
           closePendingAttachClients();
           return;
@@ -2119,6 +2170,7 @@ export default function App() {
         pendingAttachClientRef.current = outputClient;
         pendingTerminalAttachSessionRef.current = sessionId;
         const attached = await outputClient.attachSession(sessionId);
+        advanceSessionOpenAttempt(sessionOpenAttemptId, "initializing");
         if (!isCurrentAttachRequest()) {
           outputClient.detachSession(sessionId);
           closePendingAttachClients();
@@ -2157,6 +2209,7 @@ export default function App() {
         // 等 TerminalPane 确认旧 xterm 已经清屏/重建，再把新 snapshot 从 V070Client
         // 队列排进 xterm；否则新 snapshot 可能先写入旧实例。
         await waitForTerminalOutputResetApplied(resetVersion);
+        advanceSessionOpenAttempt(sessionOpenAttemptId, "syncing");
         if (!isCurrentAttachRequest() || userDetachedRef.current) {
           attachedClient.detachSession(sessionId);
           return;
@@ -2224,6 +2277,8 @@ export default function App() {
       clearNewOutputMark,
       clearTerminalSnapshotRevealHistory,
       clearTerminalOutput,
+      advanceSessionOpenAttempt,
+      beginSessionOpenProgress,
       claimAttachClient,
       disconnectAttach,
       activeServer?.device_certificate,
@@ -2277,6 +2332,7 @@ export default function App() {
         return;
       }
 
+      const sessionOpenAttemptId = beginSessionOpenProgress(sessionId);
       cancelScheduledAttachSwitch();
       attachRequestIdRef.current += 1;
       // 中文注释：新 session 一旦被点中，旧的 in-flight attach 立刻失效；
@@ -2303,10 +2359,10 @@ export default function App() {
         if (attachSwitchGenerationRef.current !== generation) {
           return;
         }
-        void performAttach(sessionId, attachOptions);
+        void performAttach(sessionId, attachOptions, sessionOpenAttemptId);
       }, ATTACH_SWITCH_COALESCE_DELAY_MS);
     },
-    [cancelScheduledAttachSwitch, clearNewOutputMark, performAttach, selectSession],
+    [beginSessionOpenProgress, cancelScheduledAttachSwitch, clearNewOutputMark, performAttach, selectSession],
   );
 
   const handleOpenWorkspace = useCallback(() => {
@@ -2762,7 +2818,7 @@ export default function App() {
       setError(undefined);
       closingSessionIdsRef.current.add(sessionId);
       const wasAttached = attachedSessionRef.current === sessionId;
-      const wasSelected = selectedSessionId === sessionId;
+      const wasSelected = selectedSessionIdRef.current === sessionId;
       const previousUserDetached = userDetachedRef.current;
       const previousSessions = sessionsRef.current;
       const previousSessionOrder = sessionOrderRef.current;
@@ -2778,6 +2834,7 @@ export default function App() {
           // 关闭当前 session 是显式离开终端；其余 session 只保留在列表中，
           // 必须等用户再次点击后才 attach，不能自动打开第一项。
           selectSession(undefined);
+          setSessionOpenProgress((current) => current?.sessionId === sessionId ? undefined : current);
           clearSessionFiles();
         }
         if (wasAttached || wasSelected) {
@@ -2842,7 +2899,6 @@ export default function App() {
       clearNewOutputMark,
       isIgnoredClosingSessionError,
       cancelScheduledAttachSwitch,
-      selectedSessionId,
       selectSession,
       authenticatedWorkspaceClient,
       setSafeError,
@@ -3149,18 +3205,6 @@ export default function App() {
     requestFollowSessionFilesRefresh,
     state.device?.device_id,
   ]);
-
-  const handleTerminalSearch = useCallback(
-    async (query: string): Promise<SessionSearchResultPayload> => {
-      const sessionId = attachedSessionRef.current;
-      if (!sessionId) {
-        throw new ProtocolClientError("invalid_state", "no attached session");
-      }
-      const client = await authenticatedSessionClient(sessionId);
-      return client.searchSessionOutput(sessionId, query, { maxResults: 80 });
-    },
-    [authenticatedSessionClient],
-  );
 
   const handleCloseFileEditor = useCallback(() => {
     resetFileEditor();
@@ -3799,7 +3843,7 @@ export default function App() {
               refreshing={status === "attaching" || status === "connecting" || status === "listing"}
             />
           ) : null}
-          {connectionReady ? (
+          {connectionReady || showFailedSessionOpenProgress ? (
             <>
               <TerminalPane
                 attached={Boolean(attachedSessionId)}
@@ -3811,6 +3855,7 @@ export default function App() {
                 mobileViewportHeight={mobileTerminalInputMode ? visualViewportMetrics.height : undefined}
                 mobileViewportOffsetTop={mobileTerminalInputMode ? visualViewportMetrics.offsetTop : undefined}
                 theme={effectiveTheme}
+                sessionOpenProgress={visibleSessionOpenProgress}
                 outputResetVersion={terminalOutputResetVersion}
                 takeOutput={takeTerminalOutput}
                 registerOutputDrain={registerTerminalOutputDrain}
@@ -3819,11 +3864,10 @@ export default function App() {
                 onTerminalSeqRendered={handleTerminalSeqRendered}
                 onTerminalSizeRendered={handleTerminalSizeRendered}
                 mobileShortcuts={preferences.mobileShortcuts}
-                onSearch={handleTerminalSearch}
                 onInput={handleTerminalInput}
                 onResize={handleResize}
               />
-              {showDesktopFilesPanel ? (
+              {connectionReady && showDesktopFilesPanel ? (
                 <>
                   <Suspense fallback={<LazyPanelFallback className="files-panel" />}>
                     <SessionFilesPanel
@@ -3857,7 +3901,7 @@ export default function App() {
                     />
                   </Suspense>
                 </>
-              ) : !isMobileLayout ? (
+              ) : connectionReady && !isMobileLayout ? (
                 <aside className="files-rail" aria-label={t("app.filesPanelCollapsed")}>
                   <button type="button" className="icon-button" aria-label={t("app.showFilesPanel")} onClick={() => setFilesPanelOpen(true)}>
                     <PanelRightOpen size={16} aria-hidden="true" />

@@ -571,6 +571,37 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     const terminalPane = page.getByTestId("terminal-pane");
     await expectTerminalLine(page, "termd-e2e-ready", 8_000);
 
+    const openProgressButton = terminalPane.getByRole("button", { name: "Session opening progress" });
+    await expect(openProgressButton).toBeVisible();
+    const openProgressIcon = openProgressButton.locator("svg[data-open-progress-icon='ready']");
+    await expect(openProgressIcon).toBeVisible();
+    await expect(openProgressIcon).toHaveCSS("width", "18px");
+    await expect(openProgressIcon).toHaveCSS("height", "18px");
+    await expect(openProgressButton.locator("img[data-avatar-style='thumbs']")).toHaveCount(0);
+
+    await openProgressButton.click();
+    const openProgressPopover = terminalPane.getByTestId("terminal-open-progress");
+    await expect(openProgressPopover).toBeVisible();
+    const progressButtonBox = await openProgressButton.boundingBox();
+    const progressPopoverBox = await openProgressPopover.boundingBox();
+    expect(progressButtonBox).not.toBeNull();
+    expect(progressPopoverBox).not.toBeNull();
+    expect(progressPopoverBox!.y).toBeGreaterThanOrEqual(progressButtonBox!.y + progressButtonBox!.height + 4);
+    if (testInfo.project.name === "chromium") {
+      await page.setViewportSize({ width: 820, height: 768 });
+      const narrowTerminalBox = await terminalPane.boundingBox();
+      const narrowPopoverBox = await openProgressPopover.boundingBox();
+      expect(narrowTerminalBox).not.toBeNull();
+      expect(narrowPopoverBox).not.toBeNull();
+      expect(narrowPopoverBox!.x).toBeGreaterThanOrEqual(narrowTerminalBox!.x);
+      expect(narrowPopoverBox!.x + narrowPopoverBox!.width)
+        .toBeLessThanOrEqual(narrowTerminalBox!.x + narrowTerminalBox!.width);
+      await page.screenshot({ path: "test-results/session-open-progress-narrow-desktop.png", fullPage: true });
+      await page.setViewportSize({ width: 1366, height: 768 });
+    }
+    await openProgressButton.click();
+    await expect(openProgressPopover).toBeHidden();
+
     if (testInfo.project.name === "mobile-chrome") {
       await expect(page.getByRole("navigation", { name: "mobile workspace actions" })).toHaveCount(0);
       const sessionListRequests = () =>
@@ -673,10 +704,22 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
 
     const sessionsPanel = page.getByRole("region", { name: "sessions" });
     // session UUID 已从 UI 隐藏；测试按用户实际看到的可访问名称打开会话。
-    const sessionRow = sessionsPanel.getByRole("button", { name: "Open Lagrange" });
+    const openSessionButton = sessionsPanel.getByRole("button", { name: "Open Lagrange" });
+    const sessionRow = sessionsPanel.locator(".session-row").filter({
+      has: page.getByRole("button", { name: "Open Lagrange" }),
+    });
     await expect(sessionRow).toBeVisible();
+    const sessionAvatarFrame = sessionRow.locator(".session-avatar");
+    const sessionAvatar = sessionRow.locator("img[data-avatar-style='thumbs']");
+    await expect(sessionAvatar).toBeVisible();
+    await expect(sessionAvatarFrame).toHaveCSS("width", "28px");
+    await expect(sessionAvatarFrame).toHaveCSS("height", "28px");
+    await expect.poll(() => sessionAvatar.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+    if (testInfo.project.name === "chromium") {
+      await page.screenshot({ path: "test-results/session-thumbs-desktop.png", fullPage: true });
+    }
 
-    await sessionRow.click();
+    await openSessionButton.click();
     await expectTerminalLine(page, "termd-e2e-ready", 8_000);
 
     if (testInfo.project.name !== "mobile-chrome") {
@@ -752,6 +795,11 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
 
     await page.reload();
     await expectTerminalLine(page, "termd-e2e-ready", 8_000);
+    const reloadedProgressButton = page
+      .getByTestId("terminal-pane")
+      .getByRole("button", { name: "Session opening progress" });
+    await expect(reloadedProgressButton).toBeVisible();
+    await expect(reloadedProgressButton.locator("svg[data-open-progress-icon='ready']")).toBeVisible();
     await focusTerminalKeyboardSink(page);
     await page.keyboard.type("terminal-after-reload");
     await page.keyboard.press("Enter");

@@ -1,6 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { ChevronDown, ChevronUp, ClipboardPaste, Copy, Search, X } from "lucide-react";
-import type { BrowserMobileShortcut, EffectiveTheme, SessionSearchResultPayload, TerminalSize } from "../protocol/types";
+import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { ClipboardPaste, Copy } from "lucide-react";
+import type { BrowserMobileShortcut, EffectiveTheme, TerminalSize } from "../protocol/types";
 import { useI18n } from "../i18n";
 import { terminalTheme } from "../theme";
 import type { TerminalOutputItem, TerminalResyncOptions } from "./terminal/types";
@@ -12,10 +12,10 @@ import {
   sameTerminalDimensions,
   type TerminalRendererFitAddon,
   type TerminalRendererInstance,
-  type TerminalRendererSearchAddon,
   type TerminalRendererTerminal,
-  type TerminalSearchOptions,
 } from "./terminal/renderer";
+import { SessionOpenProgressControl } from "./SessionOpenProgressControl";
+import type { SessionOpenProgress } from "../session-open-progress";
 
 export type { TerminalOutputItem } from "./terminal/types";
 
@@ -51,17 +51,6 @@ const TERMINAL_SURFACE_SELECTOR_FALLBACKS = [
   ".xterm-viewport",
   ".xterm",
 ] as const;
-const TERMINAL_SEARCH_OPTIONS: TerminalSearchOptions = {
-  caseSensitive: false,
-  decorations: {
-    matchBackground: "#a7c080",
-    matchBorder: "#a7c080",
-    matchOverviewRuler: "#a7c080",
-    activeMatchBackground: "#e69875",
-    activeMatchBorder: "#e69875",
-    activeMatchColorOverviewRuler: "#e69875",
-  },
-};
 type ResizeSource = "layout" | "focus" | "session" | "snapshot" | "mobile-viewport";
 const RESIZE_SOURCE_PRIORITY: Record<ResizeSource, number> = {
   snapshot: 0,
@@ -126,6 +115,7 @@ interface TerminalPaneProps {
   mobileViewportHeight?: number;
   mobileViewportOffsetTop?: number;
   theme?: EffectiveTheme;
+  sessionOpenProgress?: SessionOpenProgress;
   outputResetVersion: number;
   takeOutput: () => TerminalOutputItem[];
   registerOutputDrain: (drain: () => void) => () => void;
@@ -134,7 +124,6 @@ interface TerminalPaneProps {
   onTerminalSeqRendered?: (terminalSeq: number) => void;
   onTerminalSizeRendered?: (size: TerminalSize) => void;
   mobileShortcuts?: BrowserMobileShortcut[];
-  onSearch?: (query: string) => Promise<SessionSearchResultPayload>;
   onInput: (data: string) => void;
   onResize: (size: TerminalSize) => void;
   /** @deprecated Cursor is derived locally from snapshot and PTY output. */
@@ -153,9 +142,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const frameRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<TerminalRendererTerminal | null>(null);
   const fitRef = useRef<TerminalRendererFitAddon | null>(null);
-  const searchAddonRef = useRef<TerminalRendererSearchAddon | null>(null);
   const rendererRef = useRef<TerminalRendererInstance | null>(null);
-  const searchRequestSeqRef = useRef(0);
   const outputResetVersionRef = useRef(props.outputResetVersion);
   const attachedRef = useRef(props.attached);
   const onInputRef = useRef(props.onInput);
@@ -335,12 +322,6 @@ export function TerminalPane(props: TerminalPaneProps) {
   const [terminalSelectionAvailable, setTerminalSelectionAvailable] = useState(false);
   const [mobileDirectionActive, setMobileDirectionActive] = useState(false);
   const [mobileDirection, setMobileDirection] = useState<MobileDirection | undefined>();
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [searchDraft, setSearchDraft] = useState("");
-  const [searchLoading, setSearchLoading] = useState(false);
-  const [searchError, setSearchError] = useState<string | undefined>();
-  const [searchResult, setSearchResult] = useState<SessionSearchResultPayload | undefined>();
-  const [activeSearchIndex, setActiveSearchIndex] = useState(0);
   const deferredFrameIdRef = useRef(0);
   const deferredFrameHandlesByIdRef = useRef<Map<number, DeferredTerminalFrameHandle>>(new Map());
   const deferredFrameHandlesRef = useRef<Set<DeferredTerminalFrameHandle>>(new Set());
@@ -694,12 +675,6 @@ export function TerminalPane(props: TerminalPaneProps) {
   };
 
   useEffect(() => {
-    // 搜索结果绑定当前 terminal buffer；attach/reset 后旧请求即使返回也不能落到新 buffer。
-    searchRequestSeqRef.current += 1;
-    setSearchLoading(false);
-    setSearchError(undefined);
-    setSearchResult(undefined);
-    searchAddonRef.current?.clearDecorations();
     terminalRenderedOutputBytesSinceSnapshotRef.current = 0;
     terminalObservedLiveOutputSinceSnapshotRef.current = false;
     terminalOutputIdleRef.current = true;
@@ -2049,82 +2024,6 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
   };
 
-  const runSearch = async (event?: FormEvent<HTMLFormElement>) => {
-    event?.preventDefault();
-    const requestId = searchRequestSeqRef.current + 1;
-    searchRequestSeqRef.current = requestId;
-    const query = searchDraft.trim();
-    if (!query || !props.onSearch) {
-      setSearchLoading(false);
-      setSearchError(undefined);
-      setSearchResult(undefined);
-      searchAddonRef.current?.clearDecorations();
-      return;
-    }
-    setSearchLoading(true);
-    setSearchError(undefined);
-    try {
-      const result = await props.onSearch(query);
-      if (searchRequestSeqRef.current !== requestId) {
-        return;
-      }
-      setSearchResult(result);
-      setActiveSearchIndex(0);
-      scrollToSearchMatch(result, 0);
-      highlightSearchMatches(query, "next");
-    } catch {
-      if (searchRequestSeqRef.current !== requestId) {
-        return;
-      }
-      setSearchResult(undefined);
-      searchAddonRef.current?.clearDecorations();
-      setSearchError(t("terminal.searchFailed"));
-    } finally {
-      if (searchRequestSeqRef.current === requestId) {
-        setSearchLoading(false);
-      }
-    }
-  };
-
-  const scrollToSearchMatch = (result: SessionSearchResultPayload | undefined, index: number) => {
-    const terminal = terminalRef.current;
-    const scrollState = terminal ? rendererRef.current?.scrollState(terminal) : undefined;
-    const match = result?.matches[index];
-    if (!terminal || !scrollState || !match || !result?.line_count) {
-      return;
-    }
-    // daemon 返回的是本次 snapshot 内的行号；renderer buffer 尾部与 snapshot 尾部对齐。
-    const firstSnapshotLine = Math.max(0, scrollState.length - result.line_count);
-    terminal.scrollToLine(clampNumber(firstSnapshotLine + match.line_index, 0, Math.max(0, scrollState.length - 1)));
-    focusTerminalInputSink(terminal);
-  };
-
-  const stepSearchResult = (direction: 1 | -1) => {
-    if (!searchResult || searchResult.matches.length === 0) {
-      return;
-    }
-    const nextIndex = (activeSearchIndex + direction + searchResult.matches.length) % searchResult.matches.length;
-    setActiveSearchIndex(nextIndex);
-    scrollToSearchMatch(searchResult, nextIndex);
-    highlightSearchMatches(searchResult.query, direction > 0 ? "next" : "previous");
-  };
-
-  const highlightSearchMatches = (query: string, direction: "next" | "previous") => {
-    const trimmed = query.trim();
-    if (!trimmed) {
-      searchAddonRef.current?.clearDecorations();
-      return;
-    }
-    // daemon 搜索负责跨 snapshot 的结果数量和目标行；终端渲染层本身不暴露文本
-    // decoration API，因此可见反馈由 React 层的搜索结果浮层承担。renderer search hook
-    // 只保留为可选扩展点，当前 renderer adapter 是 no-op。
-    if (direction === "previous") {
-      searchAddonRef.current?.findPrevious(trimmed, TERMINAL_SEARCH_OPTIONS);
-      return;
-    }
-    searchAddonRef.current?.findNext(trimmed, TERMINAL_SEARCH_OPTIONS);
-  };
-
   const keepMobileKeyboardFocused = (event: ReactPointerEvent<HTMLButtonElement>) => {
     // 快捷键按钮位于软键盘上方；阻止按钮抢焦点，尽量让移动端键盘保持打开。
     event.preventDefault();
@@ -2860,7 +2759,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         renderer.terminal.dispose();
         return;
       }
-      const { terminal, fit, search: searchAddon } = renderer;
+      const { terminal, fit } = renderer;
       terminal.open(host);
       recordTermdDiagnostic("terminal_renderer_mounted", {
         kind: renderer.kind,
@@ -3665,7 +3564,6 @@ export function TerminalPane(props: TerminalPaneProps) {
     });
     terminalRef.current = terminal;
     fitRef.current = fit;
-    searchAddonRef.current = searchAddon;
     rendererRef.current = renderer;
     outputResetVersionRef.current = props.outputResetVersion;
     confirmOutputResetApplied(props.outputResetVersion);
@@ -3815,7 +3713,6 @@ export function TerminalPane(props: TerminalPaneProps) {
       delete host.dataset.buffer;
       terminalRef.current = null;
       fitRef.current = null;
-      searchAddonRef.current = null;
       rendererRef.current = null;
       setTerminalSelectionAvailable(false);
       resizeRef.current = undefined;
@@ -3879,7 +3776,6 @@ export function TerminalPane(props: TerminalPaneProps) {
         convertEol: true,
         theme: terminalTheme(props.theme ?? "dark"),
       },
-      searchOptions: { highlightLimit: 1000 },
     });
     if ("then" in rendererResult) {
       void rendererResult.then(mountRenderer);
@@ -3964,8 +3860,6 @@ export function TerminalPane(props: TerminalPaneProps) {
     stabilizeRef.current?.(hasActiveTerminalFocus() ? "focus" : "layout");
   }, [props.mobileInputMode]);
 
-  const activeSearchMatch = searchResult?.matches[activeSearchIndex];
-
   return (
     <section
       className="terminal-pane"
@@ -3998,63 +3892,8 @@ export function TerminalPane(props: TerminalPaneProps) {
           </div>
         </div>
       </div>
-      {props.attached && props.onSearch ? (
-        <div className="terminal-search-control" onClick={(event) => event.stopPropagation()}>
-          {searchOpen ? (
-            <form className="terminal-search-popover" onSubmit={runSearch}>
-              <label>
-                <span className="sr-only">{t("terminal.search")}</span>
-                <input
-                  value={searchDraft}
-                  autoFocus
-                  placeholder={t("terminal.searchPlaceholder")}
-                  onChange={(event) => {
-                    searchRequestSeqRef.current += 1;
-                    setSearchLoading(false);
-                    setSearchError(undefined);
-                    setSearchDraft(event.currentTarget.value);
-                  }}
-                />
-              </label>
-              <button type="submit" className="icon-button" aria-label={t("terminal.search")} disabled={searchLoading || !searchDraft.trim()}>
-                <Search size={14} aria-hidden="true" />
-              </button>
-              <button type="button" className="icon-button" aria-label={t("terminal.previousMatch")} disabled={!searchResult?.matches.length} onClick={() => stepSearchResult(-1)}>
-                <ChevronUp size={14} aria-hidden="true" />
-              </button>
-              <button type="button" className="icon-button" aria-label={t("terminal.nextMatch")} disabled={!searchResult?.matches.length} onClick={() => stepSearchResult(1)}>
-                <ChevronDown size={14} aria-hidden="true" />
-              </button>
-              <span className="terminal-search-count" aria-live="polite">
-                {searchError ?? (searchResult ? `${searchResult.matches.length ? activeSearchIndex + 1 : 0}/${searchResult.matches.length}${searchResult.truncated ? "+" : ""}` : "")}
-              </span>
-              <button
-                type="button"
-                className="icon-button"
-                aria-label={t("terminal.closeSearch")}
-                onClick={() => {
-                  searchRequestSeqRef.current += 1;
-                  searchAddonRef.current?.clearDecorations();
-                  setSearchLoading(false);
-                  setSearchError(undefined);
-                  setSearchResult(undefined);
-                  setSearchOpen(false);
-                }}
-              >
-                <X size={14} aria-hidden="true" />
-              </button>
-            </form>
-          ) : (
-            <button type="button" className="icon-button terminal-search-button" aria-label={t("terminal.search")} onClick={() => setSearchOpen(true)}>
-              <Search size={15} aria-hidden="true" />
-            </button>
-          )}
-          {searchOpen && searchResult?.matches.length ? (
-            <div className="terminal-search-highlight" data-testid="terminal-search-highlight">
-              {activeSearchMatch?.line_text ?? searchResult.query}
-            </div>
-          ) : null}
-        </div>
+      {props.sessionOpenProgress ? (
+        <SessionOpenProgressControl progress={props.sessionOpenProgress} />
       ) : null}
       {props.attached && props.mobileInputMode && terminalSelectionAvailable ? (
         <div
@@ -4135,7 +3974,9 @@ export function TerminalPane(props: TerminalPaneProps) {
           {t("terminal.copied")}
         </div>
       ) : null}
-      {!props.attached ? <div className="terminal-placeholder">{t("status.detached")}</div> : null}
+      {!props.attached && !props.sessionOpenProgress ? (
+        <div className="terminal-placeholder">{t("status.detached")}</div>
+      ) : null}
     </section>
   );
 }

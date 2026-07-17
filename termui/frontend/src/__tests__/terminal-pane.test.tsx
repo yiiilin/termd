@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { TerminalPane, type TerminalOutputItem } from "../components/TerminalPane";
-import type { SessionSearchResultPayload, TerminalSize } from "../protocol/types";
+import type { TerminalSize } from "../protocol/types";
 
 const animationFrameMs = 16;
 const DEFAULT_TERMINAL_SIZE = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
@@ -268,20 +268,6 @@ async function flushPasteShortcutFallbackTick() {
   await act(async () => {
     await new Promise((resolve) => window.setTimeout(resolve, 0));
   });
-}
-
-function searchResult(query: string, matchCount: number): SessionSearchResultPayload {
-  return {
-    session_id: "00000000-0000-0000-0000-000000000401",
-    query,
-    line_count: 4,
-    matches: Array.from({ length: matchCount }, (_, index) => ({
-      line_index: index,
-      column_index: 0,
-      line_text: `${query}-${index}`,
-    })),
-    truncated: false,
-  };
 }
 
 describe("TerminalPane terminal sequence rendering", () => {
@@ -3897,55 +3883,6 @@ describe("TerminalPane terminal sequence rendering", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-});
-
-describe("TerminalPane terminal search", () => {
-  it("忽略旧搜索请求的迟到结果", async () => {
-    const alphaSearch = deferred<SessionSearchResultPayload>();
-    const betaSearch = deferred<SessionSearchResultPayload>();
-    const onSearch = vi.fn((query: string) => (query === "alpha" ? alphaSearch.promise : betaSearch.promise));
-
-    render(
-      <TerminalPane
-        attached
-        sessionSize={DEFAULT_TERMINAL_SIZE}
-        outputResetVersion={0}
-        takeOutput={() => []}
-        registerOutputDrain={() => () => undefined}
-        onSearch={onSearch}
-        onInput={vi.fn()}
-        onResize={vi.fn()}
-        onCursorChange={vi.fn()}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "Search terminal" }));
-    const input = screen.getByPlaceholderText("Search scrollback");
-    const form = input.closest("form");
-    expect(form).not.toBeNull();
-
-    fireEvent.change(input, { target: { value: "alpha" } });
-    fireEvent.submit(form!);
-    fireEvent.change(input, { target: { value: "beta" } });
-    fireEvent.submit(form!);
-    expect(onSearch).toHaveBeenNthCalledWith(1, "alpha");
-    expect(onSearch).toHaveBeenNthCalledWith(2, "beta");
-
-    await act(async () => {
-      betaSearch.resolve(searchResult("beta", 2));
-      await betaSearch.promise;
-    });
-    expect(await screen.findByText("1/2")).toBeInTheDocument();
-    expect(screen.getByTestId("terminal-search-highlight")).toHaveTextContent("beta");
-
-    await act(async () => {
-      alphaSearch.resolve(searchResult("alpha", 1));
-      await alphaSearch.promise;
-    });
-
-    expect(screen.getByText("1/2")).toBeInTheDocument();
-    expect(screen.getByTestId("terminal-search-highlight")).toHaveTextContent("beta");
   });
 });
 

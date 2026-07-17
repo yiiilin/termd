@@ -4289,38 +4289,97 @@ describe("termui web 工作台", () => {
     );
   });
 
-  it("终端搜索会查询 session snapshot，并支持切换命中结果", async () => {
+  it("切换 session 时展示打开步骤，并在首帧渲染后保留可回看的进度按钮", async () => {
     const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000581",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000582",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "progress-ready\n",
+      attachDelayMs: 180,
+    });
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await waitForWorkspaceSession();
-    await clickSessionCard(user);
-
-    await screen.findByText(/termd-e2e-ready/);
-    daemon.pushSessionData(DEFAULT_SESSION_ID, "alpha beta\nbeta gamma\n");
-    await screen.findByText(/beta gamma/);
+    await waitForWorkspaceSession("alpha");
+    await screen.findByText(/progress-ready/);
 
     const terminalPane = screen.getByTestId("terminal-pane");
-    await user.click(within(terminalPane).getByRole("button", { name: "Search terminal" }));
-    const searchInput = await within(terminalPane).findByPlaceholderText("Search scrollback");
-    await user.type(searchInput, "beta");
-    await user.keyboard("{Enter}");
+    expect(within(terminalPane).queryByRole("button", { name: "Search terminal" })).toBeNull();
+
+    await clickSessionCard(user, "beta");
+
+    const progress = await within(terminalPane).findByTestId("terminal-open-progress");
+    expect(progress).toHaveTextContent("Opening terminal");
+    expect(progress).toHaveTextContent("beta");
+    expect(progress).toHaveTextContent("Session selected");
+    expect(progress).toHaveTextContent("Sync terminal content");
 
     await waitFor(() =>
-      expect(daemon.sessionSearchRequests).toContainEqual({
-        session_id: DEFAULT_SESSION_ID,
-        query: "beta",
-        case_sensitive: false,
-        max_results: 80,
-      }),
+      expect(daemon.attachedSessions).toContain(betaSession.session_id),
     );
-    await within(terminalPane).findByText("1/2");
-    await waitFor(() =>
-      expect(within(terminalPane).getByTestId("terminal-search-highlight")).toHaveTextContent("beta"),
-    );
-    await user.click(within(terminalPane).getByRole("button", { name: "Next match" }));
-    await within(terminalPane).findByText("2/2");
+    await waitFor(() => expect(within(terminalPane).queryByTestId("terminal-open-progress")).toBeNull());
+
+    const progressButton = within(terminalPane).getByRole("button", { name: "Session opening progress" });
+    await user.click(progressButton);
+    const completedProgress = within(terminalPane).getByTestId("terminal-open-progress");
+    expect(completedProgress).toHaveTextContent("Terminal ready");
+    expect(completedProgress).toHaveTextContent("NextTerminal available");
+  });
+
+  it("attach 失败时在错误提示下保留失败步骤和耗时", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000583",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000584",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "progress-failure-ready\n",
+      attachDelayMs: 180,
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await screen.findByText(/progress-failure-ready/);
+
+    await clickSessionCard(user, "beta");
+    daemon.forgetSession(betaSession.session_id);
+
+    await screen.findByRole("alert", { name: "Connection error" });
+    const terminalPane = screen.getByTestId("terminal-pane");
+    const failedProgress = within(terminalPane).getByTestId("terminal-open-progress");
+    expect(failedProgress).toHaveTextContent("Open failed");
+    expect(failedProgress).toHaveTextContent("beta");
+    expect(failedProgress).toHaveTextContent("Retry connection");
+    expect(
+      within(terminalPane)
+        .getByRole("button", { name: "Session opening progress" })
+        .querySelector("svg[data-open-progress-icon='failed']"),
+    ).toHaveClass("lucide-circle-x");
   });
 
   it("可以创建 session 并自动 attach 到 terminal", async () => {

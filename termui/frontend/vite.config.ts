@@ -10,8 +10,7 @@ function manualChunk(id: string): string | undefined {
   }
   if (
     id.includes("node_modules/@xterm/xterm/") ||
-    id.includes("node_modules/@xterm/addon-fit/") ||
-    id.includes("node_modules/@xterm/addon-search/")
+    id.includes("node_modules/@xterm/addon-fit/")
   ) {
     return "xterm-vendor";
   }

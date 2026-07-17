@@ -48,10 +48,10 @@ describe("SessionList", () => {
     expect(row).not.toHaveAttribute("role", "button");
     expect(within(openButton).queryByRole("button")).toBeNull();
     expect(within(row as HTMLElement).queryByRole("button", { name: /Drag/ })).toBeNull();
-    const identicon = (row as HTMLElement).querySelector<HTMLImageElement>(
-      '[data-session-identicon="00000000-0000-0000-0000-000000000401"] img',
+    const avatar = (row as HTMLElement).querySelector<HTMLImageElement>(
+      '[data-session-avatar="00000000-0000-0000-0000-000000000401"][data-avatar-style="thumbs"]',
     );
-    expect(identicon?.getAttribute("src")).toMatch(/^data:image\/svg\+xml;charset=utf-8,/);
+    expect(avatar?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
     expect(within(row as HTMLElement).getByRole("button", { name: "Rename session" })).toBeInTheDocument();
     expect(within(row as HTMLElement).getByRole("button", { name: "Close session" })).toBeInTheDocument();
   });
@@ -90,31 +90,21 @@ describe("SessionList", () => {
       </>,
     );
 
-    const alphaDarkIcons = Array.from(
+    const alphaAvatars = Array.from(
       document.querySelectorAll<HTMLImageElement>(
-        `[data-session-identicon="${alphaId}"] [data-identicon-theme="dark"]`,
+        `[data-session-avatar="${alphaId}"][data-avatar-style="thumbs"]`,
       ),
     );
-    const alphaLightIcons = Array.from(
-      document.querySelectorAll<HTMLImageElement>(
-        `[data-session-identicon="${alphaId}"] [data-identicon-theme="light"]`,
-      ),
+    const betaAvatar = document.querySelector<HTMLImageElement>(
+      `[data-session-avatar="${betaId}"][data-avatar-style="thumbs"]`,
     );
-    const betaDarkIcon = document.querySelector<HTMLImageElement>(
-      `[data-session-identicon="${betaId}"] [data-identicon-theme="dark"]`,
-    );
-    const alphaDarkSources = alphaDarkIcons.map((icon) => icon.getAttribute("src"));
-    const alphaLightSources = alphaLightIcons.map((icon) => icon.getAttribute("src"));
+    const alphaSources = alphaAvatars.map((avatar) => avatar.getAttribute("src"));
 
-    expect(alphaDarkIcons).toHaveLength(2);
-    expect(alphaLightIcons).toHaveLength(2);
-    expect(alphaDarkSources[0]).toBe(alphaDarkSources[1]);
-    expect(alphaLightSources[0]).toBe(alphaLightSources[1]);
-    expect(alphaDarkSources[0]).toMatch(/^data:image\/svg\+xml;charset=utf-8,/);
-    expect(alphaLightSources[0]).toMatch(/^data:image\/svg\+xml;charset=utf-8,/);
-    expect(alphaLightSources[0]).not.toBe(alphaDarkSources[0]);
-    expect(betaDarkIcon?.getAttribute("src")).toMatch(/^data:image\/svg\+xml;charset=utf-8,/);
-    expect(betaDarkIcon?.getAttribute("src")).not.toBe(alphaDarkSources[0]);
+    expect(alphaAvatars).toHaveLength(2);
+    expect(alphaSources[0]).toBe(alphaSources[1]);
+    expect(alphaSources[0]).toMatch(/^data:image\/svg\+xml/);
+    expect(betaAvatar?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
+    expect(betaAvatar?.getAttribute("src")).not.toBe(alphaSources[0]);
   });
 
   it("重命名保存时把当前输入框里的完整值交给回调", async () => {
@@ -219,7 +209,12 @@ describe("SessionList", () => {
     expect(within(runningButton).queryByTitle("Codex is running")).toBeNull();
     expect(screen.getByTitle("OpenCode finished").querySelector(".session-activity-ok-badge")).not.toBeNull();
     expect(screen.getByTitle("Claude Code needs attention").querySelector(".session-activity-attention-badge")).not.toBeNull();
-    expect(document.querySelector(".session-identicon")).toBeNull();
+    expect(document.querySelectorAll(".session-avatar")).toHaveLength(4);
+    expect(
+      runningRow.querySelector(
+        '[data-session-avatar="00000000-0000-0000-0000-000000000401"][data-avatar-style="thumbs"]',
+      ),
+    ).not.toBeNull();
   });
 
   it("直接拖动卡片时用横线标出插入位置并按该位置排序", () => {

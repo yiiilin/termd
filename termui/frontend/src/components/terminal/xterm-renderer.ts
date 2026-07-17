@@ -1,5 +1,4 @@
 import { FitAddon } from "@xterm/addon-fit";
-import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
 import { Terminal } from "@xterm/xterm";
 import type {
   CreateTerminalRendererOptions,
@@ -298,10 +297,6 @@ function createTermdXtermFitAddon(terminal: Terminal, fitAddon: FitAddon): Termi
   };
 }
 
-function createXtermSearchAddon(options: CreateTerminalRendererOptions): SearchAddon {
-  return new SearchAddon(options.searchOptions as Partial<{ highlightLimit: number }>);
-}
-
 function adaptXtermTerminal(
   terminal: Terminal,
   cleanupDebugBufferMirror: () => void = () => undefined,
@@ -419,9 +414,7 @@ function adaptXtermTerminal(
 export function createXtermRenderer(options: CreateTerminalRendererOptions): TerminalRendererInstance {
   const terminal = new Terminal(options.terminalOptions);
   const fitAddon = new FitAddon();
-  const searchAddon = createXtermSearchAddon(options);
   terminal.loadAddon(fitAddon);
-  terminal.loadAddon(searchAddon);
   let cleanupDebugBufferMirror: () => void = () => undefined;
   const terminalFacade = adaptXtermTerminal(terminal, () => cleanupDebugBufferMirror());
   cleanupDebugBufferMirror = installDebugBufferMirror(terminal, terminalFacade);
@@ -430,15 +423,6 @@ export function createXtermRenderer(options: CreateTerminalRendererOptions): Ter
     kind: "xterm",
     terminal: terminalFacade,
     fit: createTermdXtermFitAddon(terminal, fitAddon),
-    search: {
-      clearDecorations: () => searchAddon.clearDecorations(),
-      findNext: (query, searchOptions) => {
-        searchAddon.findNext(query, searchOptions as ISearchOptions | undefined);
-      },
-      findPrevious: (query, searchOptions) => {
-        searchAddon.findPrevious(query, searchOptions as ISearchOptions | undefined);
-      },
-    },
     getInputElement: (host) => terminal.textarea ?? host.querySelector<HTMLTextAreaElement>("textarea") ?? undefined,
     isActivationTarget: (target) => Boolean(
       target.closest(".xterm") ||

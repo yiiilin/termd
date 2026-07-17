@@ -63,11 +63,6 @@ function fakeRenderer(label: string): TerminalRendererInstance {
       fit: () => undefined,
       proposeDimensions: () => ({ cols: 80, rows: 24 }),
     },
-    search: {
-      clearDecorations: () => undefined,
-      findNext: () => undefined,
-      findPrevious: () => undefined,
-    },
     getInputElement: () => undefined,
     isActivationTarget: () => false,
     setOptions: (options) => {

@@ -12,7 +12,6 @@ describe("terminal renderer factory", () => {
 
     const renderer = await createTerminalRendererInstance({
       terminalOptions: {},
-      searchOptions: {},
     });
 
     expect(renderer.kind).toBe("xterm");

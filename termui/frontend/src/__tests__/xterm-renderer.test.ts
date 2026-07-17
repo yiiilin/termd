@@ -7,7 +7,6 @@ describe("xterm renderer adapter", () => {
 
     const renderer = createXtermRenderer({
       terminalOptions: { fontSize: 14, convertEol: true },
-      searchOptions: {},
     });
 
     expect(renderer.kind).toBe("xterm");
@@ -34,9 +33,6 @@ describe("xterm renderer adapter", () => {
     expect(renderer.terminal.options.fontSize).toBe(18);
     expect(renderer.terminal.options.theme).toEqual({ background: "#101418" });
 
-    expect(() => renderer.search.findNext("line")).not.toThrow();
-    expect(() => renderer.search.findPrevious("line")).not.toThrow();
-    expect(() => renderer.search.clearDecorations()).not.toThrow();
   });
 
   it("viewport 选区和 facade 复制文本保持一致，不回落到陈旧 selection", async () => {
@@ -45,7 +41,6 @@ describe("xterm renderer adapter", () => {
 
     const renderer = createXtermRenderer({
       terminalOptions: { fontSize: 14, convertEol: true },
-      searchOptions: {},
     });
     const host = document.createElement("div");
     renderer.terminal.open(host);
@@ -75,7 +70,6 @@ describe("xterm renderer adapter", () => {
 
     const renderer = createXtermRenderer({
       terminalOptions: { cols: 108, rows: 35, fontSize: 13 },
-      searchOptions: {},
     });
     const host = document.createElement("div");
     renderer.terminal.open(host);
@@ -92,7 +86,6 @@ describe("xterm renderer adapter", () => {
 
     const renderer = createXtermRenderer({
       terminalOptions: { cols: 108, rows: 35, fontSize: 13 },
-      searchOptions: {},
     });
 
     renderer.setOptions({ theme: { background: "#101418" } });
@@ -111,7 +104,6 @@ describe("xterm renderer adapter", () => {
 
     const renderer = createXtermRenderer({
       terminalOptions: { fontSize: 13 },
-      searchOptions: {},
     });
     const host = document.createElement("div");
     renderer.terminal.open(host);

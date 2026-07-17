@@ -299,10 +299,6 @@ export class V070Client {
     return this.jsonRequest(`/api/control/session/${sessionId}/git_action`, { worktree_path: worktreePath, file_path: filePath, action });
   }
 
-  async searchSessionOutput(sessionId: UUID, query: string, options: { caseSensitive?: boolean; maxResults?: number } = {}): Promise<any> {
-    return this.jsonRequest(`/api/control/session/${sessionId}/search`, { query, case_sensitive: Boolean(options.caseSensitive), max_results: options.maxResults ?? 80 });
-  }
-
   async getSessionGitDiff(sessionId: UUID, worktreePath: string, filePath?: string | null, staged = false): Promise<any> {
     return this.jsonRequest(`/api/control/session/${sessionId}/git_diff`, { worktree_path: worktreePath, file_path: filePath, staged });
   }

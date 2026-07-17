@@ -46,11 +46,15 @@ describe("mobile layout regressions", () => {
     expect(hostFocusBlock).toContain("caret-color: transparent !important;");
   });
 
-  it("keeps terminal search result text in its own grid column before the close button", () => {
+  it("keeps terminal open progress labels and timings in stable responsive columns", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
-    expect(css).toContain("grid-template-columns: minmax(0, 1fr) repeat(3, 28px) minmax(54px, max-content) 28px;");
-    expect(css).toContain(".terminal-search-count {\n  min-width: 54px;");
+    expect(css).toContain("left: calc(var(--terminal-frame-padding) + 8px);");
+    expect(css).toContain("width: min(340px, 100%);");
+    expect(css).toContain(".terminal-open-progress-button,\n.terminal-open-progress-popover {\n  pointer-events: auto;");
+    expect(css).toContain("grid-template-columns: 16px minmax(0, 1fr) 64px;");
+    expect(css).toContain("font-variant-numeric: tabular-nums;");
+    expect(css).not.toContain(".terminal-search-control");
   });
 
   it("keeps toolbar icons and labels vertically centered in buttons", () => {
