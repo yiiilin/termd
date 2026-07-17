@@ -2574,6 +2574,16 @@ export default function App() {
     selectedSessionId,
   ]);
 
+  const handleForcedRetryConnection = useCallback(async () => {
+    // 浏览器长时间冻结时，已经登记的 reconnect timer 可能永远不会执行，但 ref 仍会
+    // 阻止 visible/pageshow 和用户手动 Refresh 发起恢复。显式恢复必须覆盖这条旧 timer。
+    // timer 已经开始执行时 ref 会先被清空；此时保留 reconnect key，让在途 attach 正常完成。
+    if (attachReconnectTimerRef.current !== undefined) {
+      resetAttachReconnectState();
+    }
+    return handleRetryConnection();
+  }, [attachReconnectTimerRef, handleRetryConnection, resetAttachReconnectState]);
+
   useEffect(() => {
     retryConnectionHandlerRef.current = handleRetryConnection;
   }, [handleRetryConnection]);
@@ -2645,7 +2655,7 @@ export default function App() {
         terminalWasHiddenRef.current = false;
         if (wasFrozen) {
           if (attachedSessionRef.current ?? attachedSessionId ?? selectedSessionId) {
-            await handleRetryConnection();
+            await handleForcedRetryConnection();
           }
           if (!terminalResumeMountedRef.current) return;
           scheduleResumeMetadataRefresh();
@@ -2670,7 +2680,7 @@ export default function App() {
               attachedSessionRef.current === probeSessionId
             ) {
               closeWorkspaceClient();
-              await handleRetryConnection();
+              await handleForcedRetryConnection();
             }
             scheduleResumeMetadataRefresh();
             return;
@@ -2678,13 +2688,13 @@ export default function App() {
         }
         if (!terminalResumeMountedRef.current) return;
         if (error) {
-          await handleRetryConnection();
+          await handleForcedRetryConnection();
           if (!terminalResumeMountedRef.current) return;
           scheduleResumeMetadataRefresh();
           return;
         }
         if ((attachedSessionId || selectedSessionId) && (!attachClientRef.current || attachClientRef.current.isClosed)) {
-          await handleRetryConnection();
+          await handleForcedRetryConnection();
           if (!terminalResumeMountedRef.current) return;
           scheduleResumeMetadataRefresh();
           return;
@@ -2760,7 +2770,7 @@ export default function App() {
     connectionReady,
     error,
     handleRefresh,
-    handleRetryConnection,
+    handleForcedRetryConnection,
     loadDaemonStatus,
     rescuePendingTerminalOutputFlush,
     scheduleResumeMetadataRefresh,
@@ -3539,7 +3549,7 @@ export default function App() {
           {error ? (
             <ProtocolErrorAlert
               error={error}
-              onRefresh={hasPairedServer ? handleRetryConnection : undefined}
+              onRefresh={hasPairedServer ? handleForcedRetryConnection : undefined}
               refreshing={status === "attaching" || status === "connecting" || status === "listing"}
             />
           ) : null}
@@ -3839,7 +3849,7 @@ export default function App() {
           {error ? (
             <ProtocolErrorAlert
               error={error}
-              onRefresh={hasPairedServer ? handleRetryConnection : undefined}
+              onRefresh={hasPairedServer ? handleForcedRetryConnection : undefined}
               refreshing={status === "attaching" || status === "connecting" || status === "listing"}
             />
           ) : null}

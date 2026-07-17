@@ -1288,6 +1288,55 @@ describe("termui web 工作台", () => {
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
   });
 
+  it("后台恢复会覆盖浏览器冻结后未执行的 attach 重连 timer", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    const nativeSetTimeout = window.setTimeout.bind(window);
+    let heldReconnectTimer = false;
+    type WindowTimeoutId = ReturnType<typeof window.setTimeout>;
+    let heldReconnectTimerId: WindowTimeoutId | undefined;
+    const setTimeoutSpy = vi.spyOn(window, "setTimeout").mockImplementation((handler, delay, ...args) => {
+      if (!heldReconnectTimer && delay === 250) {
+        heldReconnectTimer = true;
+        heldReconnectTimerId = nativeSetTimeout(() => undefined, 60_000) as unknown as WindowTimeoutId;
+        return heldReconnectTimerId;
+      }
+      return nativeSetTimeout(handler, delay, ...args) as unknown as WindowTimeoutId;
+    });
+
+    try {
+      setDocumentVisibility("hidden");
+      daemon.dropConnections();
+      await waitFor(() => expect(heldReconnectTimer).toBe(true));
+
+      setDocumentVisibility("visible");
+      fireEvent.focus(window);
+
+      await waitFor(
+        () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+        { timeout: 2800 },
+      );
+      expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+
+      const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(terminalInput).not.toBeNull();
+      terminalInput!.value = "input-after-frozen-timer-recovery";
+      fireEvent.input(terminalInput!);
+      await waitFor(() => expect(daemon.sessionDataMessages).toContain("input-after-frozen-timer-recovery"));
+    } finally {
+      if (heldReconnectTimerId !== undefined) {
+        window.clearTimeout(heldReconnectTimerId);
+      }
+      setTimeoutSpy.mockRestore();
+    }
+  });
+
   it("pagehide 会立即失效 terminal WebSocket 并在 pageshow 恢复当前 session", async () => {
     setViewportWidth(390);
     const user = userEvent.setup();
@@ -4027,6 +4076,58 @@ describe("termui web 工作台", () => {
     expect(daemon.attachRequests).toHaveLength(attachCountBeforeReconnect + 1);
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+  });
+
+  it("恢复事件不会废弃已经开始的自动重连", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "termd-e2e-ready\n",
+      attachDelayMs: 220,
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    const attachCountBeforeReconnect = daemon.attachRequests.length;
+    daemon.dropConnections();
+    await waitFor(
+      () => expect(daemon.attachRequests).toHaveLength(attachCountBeforeReconnect + 1),
+      { timeout: 1800 },
+    );
+
+    // attach 请求已经离开 250ms timer、正在等待 daemon ack。此时 focus/online 只能
+    // 复用这轮恢复，不能清空它的 reconnect key 后把成功响应当成 stale attach。
+    fireEvent(window, new Event("focus"));
+    fireEvent(window, new Event("online"));
+
+    await waitFor(
+      () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2800 },
+    );
+    await new Promise((resolve) => window.setTimeout(resolve, 320));
+
+    expect(daemon.attachRequests).toHaveLength(attachCountBeforeReconnect + 1);
+    expect(daemon.hasActiveTerminalSession(DEFAULT_SESSION_ID)).toBe(true);
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
+
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.value = "input-after-inflight-recovery";
+    fireEvent.input(terminalInput!);
+    await waitFor(() => expect(daemon.sessionDataMessages).toContain("input-after-inflight-recovery"));
   });
 
   it("relay 后台恢复时保持 workspace，不依赖侧栏手动刷新", async () => {
