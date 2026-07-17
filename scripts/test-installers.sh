@@ -104,37 +104,29 @@ grep -Fq 'Validate exact release asset set' "${ROOT_DIR}/.github/workflows/relea
 ! grep -Eq '(^|[[:space:]])tar[[:space:]].*-czf' "${ROOT_DIR}/.github/workflows/release.yml"
 ! grep -Eq 'sha256sum .*checksums\.txt' "${ROOT_DIR}/.github/workflows/release.yml"
 ! grep -Eq 'gh release (upload|create).*install-.*\.sh' "${ROOT_DIR}/.github/workflows/release.yml"
-grep -Fq 'releases/latest/download/${asset}' "${ROOT_DIR}/README.md"
 grep -Fq '### 1. 安装 termrelay' "${ROOT_DIR}/README.md"
 grep -Fq '### 2. 安装 termd' "${ROOT_DIR}/README.md"
 grep -Fq '### 3. 安装 termctl' "${ROOT_DIR}/README.md"
-[[ "$(grep -Fc 'trap '\''rm -f -- "$tmp"'\'' EXIT' "${ROOT_DIR}/README.md")" -eq 3 ]]
-[[ "$(grep -Fc 'sudo "$tmp" install' "${ROOT_DIR}/README.md")" -eq 3 ]]
 python3 - "${ROOT_DIR}/README.md" <<'PY'
 import pathlib
+import re
 import sys
 
 readme = pathlib.Path(sys.argv[1]).read_text()
 for number, component in enumerate(("termrelay", "termd", "termctl"), start=1):
     heading = f"### {number}. 安装 {component}"
-    section = readme.split(heading, 1)[1]
-    block = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
-    lines = [line for line in block.splitlines() if line.strip()]
-    if len(lines) != 1:
-        raise SystemExit(f"{heading} must contain exactly one physical shell command line")
-    command = lines[0]
-    required = (
-        "(set -eu;",
-        'case "$(uname -m)" in',
-        f'asset="{component}-linux-${{arch}}"',
-        'tmp="$(mktemp)"',
-        'trap \'rm -f -- "$tmp"\' EXIT',
-        "curl --proto '=https' --tlsv1.2 -fL",
-        'sudo "$tmp" install)',
+    section = readme.split(heading, 1)[1].split("\n### ", 1)[0]
+    blocks = [block.strip() for block in re.findall(r"```bash\n(.*?)\n```", section, re.DOTALL)]
+    arch = "$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+    asset_url = f"https://github.com/yiiilin/termd/releases/latest/download/{component}-linux-{arch}"
+    required_commands = (
+        f'curl -fL "{asset_url}" -o {component}',
+        f'wget -O {component} "{asset_url}"',
+        f'chmod 0755 {component} && sudo ./{component} install && rm -f {component}',
     )
-    missing = [fragment for fragment in required if fragment not in command]
+    missing = [command for command in required_commands if command not in blocks]
     if missing:
-        raise SystemExit(f"{heading} is missing safe installer fragments: {missing}")
+        raise SystemExit(f"{heading} is missing documented download/install commands: {missing}")
 PY
 ! grep -Fq 'python3' "${ROOT_DIR}/README.md"
 grep -Fq 'sudo termrelay upgrade' "${ROOT_DIR}/README.md"
