@@ -87,6 +87,7 @@ interface MockDaemonOptions {
   attachOutput?: string;
   createOutputBeforeResponse?: string;
   attachDelayMs?: number;
+  terminalAttachMetadataDelayMs?: number;
   sessionCreateDelayMs?: number;
   routePreludeError?: ErrorPayload;
   routeReadyDelayMs?: number;
@@ -960,7 +961,12 @@ export class MockDaemon {
             this.sendV070AttachSync(socket, attachedSessionId, session.size);
           }
         });
-        this.broadcastV070Metadata();
+        const metadataDelayMs = Math.max(0, this.options.terminalAttachMetadataDelayMs ?? 0);
+        if (metadataDelayMs > 0) {
+          setTimeout(() => this.broadcastV070Metadata(), metadataDelayMs);
+        } else {
+          this.broadcastV070Metadata();
+        }
         return;
       }
       if (!sessionId) return;

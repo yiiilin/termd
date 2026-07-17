@@ -5278,6 +5278,7 @@ function upsertAttachedSession(
     size: attached.size,
     files_path: existing?.files_path ?? null,
     created_at_ms: existing?.created_at_ms ?? null,
+    activity: existing?.activity ?? null,
   };
   return orderSessions(
     [next, ...current.filter((candidate) => candidate.session_id !== attached.session_id)],

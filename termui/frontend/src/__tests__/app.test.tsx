@@ -2109,7 +2109,7 @@ describe("termui web 工作台", () => {
     expect(latencyLevelClass(151)).toBe("latency-danger");
   });
 
-  it("可以通过拖动手柄调整 session 顺序，并在刷新后保留", async () => {
+  it("可以直接拖动 session 卡片调整顺序，并在刷新后保留", async () => {
     const user = userEvent.setup();
     await daemon.stop();
     daemon = await MockDaemon.start({
@@ -2152,10 +2152,11 @@ describe("termui web 工作台", () => {
       }));
     });
 
-    const shellHandle = screen.getByRole("button", { name: "Drag shell" });
-    fireEvent.mouseDown(shellHandle, { button: 0, clientY: 90 });
-    fireEvent.mouseMove(shellHandle, { clientY: 10 });
-    fireEvent.mouseUp(shellHandle, { clientY: 10 });
+    const shellRow = screen.getByRole("button", { name: "Open shell" }).closest(".session-row") as HTMLElement;
+    fireTouchPointer(shellRow, "pointerdown", { pointerId: 11, clientX: 0, clientY: 90 });
+    fireTouchPointer(shellRow, "pointermove", { pointerId: 11, clientX: 0, clientY: 10 });
+    expect(rows[0]).toHaveClass("drop-before");
+    fireTouchPointer(shellRow, "pointerup", { pointerId: 11, clientX: 0, clientY: 10 });
 
     await waitFor(() => expect(visibleSessionNames()).toEqual(["shell", "work"]));
     await waitFor(() =>
@@ -2247,10 +2248,10 @@ describe("termui web 工作台", () => {
       });
     });
 
-    const shellHandle = screen.getByRole("button", { name: "Drag shell" });
-    fireEvent.mouseDown(shellHandle, { button: 0, clientY: 90 });
-    fireEvent.mouseMove(shellHandle, { clientY: 10 });
-    fireEvent.mouseUp(shellHandle, { clientY: 10 });
+    const shellRow = screen.getByRole("button", { name: "Open shell" }).closest(".session-row") as HTMLElement;
+    fireTouchPointer(shellRow, "pointerdown", { pointerId: 12, clientX: 0, clientY: 90 });
+    fireTouchPointer(shellRow, "pointermove", { pointerId: 12, clientX: 0, clientY: 10 });
+    fireTouchPointer(shellRow, "pointerup", { pointerId: 12, clientX: 0, clientY: 10 });
 
     await waitFor(() => expect(visibleSessionNames()).toEqual(["shell", "work"]));
     await waitFor(() =>
@@ -2307,6 +2308,52 @@ describe("termui web 工作台", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 180));
 
     expect(selectedSessionName()).toBe("gamma");
+  });
+
+  it("terminal attach 保留 metadata 中的 AI activity 直到下一次全量快照", async () => {
+    const user = userEvent.setup();
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000441",
+      name: "alpha",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 3000,
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000442",
+      name: "beta",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      created_at_ms: 2000,
+      activity: {
+        kind: "ai",
+        agent: "codex",
+        state: "running",
+        changed_at_ms: 10,
+      },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      attachOutput: "attached-ready\n",
+      terminalAttachMetadataDelayMs: 300,
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await waitFor(() => expect(daemon.hasActiveTerminalSession(alphaSession.session_id)).toBe(true));
+    await new Promise((resolve) => window.setTimeout(resolve, 350));
+
+    const indicator = await screen.findByTitle("Codex is running");
+    await user.click(screen.getByRole("button", { name: "Open beta, Codex is running" }));
+    await waitFor(() => expect(daemon.hasActiveTerminalSession(betaSession.session_id)).toBe(true));
+    await new Promise((resolve) => window.setTimeout(resolve, 40));
+
+    expect(screen.getByTitle("Codex is running")).toBe(indicator);
+    await new Promise((resolve) => window.setTimeout(resolve, 320));
+    expect(screen.getByTitle("Codex is running")).toBe(indicator);
   });
 
   it("快速切换 session 会关闭尚未完成的 attach 连接", async () => {

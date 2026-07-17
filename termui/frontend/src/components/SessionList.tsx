@@ -1,11 +1,5 @@
-import { Bot, Check, CheckCircle2, CircleAlert, GripVertical, MonitorUp, Pencil, Trash2, X } from "lucide-react";
-import {
-  useEffect,
-  useRef,
-  useState,
-  type MouseEvent as ReactMouseEvent,
-  type PointerEvent as ReactPointerEvent,
-} from "react";
+import { Bot, Check, CircleAlert, Cog, MonitorUp, Pencil, Trash2, X } from "lucide-react";
+import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { flushSync } from "react-dom";
 import type { SessionAiActivityPayload, SessionSummaryPayload, UUID } from "../protocol/types";
 import { sessionDisplayName } from "../session-names";
@@ -29,20 +23,25 @@ function SessionActivityIndicator(props: {
   const activity = props.activity;
   if (!activity) return null;
   const label = sessionActivityLabel(t, activity);
-  const icon = activity.state === "completed"
-    ? <CheckCircle2 size={props.compact ? 11 : 13} aria-hidden="true" />
-    : activity.state === "attention"
-      ? <CircleAlert size={props.compact ? 11 : 13} aria-hidden="true" />
-      : <Bot size={props.compact ? 11 : 13} aria-hidden="true" />;
+  const compact = Boolean(props.compact);
   return (
     <span
-      className={["session-activity-indicator", props.compact ? "compact" : "", sessionActivityClassName(activity)]
+      className={["session-activity-indicator", compact ? "compact" : "", sessionActivityClassName(activity)]
         .filter(Boolean)
         .join(" ")}
       aria-hidden="true"
       title={label}
     >
-      {icon}
+      <Bot className="session-activity-bot" size={compact ? 12 : 18} strokeWidth={1.8} />
+      {activity.state === "running" ? (
+        <Cog className="session-activity-work-gear" size={compact ? 8 : 11} strokeWidth={2.2} />
+      ) : activity.state === "attention" ? (
+        <CircleAlert className="session-activity-attention-badge" size={compact ? 8 : 11} strokeWidth={2.4} />
+      ) : (
+        <span className="session-activity-ok-badge">
+          <Check size={compact ? 7 : 9} strokeWidth={3} />
+        </span>
+      )}
     </span>
   );
 }
@@ -96,78 +95,23 @@ interface SessionListProps {
   onReorder?: (sessionIds: UUID[]) => void;
 }
 
+const SESSION_DRAG_THRESHOLD_PX = 5;
+
 export function SessionList(props: SessionListProps) {
   const [draggingSessionId, setDraggingSessionId] = useState<UUID | undefined>();
-  const [dragTargetSessionId, setDragTargetSessionId] = useState<UUID | undefined>();
+  const [dragInsertionIndex, setDragInsertionIndex] = useState<number | undefined>();
   const { t } = useI18n();
   const rowRefs = useRef(new Map<UUID, HTMLDivElement>());
+  const suppressClickUntilRef = useRef(0);
   const pointerDragRef = useRef<{
     pointerId: number;
     sessionId: UUID;
-    targetSessionId: UUID;
+    startY: number;
+    dragging: boolean;
   } | null>(null);
 
   const isActivePointer = (eventPointerId: number | undefined, dragPointerId: number) =>
     eventPointerId === undefined || eventPointerId === 0 || eventPointerId === dragPointerId;
-
-  const startPointerDrag = (sessionId: UUID, pointerId: number, clientY: number) => {
-    pointerDragRef.current = {
-      pointerId: pointerId || 1,
-      sessionId,
-      targetSessionId: resolvePointerTarget(clientY).sessionId ?? sessionId,
-    };
-    setDraggingSessionId(sessionId);
-    setDragTargetSessionId(pointerDragRef.current.targetSessionId);
-  };
-
-  const updatePointerDrag = (clientY: number, pointerId?: number) => {
-    const drag = pointerDragRef.current;
-    if (!drag || !isActivePointer(pointerId, drag.pointerId)) {
-      return;
-    }
-    const target = resolvePointerTarget(clientY);
-    if (target.sessionId) {
-      pointerDragRef.current = { ...drag, targetSessionId: target.sessionId };
-      setDragTargetSessionId(target.sessionId);
-    }
-  };
-
-  const finishPointerDrag = (clientY: number, pointerId?: number) => {
-    const drag = pointerDragRef.current;
-    if (!drag || !isActivePointer(pointerId, drag.pointerId)) {
-      return;
-    }
-    const target = resolvePointerTarget(clientY);
-    pointerDragRef.current = null;
-    setDraggingSessionId(undefined);
-    setDragTargetSessionId(undefined);
-    moveSessionToIndex(drag.sessionId, target.index);
-  };
-
-  const cancelPointerDrag = (pointerId?: number) => {
-    const drag = pointerDragRef.current;
-    if (!drag || !isActivePointer(pointerId, drag.pointerId)) {
-      return;
-    }
-    pointerDragRef.current = null;
-    setDraggingSessionId(undefined);
-    setDragTargetSessionId(undefined);
-  };
-
-  const moveSessionBefore = (targetSessionId: UUID) => {
-    if (!draggingSessionId || draggingSessionId === targetSessionId) {
-      return;
-    }
-    const currentIds = props.sessions.map((session) => session.session_id);
-    const withoutDragging = currentIds.filter((sessionId) => sessionId !== draggingSessionId);
-    const targetIndex = withoutDragging.indexOf(targetSessionId);
-    if (targetIndex < 0) {
-      return;
-    }
-    const next = [...withoutDragging];
-    next.splice(targetIndex, 0, draggingSessionId);
-    props.onReorder?.(next);
-  };
 
   const moveSessionToIndex = (sessionId: UUID, targetIndex: number) => {
     const currentIds = props.sessions.map((session) => session.session_id);
@@ -175,11 +119,27 @@ export function SessionList(props: SessionListProps) {
     const clampedIndex = Math.max(0, Math.min(targetIndex, withoutDragging.length));
     const next = [...withoutDragging];
     next.splice(clampedIndex, 0, sessionId);
+    if (next.every((candidateId, index) => candidateId === currentIds[index])) {
+      return;
+    }
     props.onReorder?.(next);
   };
 
-  const resolvePointerTarget = (clientY: number) => {
+  const moveSessionByOffset = (sessionId: UUID, offset: -1 | 1) => {
+    const ids = props.sessions.map((session) => session.session_id);
+    const index = ids.indexOf(sessionId);
+    const nextIndex = index + offset;
+    if (index < 0 || nextIndex < 0 || nextIndex >= ids.length) {
+      return;
+    }
+    const next = [...ids];
+    [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+    props.onReorder?.(next);
+  };
+
+  const resolveInsertionIndex = (clientY: number, draggedSessionId: UUID) => {
     const rows = props.sessions
+      .filter((session) => session.session_id !== draggedSessionId)
       .map((session) => ({
         sessionId: session.session_id,
         rect: rowRefs.current.get(session.session_id)?.getBoundingClientRect(),
@@ -189,34 +149,75 @@ export function SessionList(props: SessionListProps) {
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
       if (clientY < row.rect.top + row.rect.height / 2) {
-        return { sessionId: row.sessionId, index };
+        return index;
       }
     }
 
-    return { sessionId: rows.at(-1)?.sessionId, index: rows.length };
+    return rows.length;
   };
 
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return undefined;
+  const startPointerDrag = (sessionId: UUID, pointerId: number, clientY: number) => {
+    pointerDragRef.current = {
+      pointerId: pointerId || 1,
+      sessionId,
+      startY: clientY,
+      dragging: false,
+    };
+  };
+
+  const updatePointerDrag = (clientY: number, pointerId?: number): boolean => {
+    let drag = pointerDragRef.current;
+    if (!drag || !isActivePointer(pointerId, drag.pointerId)) {
+      return false;
     }
+    if (!drag.dragging) {
+      if (Math.abs(clientY - drag.startY) < SESSION_DRAG_THRESHOLD_PX) {
+        return false;
+      }
+      drag = { ...drag, dragging: true };
+      pointerDragRef.current = drag;
+      setDraggingSessionId(drag.sessionId);
+    }
+    setDragInsertionIndex(resolveInsertionIndex(clientY, drag.sessionId));
+    return true;
+  };
 
-    const handlePointerMove = (event: PointerEvent) => {
-      updatePointerDrag(event.clientY, event.pointerId);
-    };
+  const finishPointerDrag = (clientY: number, pointerId?: number): boolean => {
+    const drag = pointerDragRef.current;
+    if (!drag || !isActivePointer(pointerId, drag.pointerId)) {
+      return false;
+    }
+    pointerDragRef.current = null;
+    if (!drag.dragging) {
+      return false;
+    }
+    const targetIndex = resolveInsertionIndex(clientY, drag.sessionId);
+    suppressClickUntilRef.current = Date.now() + 250;
+    setDraggingSessionId(undefined);
+    setDragInsertionIndex(undefined);
+    moveSessionToIndex(drag.sessionId, targetIndex);
+    return true;
+  };
 
-    const handlePointerUp = (event: PointerEvent) => finishPointerDrag(event.clientY, event.pointerId);
-    const handlePointerCancel = (event: PointerEvent) => cancelPointerDrag(event.pointerId);
+  const cancelPointerDrag = (pointerId?: number) => {
+    const drag = pointerDragRef.current;
+    if (!drag || !isActivePointer(pointerId, drag.pointerId)) {
+      return;
+    }
+    pointerDragRef.current = null;
+    setDraggingSessionId(undefined);
+    setDragInsertionIndex(undefined);
+  };
 
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerUp);
-    window.addEventListener("pointercancel", handlePointerCancel);
-    return () => {
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-      window.removeEventListener("pointercancel", handlePointerCancel);
-    };
-  });
+  const dropCandidates = draggingSessionId
+    ? props.sessions.filter((session) => session.session_id !== draggingSessionId)
+    : [];
+  const dropBeforeSessionId = dragInsertionIndex === undefined
+    ? undefined
+    : dropCandidates[dragInsertionIndex]?.session_id;
+  const dropAfterSessionId = dragInsertionIndex === dropCandidates.length
+    ? dropCandidates.at(-1)?.session_id
+    : undefined;
 
   return (
     <section className="session-list" aria-label={t("sessions.aria")}>
@@ -230,10 +231,9 @@ export function SessionList(props: SessionListProps) {
           ? t("sessions.openNewOutput", { name: displayName })
           : t("sessions.open", { name: displayName });
         const activityLabel = sessionActivityLabel(t, session.activity);
-        const isDragTarget =
-          Boolean(draggingSessionId) &&
-          draggingSessionId !== session.session_id &&
-          dragTargetSessionId === session.session_id;
+        const isReorderable = Boolean(props.onReorder) && !isRenaming;
+        const showDropBefore = Boolean(draggingSessionId) && dropBeforeSessionId === session.session_id;
+        const showDropAfter = Boolean(draggingSessionId) && dropAfterSessionId === session.session_id;
         return (
           <div
             className={[
@@ -241,8 +241,10 @@ export function SessionList(props: SessionListProps) {
               session.session_id === props.selectedSessionId ? "selected" : "",
               hasNewOutput ? "has-new-output" : "",
               sessionActivityClassName(session.activity),
+              isReorderable ? "reorderable" : "",
               draggingSessionId === session.session_id ? "dragging" : "",
-              isDragTarget ? "drag-target" : "",
+              showDropBefore ? "drop-before" : "",
+              showDropAfter ? "drop-after" : "",
             ]
               .filter(Boolean)
               .join(" ")}
@@ -254,90 +256,52 @@ export function SessionList(props: SessionListProps) {
                 rowRefs.current.delete(session.session_id);
               }
             }}
-            onDragOver={(event) => {
-              if (!draggingSessionId || draggingSessionId === session.session_id) {
+            onClickCapture={(event) => {
+              if (Date.now() >= suppressClickUntilRef.current) {
                 return;
               }
               event.preventDefault();
-              setDragTargetSessionId(session.session_id);
+              event.stopPropagation();
+              suppressClickUntilRef.current = 0;
             }}
-            onDrop={(event) => {
-              event.preventDefault();
-              moveSessionBefore(session.session_id);
-              setDraggingSessionId(undefined);
-              setDragTargetSessionId(undefined);
+            onPointerDown={(event: ReactPointerEvent<HTMLDivElement>) => {
+              const target = event.target as Element;
+              if (
+                !isReorderable ||
+                event.button > 0 ||
+                pointerDragRef.current ||
+                target.closest("input, textarea, select, [contenteditable='true']")
+              ) {
+                return;
+              }
+              startPointerDrag(session.session_id, event.pointerId, event.clientY);
+            }}
+            onPointerMove={(event) => {
+              const wasDragging = pointerDragRef.current?.dragging ?? false;
+              if (updatePointerDrag(event.clientY, event.pointerId)) {
+                if (!wasDragging) {
+                  event.currentTarget.setPointerCapture?.(event.pointerId);
+                }
+                event.preventDefault();
+              }
+            }}
+            onPointerUp={(event) => {
+              if (finishPointerDrag(event.clientY, event.pointerId)) {
+                event.preventDefault();
+                event.stopPropagation();
+              }
+            }}
+            onPointerCancel={(event) => {
+              cancelPointerDrag(event.pointerId);
+            }}
+            onLostPointerCapture={(event) => {
+              cancelPointerDrag(event.pointerId);
             }}
           >
             <div className="session-row-heading">
-              <button
-                type="button"
-                className="icon-button session-drag-handle"
-                aria-label={t("sessions.drag", { name: displayName })}
-                draggable={Boolean(props.onReorder)}
-                onClick={(event) => event.stopPropagation()}
-                onPointerDown={(event: ReactPointerEvent<HTMLButtonElement>) => {
-                  if (!props.onReorder || event.button > 0) {
-                    return;
-                  }
-                  // 只从手柄启动 pointer 排序，避免和打开 session 的整行点击冲突。
-                  event.preventDefault();
-                  event.stopPropagation();
-                  startPointerDrag(session.session_id, event.pointerId, event.clientY);
-                  event.currentTarget.setPointerCapture?.(event.pointerId);
-                }}
-                onPointerMove={(event) => {
-                  updatePointerDrag(event.clientY, event.pointerId);
-                }}
-                onPointerUp={(event) => {
-                  finishPointerDrag(event.clientY, event.pointerId);
-                }}
-                onPointerCancel={(event) => {
-                  cancelPointerDrag(event.pointerId);
-                }}
-                onMouseDown={(event: ReactMouseEvent<HTMLButtonElement>) => {
-                  if (!props.onReorder || event.button !== 0 || pointerDragRef.current) {
-                    return;
-                  }
-                  event.preventDefault();
-                  event.stopPropagation();
-                  startPointerDrag(session.session_id, 1, event.clientY);
-                }}
-                onMouseMove={(event) => {
-                  updatePointerDrag(event.clientY, 1);
-                }}
-                onMouseUp={(event) => {
-                  finishPointerDrag(event.clientY, 1);
-                }}
-                onDragStart={(event) => {
-                  event.stopPropagation();
-                  setDraggingSessionId(session.session_id);
-                  setDragTargetSessionId(session.session_id);
-                  event.dataTransfer.effectAllowed = "move";
-                  event.dataTransfer.setData("text/plain", session.session_id);
-                }}
-                onDragEnd={() => {
-                  setDraggingSessionId(undefined);
-                  setDragTargetSessionId(undefined);
-                }}
-                onKeyDown={(event) => {
-                  if (!props.onReorder || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) {
-                    return;
-                  }
-                  event.preventDefault();
-                  event.stopPropagation();
-                  const ids = props.sessions.map((candidate) => candidate.session_id);
-                  const index = ids.indexOf(session.session_id);
-                  const nextIndex = event.key === "ArrowUp" ? index - 1 : index + 1;
-                  if (index < 0 || nextIndex < 0 || nextIndex >= ids.length) {
-                    return;
-                  }
-                  const next = [...ids];
-                  [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
-                  props.onReorder(next);
-                }}
-              >
-                <GripVertical size={15} aria-hidden="true" />
-              </button>
+              <div className="session-activity-slot">
+                <SessionActivityIndicator activity={session.activity} />
+              </div>
               <div className="session-main">
                 {isRenaming ? (
                   <form
@@ -381,9 +345,15 @@ export function SessionList(props: SessionListProps) {
                     className={["session-open-button", hasNewOutput ? "has-new-output" : ""].filter(Boolean).join(" ")}
                     aria-label={activityLabel ? `${openLabel}, ${activityLabel}` : openLabel}
                     onClick={() => props.onAttach(session.session_id)}
+                    onKeyDown={(event) => {
+                      if (!props.onReorder || !event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) {
+                        return;
+                      }
+                      event.preventDefault();
+                      moveSessionByOffset(session.session_id, event.key === "ArrowUp" ? -1 : 1);
+                    }}
                   >
                     <strong>{displayName}</strong>
-                    <SessionActivityIndicator activity={session.activity} />
                   </button>
                 )}
               </div>
