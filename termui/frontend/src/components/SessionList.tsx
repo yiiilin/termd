@@ -1,5 +1,6 @@
-import { Bot, Check, CircleAlert, Cog, MonitorUp, Pencil, Trash2, X } from "lucide-react";
-import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { toSvg, type JdenticonConfig } from "jdenticon/browser";
+import { Bot, Check, CircleAlert, Cog, Pencil, Trash2, X } from "lucide-react";
+import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { flushSync } from "react-dom";
 import type { SessionAiActivityPayload, SessionSummaryPayload, UUID } from "../protocol/types";
 import { sessionDisplayName } from "../session-names";
@@ -13,6 +14,46 @@ function sessionActivityLabel(t: Translate, activity?: SessionAiActivityPayload 
   if (!activity) return undefined;
   const agent = t(`sessions.activity.agent.${activity.agent}`);
   return t(`sessions.activity.${activity.state}`, { agent });
+}
+
+const SESSION_IDENTICON_SIZE = 32;
+// 默认会话图标只使用界面的绿/青色系，身份差异主要由几何形状表达。
+const SESSION_IDENTICON_HUES = [82, 168];
+const SESSION_IDENTICON_CONFIGS = {
+  dark: {
+    hues: SESSION_IDENTICON_HUES,
+    padding: 0.08,
+    saturation: { color: 0.48, grayscale: 0.08 },
+    lightness: { color: [0.6, 0.72], grayscale: [0.56, 0.68] },
+  },
+  light: {
+    hues: SESSION_IDENTICON_HUES,
+    padding: 0.08,
+    saturation: { color: 0.48, grayscale: 0.08 },
+    lightness: { color: [0.34, 0.48], grayscale: [0.34, 0.48] },
+  },
+} satisfies Record<"dark" | "light", JdenticonConfig>;
+
+function sessionIdenticonDataUrl(sessionId: UUID, config: JdenticonConfig): string {
+  const svg = toSvg(sessionId, SESSION_IDENTICON_SIZE, config);
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
+function SessionIdenticon(props: { sessionId: UUID; compact?: boolean }) {
+  const sources = useMemo(() => ({
+    dark: sessionIdenticonDataUrl(props.sessionId, SESSION_IDENTICON_CONFIGS.dark),
+    light: sessionIdenticonDataUrl(props.sessionId, SESSION_IDENTICON_CONFIGS.light),
+  }), [props.sessionId]);
+  return (
+    <span
+      className={["session-identicon", props.compact ? "compact" : ""].filter(Boolean).join(" ")}
+      data-session-identicon={props.sessionId}
+      aria-hidden="true"
+    >
+      <img className="session-identicon-dark" data-identicon-theme="dark" src={sources.dark} alt="" draggable={false} />
+      <img className="session-identicon-light" data-identicon-theme="light" src={sources.light} alt="" draggable={false} />
+    </span>
+  );
 }
 
 function SessionActivityIndicator(props: {
@@ -46,6 +87,18 @@ function SessionActivityIndicator(props: {
   );
 }
 
+function SessionVisual(props: {
+  sessionId: UUID;
+  activity?: SessionAiActivityPayload | null;
+  compact?: boolean;
+}) {
+  return props.activity ? (
+    <SessionActivityIndicator activity={props.activity} compact={props.compact} />
+  ) : (
+    <SessionIdenticon sessionId={props.sessionId} compact={props.compact} />
+  );
+}
+
 export function CollapsedSessionButton(props: {
   session: SessionSummaryPayload;
   selected: boolean;
@@ -72,8 +125,7 @@ export function CollapsedSessionButton(props: {
       aria-label={activityLabel ? `${selectLabel}, ${activityLabel}` : selectLabel}
       onClick={() => props.onAttach(props.session.session_id)}
     >
-      <MonitorUp size={15} aria-hidden="true" />
-      <SessionActivityIndicator activity={props.session.activity} compact />
+      <SessionVisual sessionId={props.session.session_id} activity={props.session.activity} compact />
     </button>
   );
 }
@@ -300,7 +352,7 @@ export function SessionList(props: SessionListProps) {
           >
             <div className="session-row-heading">
               <div className="session-activity-slot">
-                <SessionActivityIndicator activity={session.activity} />
+                <SessionVisual sessionId={session.session_id} activity={session.activity} />
               </div>
               <div className="session-main">
                 {isRenaming ? (

@@ -87,6 +87,7 @@
   --color-accent-shadow: rgba(167, 192, 128, 0.12);
   --color-accent-shadow-strong: rgba(167, 192, 128, 0.35);
   --color-session-drop-line: rgba(211, 238, 233, 0.68);
+  --color-session-identicon-border: #727c80;
   --terminal-frame-padding: 12px;
   --terminal-mobile-shortcuts-height: 42px;
   --daemon-status-cpu-width: 148px;
@@ -173,6 +174,7 @@
   --color-accent-shadow: rgba(141, 161, 1, 0.14);
   --color-accent-shadow-strong: rgba(141, 161, 1, 0.28);
   --color-session-drop-line: rgba(58, 148, 197, 0.56);
+  --color-session-identicon-border: #b5b8b5;
 }
 
 * {
@@ -578,15 +580,10 @@ label {
   background: var(--color-surface-selected);
 }
 
-.collapsed-session-list .session-activity-indicator.compact {
-  position: absolute;
-  right: 2px;
-  bottom: 2px;
-  width: 18px;
-  height: 18px;
-  border-radius: 5px;
-  border: 1px solid var(--color-border-control);
-  background: var(--color-surface-raised);
+.collapsed-session-list .session-activity-indicator.compact,
+.collapsed-session-list .session-identicon.compact {
+  width: 28px;
+  height: 28px;
 }
 
 .rail-popover {
@@ -1136,7 +1133,8 @@ label {
   cursor: grabbing;
 }
 
-.session-activity-indicator {
+.session-activity-indicator,
+.session-identicon {
   position: relative;
   width: 28px;
   height: 28px;
@@ -1148,6 +1146,29 @@ label {
   border-radius: 5px;
   background: var(--color-surface-sunken);
   color: var(--color-text-subtle);
+}
+
+.session-identicon {
+  border-color: var(--color-session-identicon-border);
+  overflow: hidden;
+}
+
+.session-identicon img {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.session-identicon .session-identicon-light {
+  display: none;
+}
+
+:root[data-theme="light"] .session-identicon-dark {
+  display: none;
+}
+
+:root[data-theme="light"] .session-identicon-light {
+  display: block;
 }
 
 .session-activity-indicator.activity-running {

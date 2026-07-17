@@ -48,8 +48,73 @@ describe("SessionList", () => {
     expect(row).not.toHaveAttribute("role", "button");
     expect(within(openButton).queryByRole("button")).toBeNull();
     expect(within(row as HTMLElement).queryByRole("button", { name: /Drag/ })).toBeNull();
+    const identicon = (row as HTMLElement).querySelector<HTMLImageElement>(
+      '[data-session-identicon="00000000-0000-0000-0000-000000000401"] img',
+    );
+    expect(identicon?.getAttribute("src")).toMatch(/^data:image\/svg\+xml;charset=utf-8,/);
     expect(within(row as HTMLElement).getByRole("button", { name: "Rename session" })).toBeInTheDocument();
     expect(within(row as HTMLElement).getByRole("button", { name: "Close session" })).toBeInTheDocument();
+  });
+
+  it("同一 session id 生成稳定的本地图标，不同 id 生成不同图标", () => {
+    const alphaId = "00000000-0000-0000-0000-000000000401";
+    const betaId = "00000000-0000-0000-0000-000000000402";
+    const sessionBase = {
+      state: "running" as const,
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    };
+    render(
+      <>
+        <SessionList
+          sessions={[
+            { ...sessionBase, session_id: alphaId, name: "alpha" },
+            { ...sessionBase, session_id: betaId, name: "beta" },
+          ]}
+          renameDraft=""
+          canSaveRename={false}
+          onAttach={vi.fn()}
+          onStartRename={vi.fn()}
+          onRenameDraftChange={vi.fn()}
+          onSaveRename={vi.fn()}
+          onCancelRename={vi.fn()}
+          onClose={vi.fn()}
+        />
+        <div className="collapsed-session-list">
+          <CollapsedSessionButton
+            session={{ ...sessionBase, session_id: alphaId, name: "alpha" }}
+            selected={false}
+            hasNewOutput={false}
+            onAttach={vi.fn()}
+          />
+        </div>
+      </>,
+    );
+
+    const alphaDarkIcons = Array.from(
+      document.querySelectorAll<HTMLImageElement>(
+        `[data-session-identicon="${alphaId}"] [data-identicon-theme="dark"]`,
+      ),
+    );
+    const alphaLightIcons = Array.from(
+      document.querySelectorAll<HTMLImageElement>(
+        `[data-session-identicon="${alphaId}"] [data-identicon-theme="light"]`,
+      ),
+    );
+    const betaDarkIcon = document.querySelector<HTMLImageElement>(
+      `[data-session-identicon="${betaId}"] [data-identicon-theme="dark"]`,
+    );
+    const alphaDarkSources = alphaDarkIcons.map((icon) => icon.getAttribute("src"));
+    const alphaLightSources = alphaLightIcons.map((icon) => icon.getAttribute("src"));
+
+    expect(alphaDarkIcons).toHaveLength(2);
+    expect(alphaLightIcons).toHaveLength(2);
+    expect(alphaDarkSources[0]).toBe(alphaDarkSources[1]);
+    expect(alphaLightSources[0]).toBe(alphaLightSources[1]);
+    expect(alphaDarkSources[0]).toMatch(/^data:image\/svg\+xml;charset=utf-8,/);
+    expect(alphaLightSources[0]).toMatch(/^data:image\/svg\+xml;charset=utf-8,/);
+    expect(alphaLightSources[0]).not.toBe(alphaDarkSources[0]);
+    expect(betaDarkIcon?.getAttribute("src")).toMatch(/^data:image\/svg\+xml;charset=utf-8,/);
+    expect(betaDarkIcon?.getAttribute("src")).not.toBe(alphaDarkSources[0]);
   });
 
   it("重命名保存时把当前输入框里的完整值交给回调", async () => {
@@ -154,6 +219,7 @@ describe("SessionList", () => {
     expect(within(runningButton).queryByTitle("Codex is running")).toBeNull();
     expect(screen.getByTitle("OpenCode finished").querySelector(".session-activity-ok-badge")).not.toBeNull();
     expect(screen.getByTitle("Claude Code needs attention").querySelector(".session-activity-attention-badge")).not.toBeNull();
+    expect(document.querySelector(".session-identicon")).toBeNull();
   });
 
   it("直接拖动卡片时用横线标出插入位置并按该位置排序", () => {
