@@ -1087,6 +1087,30 @@ impl SupervisorPtySession {
         .into_device_attached()
     }
 
+    fn wait_for_supervisor_exit_confirmation(&self, deadline: Instant) -> PtyResult<bool> {
+        loop {
+            {
+                let mut child_guard = self
+                    .supervisor_child
+                    .lock()
+                    .expect("supervisor child mutex poisoned");
+                if let Some(child) = child_guard.as_mut()
+                    && child.try_wait().map_err(PtyError::from)?.is_some()
+                {
+                    child_guard.take();
+                    return Ok(true);
+                }
+            }
+            if probe_reconnected_supervisor_exit(&self.session_id, &self.restore_info)?.is_some() {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(CLOSE_CONFIRM_POLL_INTERVAL);
+        }
+    }
+
     fn confirm_and_finalize_close(
         &self,
         operation_id: u64,
@@ -1806,12 +1830,16 @@ impl PtySession for SupervisorPtySession {
         self.restore_info =
             restore_info_with_status(&self.restore_info, PtySupervisorStatus::Closing);
         if self.cleanup_capability.is_none() {
-            self.request_once(SupervisorRequest::Close)
-                .map_err(|failure| match failure {
-                    SupervisorRequestFailure::Response(error)
-                    | SupervisorRequestFailure::Transport(error) => error,
-                })?
-                .expect_empty()?;
+            match self.request_once(SupervisorRequest::Close) {
+                Ok(response) => response.expect_empty()?,
+                Err(SupervisorRequestFailure::Response(error)) => return Err(error),
+                Err(SupervisorRequestFailure::Transport(error)) => {
+                    let deadline = Instant::now() + CLOSE_CONFIRM_TIMEOUT;
+                    if !self.wait_for_supervisor_exit_confirmation(deadline)? {
+                        return Err(error);
+                    }
+                }
+            }
             self.restore_info =
                 restore_info_with_status(&self.restore_info, PtySupervisorStatus::Closed);
             return Ok(());
@@ -5957,6 +5985,40 @@ mod tests {
             cleanup_capability: None,
             exited: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn legacy_close_transport_loss_confirms_already_exited_supervisor() {
+        let (writer, peer) = StdUnixStream::pair().expect("test unix stream pair should open");
+        writer
+            .shutdown(std::net::Shutdown::Both)
+            .expect("test writer should shut down");
+        drop(peer);
+        let (output_signal_tx, output_signal_rx) = watch::channel(OUTPUT_SIGNAL_INIT);
+        let mut session = test_supervisor_client_with_queues(
+            writer,
+            Arc::new(StdMutex::new(VecDeque::new())),
+            Arc::new(StdMutex::new(VecDeque::new())),
+            output_signal_tx,
+            output_signal_rx,
+        );
+        session.restore_info = PtyRestoreInfo::UnixSocket {
+            socket_path: PathBuf::from("/tmp/termd-dead-supervisor.sock"),
+            supervisor_pid: i32::MAX as u32,
+            supervisor_status: PtySupervisorStatus::Running,
+        };
+
+        session
+            .terminate()
+            .expect("lost legacy close response should converge after confirmed process exit");
+
+        assert!(matches!(
+            session.restore_info(),
+            Some(PtyRestoreInfo::UnixSocket {
+                supervisor_status: PtySupervisorStatus::Closed,
+                ..
+            })
+        ));
     }
 
     const TEST_SUPERVISOR_FRAME_MAX_BYTES: usize = 8 * 1024 * 1024;
