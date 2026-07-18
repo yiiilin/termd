@@ -246,6 +246,10 @@ const RETRYABLE_CONNECTION_ERROR_CODES = new Set([
   "relay_tunnel_failed",
   "handshake_timeout",
   "terminal_resync",
+  "heartbeat_timeout",
+  "slow_consumer",
+  "server_shutdown",
+  "attach_replaced",
 ]);
 
 function isRetryableConnectionError(caught: unknown): boolean {
@@ -2581,8 +2585,17 @@ export default function App() {
     if (attachReconnectTimerRef.current !== undefined) {
       resetAttachReconnectState();
     }
+    // supervisor 只关闭 attach 时，外层 WebSocket/V070Client 仍可能看起来可用。
+    // 强制恢复必须越过 performAttach 的“当前 transport 仍活着”快路径并替换旧 socket。
+    if (
+      attachedSessionRef.current &&
+      attachClientRef.current &&
+      !attachClientRef.current.isClosed
+    ) {
+      reattachCurrentSessionOnOpenRef.current = true;
+    }
     return handleRetryConnection();
-  }, [attachReconnectTimerRef, handleRetryConnection, resetAttachReconnectState]);
+  }, [attachClientRef, attachReconnectTimerRef, attachedSessionRef, handleRetryConnection, resetAttachReconnectState]);
 
   useEffect(() => {
     retryConnectionHandlerRef.current = handleRetryConnection;

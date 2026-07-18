@@ -1182,7 +1182,7 @@ test("relay Web 后台恢复后重建当前 session 并能继续输入", async (
 
 test("relay Web 后台空闲超过保活间隔后恢复仍能继续输入", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name === "mobile-chrome", "长空闲恢复回归用桌面项目覆盖真实 relay 链路");
-  test.setTimeout(90_000);
+  test.setTimeout(120_000);
   const fixture = await startRealRelayFixture();
   const createdNames: string[] = [];
   const browserErrors: string[] = [];
@@ -1201,25 +1201,32 @@ test("relay Web 后台空闲超过保活间隔后恢复仍能继续输入", asyn
     await runTerminalCommand(page, `printf '${marker(name)}-idle-ready\\n'`);
     await expectTerminalLine(page, `${marker(name)}-idle-ready`, 8_000);
 
-    await page.evaluate(() => {
-      Object.defineProperty(document, "visibilityState", {
-        configurable: true,
-        get: () => "hidden",
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      await page.evaluate(() => {
+        Object.defineProperty(document, "visibilityState", {
+          configurable: true,
+          get: () => "hidden",
+        });
+        document.dispatchEvent(new Event("visibilitychange"));
+        window.dispatchEvent(new Event("blur"));
       });
-      document.dispatchEvent(new Event("visibilitychange"));
-      window.dispatchEvent(new Event("blur"));
-    });
-    // 中文注释：覆盖真实使用中“页面放一阵子再回来”的路径。
-    // 12 秒同时跨过前端 10 秒长失焦重建阈值和 relay/daemon idle ping 间隔。
-    await sleep(12_000);
-    await page.evaluate(() => {
-      Object.defineProperty(document, "visibilityState", {
-        configurable: true,
-        get: () => "visible",
+      // 中文注释：仅修改 visibilityState 不会暂停 JS，无法复现移动系统冻结 PWA 的行为。
+      // 真正冻结 35 秒，跨过 supervisor 的 30 秒 heartbeat timeout，再验证 attach 恢复。
+      await cdp.send("Page.setWebLifecycleState", { state: "frozen" });
+      await sleep(35_000);
+      await cdp.send("Page.setWebLifecycleState", { state: "active" });
+      await page.evaluate(() => {
+        Object.defineProperty(document, "visibilityState", {
+          configurable: true,
+          get: () => "visible",
+        });
+        document.dispatchEvent(new Event("visibilitychange"));
+        window.dispatchEvent(new Event("focus"));
       });
-      document.dispatchEvent(new Event("visibilitychange"));
-      window.dispatchEvent(new Event("focus"));
-    });
+    } finally {
+      await cdp.detach().catch(() => undefined);
+    }
 
     await expectTerminalLine(page, `${marker(name)}-idle-ready`, 20_000);
     await runTerminalCommand(page, `printf '${marker(name)}-idle-input-ok\\n'`);

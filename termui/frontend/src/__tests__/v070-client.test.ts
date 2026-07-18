@@ -482,6 +482,55 @@ describe("V070Client", () => {
     expect(await closeOutcome).toMatchObject({ code: "connection_closed" });
   });
 
+  it("rejects a terminal liveness probe when the daemon reports the attach is gone", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
+    const transport = {
+      onMetadata: undefined as ((data: unknown) => void) | undefined,
+      onTerminal: undefined as ((data: unknown) => void) | undefined,
+      connectMetadata: vi.fn(async () => undefined),
+      reconnectMetadata: vi.fn(async () => undefined),
+      openTerminal: vi.fn(async () => undefined),
+      sendTerminal: vi.fn(),
+      closeTerminal: vi.fn(),
+      close: vi.fn(),
+    };
+    const client = new V070Client(
+      {
+        server_id: "00000000-0000-0000-0000-000000000070",
+        daemon_public_key: "ed25519-v1:daemon",
+        url: "wss://relay.example/ws",
+        paired_at_ms: 1,
+        device_certificate: "device.certificate.signature",
+      },
+      device,
+      transport,
+    );
+    const attached = client.attachSession("session-a");
+    transport.onTerminal?.(JSON.stringify({
+      type: "terminal.attached",
+      payload: {
+        session_id: "session-a",
+        role: "operator",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    }));
+    await attached;
+
+    const liveness = client.probeTerminalLiveness(
+      "session-a",
+      { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      100,
+    );
+    transport.onTerminal?.(JSON.stringify({
+      type: "error",
+      payload: { code: "runtime_failed", message: "session is not attached" },
+    }));
+
+    await expect(liveness).rejects.toMatchObject({ code: "runtime_failed" });
+    client.close();
+  });
+
   it("cleans pending RTT measurements on timeout, close, metadata close, and reconnect", async () => {
     vi.useFakeTimers();
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");

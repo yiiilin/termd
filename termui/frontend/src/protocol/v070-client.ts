@@ -592,11 +592,11 @@ export class V070Client {
           this.enqueue({ type: "attach_frame", payload: buildAttachFramePayload(this.terminalSessionId!, bytes) });
         }
       } else if (message.type === "error") {
-        this.resolveTerminalActivityProbe();
         const error = new ProtocolClientError(
           message.payload?.code ?? "terminal_error",
           message.payload?.message ?? "terminal error",
         );
+        this.rejectTerminalActivityProbe(error);
         if (this.terminalOpen) {
           const pending = this.terminalOpen;
           this.terminalOpen = undefined;

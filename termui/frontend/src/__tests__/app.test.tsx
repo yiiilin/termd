@@ -1288,6 +1288,27 @@ describe("termui web 工作台", () => {
     expect(screen.getByTestId("terminal-pane")).toBeInTheDocument();
   });
 
+  it("visibility 恢复探测收到 not attached 时会替换 terminal WebSocket 并重新 attach", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    setDocumentVisibility("hidden");
+    setDocumentVisibility("visible");
+    daemon.sendUnownedPacketError("runtime_failed", "session is not attached");
+
+    await waitFor(
+      () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2800 },
+    );
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(daemon.hasActiveTerminalSession(DEFAULT_SESSION_ID)).toBe(true);
+  });
+
   it("后台恢复会覆盖浏览器冻结后未执行的 attach 重连 timer", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -3657,6 +3678,87 @@ describe("termui web 工作台", () => {
     expect(terminalText.match(/termd-e2e-ready/g) ?? []).toHaveLength(1);
     observer.disconnect();
     expect(sawConnectionAlert).toBe(false);
+  });
+
+  it.each(["heartbeat_timeout", "slow_consumer"])(
+    "terminal attach 以 %s 关闭时会静默重新 attach",
+    async (closeReason) => {
+      const user = userEvent.setup();
+      await daemon.stop();
+      daemon = await MockDaemon.start({
+        token: "secret-token",
+        sessions: [
+          {
+            session_id: DEFAULT_SESSION_ID,
+            state: "running",
+            size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+          },
+        ],
+        attachOutput: "termd-e2e-ready\n",
+        sessionDataError: {
+          code: closeReason,
+          message: "terminal attach ended; reattach to continue",
+        },
+      });
+      render(<App />);
+
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession();
+      await screen.findByText(/termd-e2e-ready/);
+      await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+      const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(terminalInput).not.toBeNull();
+      terminalInput!.value = "trigger-terminal-close";
+      fireEvent.input(terminalInput!);
+
+      await waitFor(
+        () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+        { timeout: 2800 },
+      );
+      expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+      expect(daemon.hasActiveTerminalSession(DEFAULT_SESSION_ID)).toBe(true);
+    },
+  );
+
+  it("错误提示 Refresh 会替换仍 OPEN 但已失去 attach 的 terminal WebSocket", async () => {
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "termd-e2e-ready\n",
+      sessionDataError: {
+        code: "runtime_failed",
+        message: "session is not attached",
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.value = "trigger-detached-error";
+    fireEvent.input(terminalInput!);
+    const alert = await screen.findByRole("alert", { name: "Connection error" });
+    await user.click(within(alert).getByRole("button", { name: "Refresh" }));
+
+    await waitFor(
+      () => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID, DEFAULT_SESSION_ID]),
+      { timeout: 2800 },
+    );
+    expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
+    expect(daemon.hasActiveTerminalSession(DEFAULT_SESSION_ID)).toBe(true);
   });
 
   it("attach WebSocket 短断恢复后还能继续渲染新的 terminal frame", async () => {
