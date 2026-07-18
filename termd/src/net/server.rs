@@ -20,8 +20,9 @@ use axum::extract::{ConnectInfo, OriginalUri, Path, State};
 use axum::http::header::{CONTENT_TYPE, HeaderName};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, options, post, put};
+use axum::routing::{delete, get, options, post, put};
 use axum::{Json, Router};
+use base64::{Engine as _, engine::general_purpose};
 #[cfg(test)]
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::pem::PemObject;
@@ -35,14 +36,17 @@ use termd_proto::{
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tower::ServiceExt as _;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::warn;
 
 use crate::auth::current_unix_timestamp_millis;
 use crate::config::DaemonConfig;
+use crate::notifications::{PushNotificationCoordinator, PushNotificationError};
 use crate::pty::PtyRestoreInfo;
 use crate::pty::supervisor::SupervisorPtyBackend;
+use crate::state::web_push::{PushNotificationLocale, PushNotificationMode, PushSubscription};
 use crate::state::{StateError, StateStore};
 
 use super::protocol::{
@@ -53,6 +57,10 @@ use super::signature::Ed25519SignatureVerifier;
 use recovery::warn_about_orphaned_supervisors;
 
 const HTTP_JSON_MAX_BYTES: usize = 1024 * 1024;
+const PUSH_SUBSCRIPTION_JSON_MAX_BYTES: usize = 8 * 1024;
+const PUSH_ENDPOINT_MAX_BYTES: usize = 2 * 1024;
+const PUSH_P256DH_MAX_BYTES: usize = 128;
+const PUSH_AUTH_MAX_BYTES: usize = 64;
 const V070_FILE_CHUNK_MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_METADATA_TIMESTAMP_MS: u64 = 9_007_199_254_740_991;
 
@@ -193,6 +201,7 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
         .merge(auth_api_router())
         .merge(http_control_api_router())
         .merge(http_file_api_router())
+        .merge(push_api_router())
         .route("/ws/metadata", get(metadata_ws_handler))
         .route("/ws/terminal", get(terminal_ws_handler))
         .method_not_allowed_fallback(api_method_not_allowed)
@@ -283,6 +292,50 @@ fn auth_api_router() -> Router<SharedDaemonProtocol> {
             "/api/auth/device-certificate/migrate/challenge",
             post(auth_device_certificate_migration_challenge),
         )
+}
+
+fn push_api_router() -> Router<SharedDaemonProtocol> {
+    Router::new()
+        .route(
+            "/api/push/config",
+            get(push_config).merge(options(v070_preflight)),
+        )
+        .route(
+            "/api/push/subscription",
+            put(push_subscription_upsert)
+                .merge(delete(push_subscription_delete))
+                .merge(options(v070_preflight)),
+        )
+        .route_layer(push_api_cors_layer())
+}
+
+#[derive(Debug, Serialize)]
+struct PushConfigResponse {
+    server_id: ServerId,
+    application_server_key: String,
+    subscribed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PushSubscriptionRequest {
+    endpoint: String,
+    keys: PushSubscriptionKeys,
+    mode: PushNotificationMode,
+    locale: PushNotificationLocale,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PushSubscriptionKeys {
+    p256dh: String,
+    auth: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PushSubscriptionDeleteRequest {
+    endpoint: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -865,6 +918,179 @@ async fn authorize_v070_http_device(
         })
 }
 
+async fn push_config(State(protocol): State<SharedDaemonProtocol>, headers: HeaderMap) -> Response {
+    let device_id = match authorize_v070_http_device(&protocol, &headers).await {
+        Ok(device_id) => device_id,
+        Err(response) => return response,
+    };
+    let coordinator = protocol.lock().await.push_notifications();
+    let application_server_key = match coordinator.application_server_key() {
+        Ok(key) => key,
+        Err(error) => return push_operation_error(error),
+    };
+    let subscribed = match coordinator.is_subscribed(device_id) {
+        Ok(subscribed) => subscribed,
+        Err(error) => return push_operation_error(error),
+    };
+    (
+        StatusCode::OK,
+        Json(PushConfigResponse {
+            server_id: coordinator.server_id(),
+            application_server_key,
+            subscribed,
+        }),
+    )
+        .into_response()
+}
+
+async fn push_subscription_upsert(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let device_id = match authorize_v070_http_device(&protocol, &headers).await {
+        Ok(device_id) => device_id,
+        Err(response) => return response,
+    };
+    let request = match read_push_subscription_body(body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let subscription = match validated_push_subscription(request) {
+        Ok(subscription) => subscription,
+        Err(response) => return response,
+    };
+    let coordinator = protocol.lock().await.push_notifications();
+    match coordinator.upsert_subscription(device_id, subscription) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => push_operation_error(error),
+    }
+}
+
+async fn push_subscription_delete(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let device_id = match authorize_v070_http_device(&protocol, &headers).await {
+        Ok(device_id) => device_id,
+        Err(response) => return response,
+    };
+    let request = match read_push_subscription_delete_body(body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if let Err(response) = validate_push_endpoint(&request.endpoint) {
+        return response;
+    }
+    let coordinator = protocol.lock().await.push_notifications();
+    match coordinator.remove_subscription_if_endpoint(device_id, &request.endpoint) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => push_operation_error(error),
+    }
+}
+
+async fn read_push_subscription_body(body: Body) -> Result<PushSubscriptionRequest, Response> {
+    let bytes = to_bytes(body, PUSH_SUBSCRIPTION_JSON_MAX_BYTES)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "push_subscription_too_large",
+                "Push subscription request is too large",
+                false,
+            )
+        })?;
+    serde_json::from_slice(&bytes).map_err(|_| invalid_json_error())
+}
+
+async fn read_push_subscription_delete_body(
+    body: Body,
+) -> Result<PushSubscriptionDeleteRequest, Response> {
+    let bytes = to_bytes(body, PUSH_SUBSCRIPTION_JSON_MAX_BYTES)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "push_subscription_too_large",
+                "Push subscription request is too large",
+                false,
+            )
+        })?;
+    serde_json::from_slice(&bytes).map_err(|_| invalid_json_error())
+}
+
+#[allow(clippy::result_large_err)]
+fn validated_push_subscription(
+    request: PushSubscriptionRequest,
+) -> Result<PushSubscription, Response> {
+    validate_push_endpoint(&request.endpoint)?;
+    if request.keys.p256dh.is_empty()
+        || request.keys.p256dh.len() > PUSH_P256DH_MAX_BYTES
+        || request.keys.auth.is_empty()
+        || request.keys.auth.len() > PUSH_AUTH_MAX_BYTES
+    {
+        return Err(invalid_push_subscription());
+    }
+    let p256dh = general_purpose::URL_SAFE_NO_PAD
+        .decode(&request.keys.p256dh)
+        .map_err(|_| invalid_push_subscription())?;
+    let auth = general_purpose::URL_SAFE_NO_PAD
+        .decode(&request.keys.auth)
+        .map_err(|_| invalid_push_subscription())?;
+    if p256dh.len() != 65
+        || p256dh.first() != Some(&4)
+        || auth.len() != 16
+        || web_push_native::p256::PublicKey::from_sec1_bytes(&p256dh).is_err()
+    {
+        return Err(invalid_push_subscription());
+    }
+    Ok(PushSubscription {
+        endpoint: request.endpoint,
+        p256dh: request.keys.p256dh,
+        auth: request.keys.auth,
+        mode: request.mode,
+        locale: request.locale,
+        updated_at_ms: current_unix_timestamp_millis().0,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_push_endpoint(endpoint: &str) -> Result<(), Response> {
+    if endpoint.is_empty() || endpoint.len() > PUSH_ENDPOINT_MAX_BYTES {
+        return Err(invalid_push_subscription());
+    }
+    let endpoint = reqwest::Url::parse(endpoint).map_err(|_| invalid_push_subscription())?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(invalid_push_subscription());
+    }
+    Ok(())
+}
+
+fn invalid_push_subscription() -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "push_subscription_invalid",
+        "Push subscription is invalid",
+        false,
+    )
+}
+
+fn push_operation_error(error: PushNotificationError) -> Response {
+    warn!(%error, "Web Push operation failed");
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "push_unavailable",
+        "Web Push is temporarily unavailable",
+        true,
+    )
+}
+
 async fn v070_file_upload_create(
     State(protocol): State<SharedDaemonProtocol>,
     headers: HeaderMap,
@@ -1246,6 +1472,17 @@ fn http_file_api_cors_layer() -> CorsLayer {
         ])
 }
 
+fn push_api_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_headers([
+            CONTENT_TYPE,
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("x-termd-server-id"),
+        ])
+}
+
 pub async fn serve(
     config: DaemonConfig,
     protocol: SharedDaemonProtocol,
@@ -1284,6 +1521,7 @@ pub async fn serve_listener(
     protocol: SharedDaemonProtocol,
     web_enabled: bool,
 ) -> Result<(), ServerError> {
+    let _push_tasks = start_push_notification_tasks(protocol.clone()).await;
     axum::serve(
         listener,
         router(protocol, web_enabled).into_make_service_with_connect_info::<SocketAddr>(),
@@ -1299,9 +1537,74 @@ pub async fn serve_tls_listener(
     web_enabled: bool,
 ) -> Result<(), ServerError> {
     let tls_config = load_rustls_server_config(&tls_paths)?;
+    let _push_tasks = start_push_notification_tasks(protocol.clone()).await;
 
     // TLS 只替换 transport accept 层；router 和协议状态机保持同一套认证与 session 规则。
     serve_rustls_listener(listener, router(protocol, web_enabled), tls_config).await
+}
+
+struct PushNotificationTasks {
+    observer: Option<JoinHandle<()>>,
+    delivery: Option<JoinHandle<()>>,
+}
+
+impl Drop for PushNotificationTasks {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.observer {
+            observer.abort();
+        }
+        if let Some(delivery) = &self.delivery {
+            delivery.abort();
+        }
+    }
+}
+
+async fn start_push_notification_tasks(protocol: SharedDaemonProtocol) -> PushNotificationTasks {
+    let (coordinator, mut activity_events) = {
+        let mut guard = protocol.lock().await;
+        (
+            guard.push_notifications(),
+            guard.take_push_activity_events(),
+        )
+    };
+    if !coordinator.is_available() {
+        return PushNotificationTasks {
+            observer: None,
+            delivery: None,
+        };
+    }
+    if let Some(events) = &mut activity_events {
+        let pending_event_count = events.len();
+        for _ in 0..pending_event_count {
+            if events.try_recv().is_err() {
+                break;
+            }
+        }
+    }
+    let initial = protocol.lock().await.push_activity_snapshot();
+    coordinator.initialize_activity_snapshot(initial);
+    let delivery = coordinator.start_delivery_worker();
+    let observer = activity_events.map(|events| {
+        tokio::spawn(run_push_notification_observer(
+            protocol,
+            coordinator,
+            events,
+        ))
+    });
+    PushNotificationTasks { observer, delivery }
+}
+
+async fn run_push_notification_observer(
+    protocol: SharedDaemonProtocol,
+    coordinator: PushNotificationCoordinator,
+    mut activity_events: tokio::sync::mpsc::Receiver<crate::pty::SessionActivityEvent>,
+) {
+    while let Some(event) = activity_events.recv().await {
+        let change = protocol.lock().await.push_activity_event_snapshot(event);
+        if let Some(change) = change {
+            coordinator.observe_activity_change(change);
+        }
+    }
 }
 
 pub(crate) async fn handle_http_tunnel_stream_request(
@@ -1662,7 +1965,6 @@ fn is_loopback_peer(peer_addr: SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
     use rand_core::OsRng;
     use serde::Deserialize;
@@ -1809,6 +2111,79 @@ mod tests {
 
     fn test_protocol(name: &str) -> TestProtocolFixture {
         test_config(name).into_protocol()
+    }
+
+    #[tokio::test]
+    async fn invalid_push_identity_disables_notifications_without_blocking_daemon_startup() {
+        let fixture = test_config("invalid-push-identity");
+        let first = try_default_protocol(fixture.config.clone()).unwrap();
+        drop(first);
+
+        let sqlite_path = crate::state::sqlite_state_path_for_state_path(&fixture.state_path);
+        let connection = rusqlite::Connection::open(sqlite_path).unwrap();
+        connection
+            .execute(
+                "UPDATE web_push_identity SET private_key = 'invalid' WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let restarted = try_default_protocol(fixture.config.clone()).unwrap();
+        assert!(!restarted.lock().await.push_notifications().is_available());
+
+        let (_, access_token) = v070_access_token_for_test(&restarted).await;
+        let authorization = format!("Bearer {access_token}");
+        let app = router(restarted, false);
+        for (method, path, body) in [
+            (Method::GET, "/api/push/config", Body::empty()),
+            (
+                Method::PUT,
+                "/api/push/subscription",
+                Body::from(
+                    serde_json::json!({
+                        "endpoint": "https://push.example.test/device",
+                        "keys": {
+                            "p256dh": "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+                            "auth": "BTBZMqHH6r4Tts7J_aSIgg"
+                        },
+                        "mode": "all",
+                        "locale": "en-US"
+                    })
+                    .to_string(),
+                ),
+            ),
+            (
+                Method::DELETE,
+                "/api/push/subscription",
+                Body::from(
+                    serde_json::json!({
+                        "endpoint": "https://push.example.test/device"
+                    })
+                    .to_string(),
+                ),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("authorization", &authorization)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+            let body: serde_json::Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["error"]["code"], "push_unavailable", "{path}");
+        }
     }
 
     #[test]
@@ -2070,6 +2445,276 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
                 Some("*"),
                 "{method} {path}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn push_routes_require_bearer_and_keep_subscriptions_device_owned() {
+        let fixture = test_protocol("push-http");
+        let app = router(fixture.protocol.clone(), false);
+        for (method, path) in [
+            (Method::GET, "/api/push/config"),
+            (Method::PUT, "/api/push/subscription"),
+            (Method::DELETE, "/api/push/subscription"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+
+        let (_device_a, token_a) = v070_access_token_for_test(&fixture.protocol).await;
+        let (_device_b, token_b) = v070_access_token_for_test(&fixture.protocol).await;
+        let authorization_a = format!("Bearer {token_a}");
+        let authorization_b = format!("Bearer {token_b}");
+
+        let config = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/push/config")
+                    .header("authorization", &authorization_a)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(config.status(), StatusCode::OK);
+        let config: serde_json::Value =
+            serde_json::from_slice(&to_bytes(config.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            config["server_id"],
+            fixture.protocol.lock().await.server_id().0.to_string()
+        );
+        assert_eq!(config["subscribed"], false);
+        let application_server_key = config["application_server_key"].as_str().unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(application_server_key)
+                .unwrap()
+                .len(),
+            65
+        );
+
+        let subscription_body = serde_json::json!({
+            "endpoint": "https://push.example.test/device-a",
+            "keys": {
+                "p256dh": "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+                "auth": "BTBZMqHH6r4Tts7J_aSIgg"
+            },
+            "mode": "all",
+            "locale": "zh-CN"
+        });
+        let subscribed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/push/subscription")
+                    .header("authorization", &authorization_a)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(subscription_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscribed.status(), StatusCode::NO_CONTENT);
+
+        for (authorization, expected) in [(&authorization_a, true), (&authorization_b, false)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/push/config")
+                        .header("authorization", authorization)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["subscribed"], expected);
+        }
+
+        let delete_other_device = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/push/subscription")
+                    .header("authorization", &authorization_b)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "endpoint": "https://push.example.test/device-a"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_other_device.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/push/config")
+                    .header("authorization", &authorization_a)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["subscribed"], true);
+    }
+
+    #[tokio::test]
+    async fn push_subscription_rejects_invalid_and_oversized_input() {
+        let fixture = test_protocol("push-http-validation");
+        let app = router(fixture.protocol.clone(), false);
+        let (_, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        let authorization = format!("Bearer {access_token}");
+
+        for (endpoint, p256dh, auth) in [
+            (
+                "http://push.example.test/device",
+                "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+                "BTBZMqHH6r4Tts7J_aSIgg",
+            ),
+            (
+                "https://user@push.example.test/device",
+                "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+                "BTBZMqHH6r4Tts7J_aSIgg",
+            ),
+            (
+                "https://push.example.test/device#fragment",
+                "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+                "BTBZMqHH6r4Tts7J_aSIgg",
+            ),
+            ("https://push.example.test/device", "invalid", "invalid"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/api/push/subscription")
+                        .header("authorization", &authorization)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "endpoint": endpoint,
+                                "keys": {"p256dh": p256dh, "auth": auth},
+                                "mode": "all",
+                                "locale": "en-US"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let unknown_field = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/push/subscription")
+                    .header("authorization", &authorization)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "endpoint": "https://push.example.test/device",
+                            "keys": {
+                                "p256dh": "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+                                "auth": "BTBZMqHH6r4Tts7J_aSIgg"
+                            },
+                            "mode": "all",
+                            "locale": "en-US",
+                            "device_id": DeviceId::new()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_field.status(), StatusCode::BAD_REQUEST);
+
+        let oversized = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/push/subscription")
+                    .header("authorization", &authorization)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("x".repeat(PUSH_SUBSCRIPTION_JSON_MAX_BYTES + 1)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(oversized.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "push_subscription_too_large");
+    }
+
+    #[tokio::test]
+    async fn push_routes_allow_get_put_and_delete_cors_preflight() {
+        let app = router(test_protocol("push-http-cors").protocol.clone(), false);
+        for (method, path) in [
+            ("GET", "/api/push/config"),
+            ("PUT", "/api/push/subscription"),
+            ("DELETE", "/api/push/subscription"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri(path)
+                        .header("origin", "http://127.0.0.1:4173")
+                        .header("access-control-request-method", method)
+                        .header(
+                            "access-control-request-headers",
+                            "authorization,content-type,x-termd-server-id",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("access-control-allow-origin")
+                    .and_then(|value| value.to_str().ok()),
+                Some("*")
             );
         }
     }

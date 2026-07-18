@@ -57,12 +57,31 @@ impl SessionActivityDetector {
     }
 
     /// Returns true only when the semantic wire state changed.
+    #[cfg(test)]
     pub(super) fn observe_output(
         &mut self,
         bytes: &[u8],
         now_ms: u64,
-        mut foreground: impl FnMut() -> ForegroundProcess,
+        foreground: impl FnMut() -> ForegroundProcess,
     ) -> bool {
+        self.observe_output_inner(bytes, now_ms, foreground).0
+    }
+
+    pub(super) fn observe_output_transitions(
+        &mut self,
+        bytes: &[u8],
+        now_ms: u64,
+        foreground: impl FnMut() -> ForegroundProcess,
+    ) -> Vec<Option<SessionAiActivityPayload>> {
+        self.observe_output_inner(bytes, now_ms, foreground).1
+    }
+
+    fn observe_output_inner(
+        &mut self,
+        bytes: &[u8],
+        now_ms: u64,
+        mut foreground: impl FnMut() -> ForegroundProcess,
+    ) -> (bool, Vec<Option<SessionAiActivityPayload>>) {
         let events = self.parser.push(bytes);
         let tracks_foreground = self
             .activity
@@ -81,7 +100,7 @@ impl SessionActivityDetector {
             && !needs_identity_probe
             && !completed_needs_probe
         {
-            return false;
+            return (false, Vec::new());
         }
 
         let first_structured_event = self.activity.is_none()
@@ -136,12 +155,16 @@ impl SessionActivityDetector {
             self.last_foreground_probe_at_ms = Some(now_ms);
         }
 
+        let mut transitions = Vec::new();
         let mut changed = self.observe_foreground(self.last_foreground, now_ms);
+        if changed {
+            transitions.push(self.activity);
+        }
         let ForegroundProcess::Agent(agent) = self.last_foreground else {
-            return changed;
+            return (changed, transitions);
         };
         for event in events {
-            changed |= match event {
+            let event_changed = match event {
                 OscEvent::Title(title) => self.observe_title(agent, &title, now_ms),
                 OscEvent::ClaudeStatus(payload) if agent == SessionActivityAgent::ClaudeCode => {
                     self.observe_claude_status(&payload, now_ms)
@@ -151,8 +174,12 @@ impl SessionActivityDetector {
                 }
                 OscEvent::ClaudeStatus(_) | OscEvent::ItermProgress(_) => false,
             };
+            changed |= event_changed;
+            if event_changed {
+                transitions.push(self.activity);
+            }
         }
-        changed
+        (changed, transitions)
     }
 
     fn observe_foreground(&mut self, foreground: ForegroundProcess, now_ms: u64) -> bool {
@@ -703,6 +730,31 @@ mod tests {
     }
 
     #[test]
+    fn one_output_frame_preserves_every_activity_transition() {
+        let mut detector = SessionActivityDetector::default();
+        let transitions = detector.observe_output_transitions(
+            b"\x1b]0;[.] Working\x07\x1b]0;project\x07",
+            100,
+            || ForegroundProcess::Agent(SessionActivityAgent::Codex),
+        );
+
+        assert_eq!(
+            transitions
+                .iter()
+                .map(|activity| activity.map(|activity| activity.state))
+                .collect::<Vec<_>>(),
+            [
+                Some(SessionActivityState::Running),
+                Some(SessionActivityState::Completed),
+            ]
+        );
+        assert_eq!(
+            detector.activity().unwrap().state,
+            SessionActivityState::Completed
+        );
+    }
+
+    #[test]
     fn only_codex_foreground_can_create_activity_and_exit_completes_active_work() {
         let mut detector = SessionActivityDetector::default();
         assert!(
@@ -735,6 +787,23 @@ mod tests {
             100 + FOREGROUND_PROBE_MIN_INTERVAL_MS + 1,
             || ForegroundProcess::Other,
         ));
+        assert_eq!(detector.activity(), None);
+    }
+
+    #[test]
+    fn activity_transitions_explicitly_publish_clear_state() {
+        let mut detector = SessionActivityDetector::default();
+        detector.observe_output_transitions(b"\x1b]0;project\x07", 100, || {
+            ForegroundProcess::Agent(SessionActivityAgent::Codex)
+        });
+
+        let transitions = detector.observe_output_transitions(
+            b"shell prompt",
+            100 + FOREGROUND_PROBE_MIN_INTERVAL_MS + 1,
+            || ForegroundProcess::Other,
+        );
+
+        assert_eq!(transitions, [None]);
         assert_eq!(detector.activity(), None);
     }
 

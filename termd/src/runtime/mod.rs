@@ -11,11 +11,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::pty::{
     CommandSpec, PtyAttachment, PtyAttachmentBootstrap, PtyBackend, PtyError, PtyRestoreInfo,
-    PtySession, PtySize, PtySnapshot, PtySupervisorStatus, PtyTerminalFrame,
+    PtySession, PtySize, PtySnapshot, PtySupervisorStatus, PtyTerminalFrame, SessionActivityEvent,
+    SessionActivitySignal,
 };
 use crate::session::{AttachRole, SessionError, SessionManager, SessionState, TerminalSize};
 use crate::state::SessionStateRecord;
@@ -146,6 +147,7 @@ pub struct SessionRuntime<B: PtyBackend> {
     runtime_sessions: HashMap<String, RuntimeSession>,
     next_session_number: u64,
     activity_change_signal: Option<watch::Sender<u64>>,
+    activity_event_tx: Option<mpsc::Sender<SessionActivityEvent>>,
 }
 
 impl<B: PtyBackend> SessionRuntime<B> {
@@ -156,12 +158,14 @@ impl<B: PtyBackend> SessionRuntime<B> {
         Self::from_shared_backend(Arc::new(backend))
     }
 
-    pub(crate) fn new_with_activity_change_signal(
+    pub(crate) fn new_with_activity_signals(
         backend: B,
         activity_change_signal: watch::Sender<u64>,
+        activity_event_tx: mpsc::Sender<SessionActivityEvent>,
     ) -> Self {
         let mut runtime = Self::from_shared_backend(Arc::new(backend));
         runtime.activity_change_signal = Some(activity_change_signal);
+        runtime.activity_event_tx = Some(activity_event_tx);
         runtime
     }
 
@@ -172,6 +176,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
             runtime_sessions: HashMap::new(),
             next_session_number: 1,
             activity_change_signal: None,
+            activity_event_tx: None,
         }
     }
 
@@ -193,7 +198,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
             .resize(session_id, size)
             .expect("ownership create prevalidated terminal size");
         let now_ms = current_unix_timestamp_millis();
-        self.configure_activity_signal(&mut *pty);
+        self.configure_activity_signal(session_id, &mut *pty);
         self.runtime_sessions.insert(
             session_id.to_owned(),
             RuntimeSession {
@@ -240,7 +245,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
         self.sessions.create_session(session_id.to_owned())?;
         self.sessions.resize(session_id, size)?;
         let now_ms = current_unix_timestamp_millis();
-        self.configure_activity_signal(&mut *pty);
+        self.configure_activity_signal(session_id, &mut *pty);
         self.runtime_sessions.insert(
             session_id.to_owned(),
             RuntimeSession {
@@ -286,7 +291,7 @@ impl<B: PtyBackend> SessionRuntime<B> {
             let _ = self.sessions.attach(&session_id, recovery_device.clone())?;
             let _ = self.sessions.detach(&session_id, &recovery_device);
         }
-        self.configure_activity_signal(&mut *pty);
+        self.configure_activity_signal(&session_id, &mut *pty);
         self.runtime_sessions.insert(
             session_id,
             RuntimeSession {
@@ -807,9 +812,15 @@ impl<B: PtyBackend> SessionRuntime<B> {
             .ok_or(RuntimeError::SessionNotFound)
     }
 
-    fn configure_activity_signal(&self, pty: &mut dyn PtySession) {
-        if let Some(signal) = &self.activity_change_signal {
-            pty.set_activity_change_signal(signal.clone());
+    fn configure_activity_signal(&self, session_id: &str, pty: &mut dyn PtySession) {
+        if let (Some(metadata_signal), Some(event_tx)) =
+            (&self.activity_change_signal, &self.activity_event_tx)
+        {
+            pty.set_activity_change_signal(SessionActivitySignal::new(
+                session_id,
+                metadata_signal.clone(),
+                event_tx.clone(),
+            ));
         }
     }
 
@@ -917,7 +928,7 @@ mod tests {
         attached_devices: HashSet<String>,
         restore_info: Option<PtyRestoreInfo>,
         activity: Option<SessionAiActivityPayload>,
-        activity_change_signal: Option<watch::Sender<u64>>,
+        activity_change_signal: Option<SessionActivitySignal>,
     }
 
     #[derive(Debug)]
@@ -1004,8 +1015,7 @@ mod tests {
                 state.activity_change_signal.clone()
             };
             if let Some(signal) = signal {
-                let next = signal.borrow().saturating_add(1);
-                signal.send_replace(next);
+                signal.publish(Some(activity));
             }
         }
     }
@@ -1088,7 +1098,7 @@ mod tests {
             self.state.lock().unwrap().activity
         }
 
-        fn set_activity_change_signal(&mut self, signal: watch::Sender<u64>) {
+        fn set_activity_change_signal(&mut self, signal: SessionActivitySignal) {
             self.state.lock().unwrap().activity_change_signal = Some(signal);
         }
 
@@ -1218,26 +1228,39 @@ mod tests {
     }
 
     #[test]
-    fn session_activity_is_read_from_pty_and_forwards_change_signal() {
+    fn session_activity_is_read_from_pty_and_preserves_change_events() {
         let backend = FakePtyBackend::default();
         let (signal, changes) = watch::channel(0_u64);
-        let mut runtime = SessionRuntime::new_with_activity_change_signal(backend.clone(), signal);
+        let (activity_tx, mut activity_events) = mpsc::channel(8);
+        let mut runtime =
+            SessionRuntime::new_with_activity_signals(backend.clone(), signal, activity_tx);
         let session_id = runtime
             .create_session(CommandSpec::new("sh"), TerminalSize::cells(24, 80))
             .unwrap();
-        let activity = SessionAiActivityPayload {
+        let running = SessionAiActivityPayload {
             kind: termd_proto::SessionActivityKind::Ai,
             agent: termd_proto::SessionActivityAgent::Codex,
             state: termd_proto::SessionActivityState::Running,
             changed_at_ms: UnixTimestampMillis(123),
         };
+        let completed = SessionAiActivityPayload {
+            state: termd_proto::SessionActivityState::Completed,
+            changed_at_ms: UnixTimestampMillis(124),
+            ..running
+        };
 
-        backend.report_activity(activity);
+        backend.report_activity(running);
+        backend.report_activity(completed);
 
         assert!(changes.has_changed().unwrap());
+        assert_eq!(activity_events.try_recv().unwrap().activity, Some(running));
+        assert_eq!(
+            activity_events.try_recv().unwrap().activity,
+            Some(completed)
+        );
         assert_eq!(
             runtime.session_activity(&session_id).unwrap(),
-            Some(activity)
+            Some(completed)
         );
     }
 

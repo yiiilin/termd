@@ -314,6 +314,9 @@ pub fn is_http_tunnel_path_allowed(method: &str, path: &str) -> bool {
     (method.eq_ignore_ascii_case("POST") && auth_path)
         || (method.eq_ignore_ascii_case("POST") && is_http_control_tunnel_path_allowed(path))
         || is_http_file_tunnel_path_allowed(method, path)
+        || (method.eq_ignore_ascii_case("GET") && path == "/api/push/config")
+        || (method.eq_ignore_ascii_case("PUT") && path == "/api/push/subscription")
+        || (method.eq_ignore_ascii_case("DELETE") && path == "/api/push/subscription")
 }
 
 fn is_http_file_tunnel_path_allowed(method: &str, path: &str) -> bool {
@@ -2120,7 +2123,7 @@ mod tests {
     }
 
     #[test]
-    fn http_tunnel_allowlist_accepts_only_current_control_and_file_routes() {
+    fn http_tunnel_allowlist_accepts_only_current_control_file_and_push_routes() {
         let session_id = SessionId::new();
 
         for path in [
@@ -2148,6 +2151,9 @@ mod tests {
             ("POST", "/api/files/uploads/upload-id/abort".to_owned()),
             ("POST", "/api/files/downloads".to_owned()),
             ("GET", "/api/files/downloads/download-id".to_owned()),
+            ("GET", "/api/push/config".to_owned()),
+            ("PUT", "/api/push/subscription".to_owned()),
+            ("DELETE", "/api/push/subscription".to_owned()),
         ] {
             assert!(
                 is_http_tunnel_path_allowed(method, &path),
@@ -2176,6 +2182,8 @@ mod tests {
             "/api/files/upload/abort",
             "/api/files/download",
             "/api/files/download/extra",
+            "/api/push/config/extra",
+            "/api/push/subscription/extra",
         ] {
             assert!(!is_http_tunnel_path_allowed("POST", path), "{path}");
         }
@@ -2188,6 +2196,11 @@ mod tests {
             "POST",
             "/api/files/uploads/upload-id/chunks"
         ));
+        assert!(!is_http_tunnel_path_allowed(
+            "POST",
+            "/api/push/subscription"
+        ));
+        assert!(!is_http_tunnel_path_allowed("DELETE", "/api/push/config"));
     }
 
     #[test]

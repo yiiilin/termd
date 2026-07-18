@@ -42,7 +42,7 @@ use super::activity::{SessionActivityDetector, foreground_process_for_shell};
 use super::{
     CommandSpec, PtyAttachment, PtyAttachmentBootstrap, PtyBackend, PtyError, PtyRestoreInfo,
     PtyResult, PtySession, PtySize, PtySnapshot, PtyStartupGrant, PtySupervisorStatus,
-    PtyTerminalFrame,
+    PtyTerminalFrame, SessionActivitySignal,
 };
 
 const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -616,7 +616,7 @@ struct SupervisorPtySession {
     cached_size: StdMutex<PtySize>,
     cached_process_id: Arc<StdMutex<Option<u32>>>,
     activity_detector: Arc<StdMutex<SessionActivityDetector>>,
-    activity_change_signal: Arc<StdMutex<Option<watch::Sender<u64>>>>,
+    activity_change_signal: Arc<StdMutex<Option<SessionActivitySignal>>>,
     close_operation_id: StdMutex<Option<u64>>,
     cleanup_capability: Option<[u8; CLEANUP_CAPABILITY_BYTES]>,
     exited: Arc<AtomicBool>,
@@ -1527,7 +1527,7 @@ struct SupervisorReaderShared {
     bootstrap_terminal_frames: Arc<StdMutex<Option<VecDeque<PtyTerminalFrame>>>>,
     cached_process_id: Arc<StdMutex<Option<u32>>>,
     activity_detector: Arc<StdMutex<SessionActivityDetector>>,
-    activity_change_signal: Arc<StdMutex<Option<watch::Sender<u64>>>>,
+    activity_change_signal: Arc<StdMutex<Option<SessionActivitySignal>>>,
     exited: Arc<AtomicBool>,
 }
 
@@ -1739,7 +1739,7 @@ impl PtySession for SupervisorPtySession {
             .activity()
     }
 
-    fn set_activity_change_signal(&mut self, signal: watch::Sender<u64>) {
+    fn set_activity_change_signal(&mut self, signal: SessionActivitySignal) {
         *self
             .activity_change_signal
             .lock()
@@ -1968,7 +1968,7 @@ fn supervisor_reader_loop(
     bootstrap_terminal_frames: Arc<StdMutex<Option<VecDeque<PtyTerminalFrame>>>>,
     cached_process_id: Arc<StdMutex<Option<u32>>>,
     activity_detector: Arc<StdMutex<SessionActivityDetector>>,
-    activity_change_signal: Arc<StdMutex<Option<watch::Sender<u64>>>>,
+    activity_change_signal: Arc<StdMutex<Option<SessionActivitySignal>>>,
     output_signal_tx: watch::Sender<u64>,
     exited: Arc<AtomicBool>,
 ) {
@@ -2065,7 +2065,7 @@ fn apply_and_enqueue_daemon_terminal_frame(
     terminal_mirror: &Arc<StdMutex<SupervisorTerminalMirror>>,
     cached_process_id: &Arc<StdMutex<Option<u32>>>,
     activity_detector: &Arc<StdMutex<SessionActivityDetector>>,
-    activity_change_signal: &Arc<StdMutex<Option<watch::Sender<u64>>>>,
+    activity_change_signal: &Arc<StdMutex<Option<SessionActivitySignal>>>,
     frame: PtyTerminalFrame,
 ) -> bool {
     let applied = terminal_mirror
@@ -2075,16 +2075,18 @@ fn apply_and_enqueue_daemon_terminal_frame(
     if applied {
         if let PtyTerminalFrame::Output { data, .. } = &frame {
             let shell_pid = *cached_process_id.lock().expect("cached pid mutex poisoned");
-            let activity_changed = activity_detector
-                .lock()
-                .expect("session activity detector mutex poisoned")
-                .observe_output(
+            let activities = {
+                let mut detector = activity_detector
+                    .lock()
+                    .expect("session activity detector mutex poisoned");
+                detector.observe_output_transitions(
                     data,
                     u64::try_from(current_unix_timestamp_millis()).unwrap_or(u64::MAX),
                     || foreground_process_for_shell(shell_pid),
-                );
-            if activity_changed {
-                notify_activity_changed(activity_change_signal);
+                )
+            };
+            for activity in activities {
+                notify_activity_changed(activity_change_signal, activity);
             }
         }
         enqueue_daemon_terminal_frame(pending_terminal_frames, terminal_mirror, frame);
@@ -2092,14 +2094,16 @@ fn apply_and_enqueue_daemon_terminal_frame(
     applied
 }
 
-fn notify_activity_changed(activity_change_signal: &Arc<StdMutex<Option<watch::Sender<u64>>>>) {
+fn notify_activity_changed(
+    activity_change_signal: &Arc<StdMutex<Option<SessionActivitySignal>>>,
+    activity: Option<termd_proto::SessionAiActivityPayload>,
+) {
     let signal = activity_change_signal
         .lock()
         .expect("session activity change signal mutex poisoned")
         .clone();
     if let Some(signal) = signal {
-        let next = signal.borrow().saturating_add(1);
-        signal.send_replace(next);
+        signal.publish(activity);
     }
 }
 

@@ -14,10 +14,53 @@ use std::fmt::{self, Display};
 use std::io;
 use std::path::{Path, PathBuf};
 use termd_proto::SessionAiActivityPayload;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+use tracing::warn;
 
 /// PTY 模块统一使用的 Result 类型。
 pub type PtyResult<T> = Result<T, PtyError>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionActivityEvent {
+    pub session_id: String,
+    pub activity: Option<SessionAiActivityPayload>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionActivitySignal {
+    session_id: String,
+    metadata_signal: watch::Sender<u64>,
+    event_tx: mpsc::Sender<SessionActivityEvent>,
+}
+
+impl SessionActivitySignal {
+    pub(crate) fn new(
+        session_id: impl Into<String>,
+        metadata_signal: watch::Sender<u64>,
+        event_tx: mpsc::Sender<SessionActivityEvent>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            metadata_signal,
+            event_tx,
+        }
+    }
+
+    pub fn publish(&self, activity: Option<SessionAiActivityPayload>) {
+        let event = SessionActivityEvent {
+            session_id: self.session_id.clone(),
+            activity,
+        };
+        if matches!(
+            self.event_tx.try_send(event),
+            Err(mpsc::error::TrySendError::Full(_))
+        ) {
+            warn!("session activity event queue is full; transition dropped");
+        }
+        let next = self.metadata_signal.borrow().saturating_add(1);
+        self.metadata_signal.send_replace(next);
+    }
+}
 
 /// PTY 层错误。
 ///
@@ -530,7 +573,7 @@ pub trait PtySession: Send {
     }
 
     /// Installs a low-frequency notification target for semantic activity changes.
-    fn set_activity_change_signal(&mut self, _signal: watch::Sender<u64>) {}
+    fn set_activity_change_signal(&mut self, _signal: SessionActivitySignal) {}
 
     /// 写入用户输入或控制序列。调用前应由 session 层确认当前设备具备控制权。
     fn write_all(&mut self, bytes: &[u8]) -> PtyResult<()>;

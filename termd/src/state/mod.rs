@@ -32,6 +32,7 @@ use uuid::Uuid;
 use crate::pty::{PtyRestoreInfo, PtySupervisorStatus};
 
 pub mod client_history;
+pub mod web_push;
 
 /// 当前 daemon 状态文件的 schema 版本。
 pub const STATE_SCHEMA_VERSION: u32 = 3;
@@ -379,6 +380,9 @@ pub enum StateError {
     InvalidDaemonIdentity {
         source: String,
     },
+    InvalidWebPushIdentity {
+        source: String,
+    },
     InvalidSupervisorCleanupCapability {
         session_id: SessionId,
     },
@@ -465,6 +469,9 @@ impl fmt::Display for StateError {
                 path.display()
             ),
             Self::InvalidDaemonIdentity { .. } => write!(f, "failed to restore daemon identity"),
+            Self::InvalidWebPushIdentity { .. } => {
+                write!(f, "failed to restore Web Push identity")
+            }
             Self::InvalidSupervisorCleanupCapability { session_id } => write!(
                 f,
                 "session {session_id:?} has no valid supervisor cleanup capability"
@@ -505,6 +512,7 @@ impl Error for StateError {
             | Self::UnsafeSqlitePath { .. }
             | Self::UnsupportedPlatform { .. }
             | Self::InvalidDaemonIdentity { .. }
+            | Self::InvalidWebPushIdentity { .. }
             | Self::InvalidSupervisorCleanupCapability { .. }
             | Self::IncompatibleVersion { .. } => None,
         }

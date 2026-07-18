@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod config;
 pub mod net;
+pub mod notifications;
 pub mod pty;
 pub mod runtime;
 pub mod session;

@@ -143,6 +143,16 @@ fn http_api_tunnel_router() -> Router<RelayState> {
         .route(
             "/api/files/downloads/:id",
             get(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/push/config",
+            get(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/push/subscription",
+            put(relay_http_tunnel)
+                .delete(relay_http_tunnel)
+                .options(relay_http_tunnel_preflight),
         );
 
     // 中文注释：跨源预检只挂在 relay HTTP API tunnel 上；真正鉴权仍在 daemon access token。
@@ -157,7 +167,13 @@ fn http_api_tunnel_cors_layer() -> CorsLayer {
     // 中文注释：relay 透明转发 HTTP control/file tunnel，不解析业务内容。
     CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([
             CONTENT_TYPE,
             HeaderName::from_static("content-range"),
@@ -356,7 +372,10 @@ fn relay_http_admission_requirement(path: &str) -> Option<RelayHttpAdmissionRequ
         | "/api/auth/device-certificate/migrate/challenge" => {
             Some(RelayHttpAdmissionRequirement::Bootstrap)
         }
-        path if path.starts_with("/api/control/") || path.starts_with("/api/files/") => {
+        path if path.starts_with("/api/control/")
+            || path.starts_with("/api/files/")
+            || path.starts_with("/api/push/") =>
+        {
             Some(RelayHttpAdmissionRequirement::Signed {
                 scheme: "Bearer",
                 kind: RelaySignedCredentialKind::AccessToken,
@@ -1104,6 +1123,93 @@ mod tests {
                 .expect("router should respond");
 
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    #[tokio::test]
+    async fn router_mounts_all_web_push_tunnel_routes_and_cors_methods() {
+        for (method, path) in [
+            (Method::GET, "/api/push/config"),
+            (Method::PUT, "/api/push/subscription"),
+            (Method::DELETE, "/api/push/subscription"),
+        ] {
+            let response = router(RelayState::default(), true)
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header("x-termd-server-id", ServerId::new().0.to_string())
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            let preflight = router(RelayState::default(), true)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri(path)
+                        .header("origin", "http://127.0.0.1:4173")
+                        .header("access-control-request-method", method.as_str())
+                        .header(
+                            "access-control-request-headers",
+                            "authorization,content-type,x-termd-server-id",
+                        )
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("router should respond");
+            assert_eq!(preflight.status(), StatusCode::OK);
+            assert_eq!(
+                preflight
+                    .headers()
+                    .get("access-control-allow-origin")
+                    .and_then(|value| value.to_str().ok()),
+                Some("*")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_relay_web_push_routes_require_access_token_credentials() {
+        let fixture = relay_http_credential_fixture();
+        let server_id = fixture.identity.server_id();
+        let valid_authorization = format!("Bearer {}", fixture.access_token);
+        let wrong_authorization = format!("Bearer {}", fixture.device_certificate);
+
+        for (method, path) in [
+            (Method::GET, "/api/push/config"),
+            (Method::PUT, "/api/push/subscription"),
+            (Method::DELETE, "/api/push/subscription"),
+        ] {
+            for (authorization, expected_status) in [
+                (
+                    Some(valid_authorization.as_str()),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ),
+                (Some(wrong_authorization.as_str()), StatusCode::UNAUTHORIZED),
+                (None, StatusCode::UNAUTHORIZED),
+            ] {
+                let mut request = Request::builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .header("x-termd-server-id", server_id.0.to_string());
+                if let Some(authorization) = authorization {
+                    request = request.header("authorization", authorization);
+                }
+                let response = router(fixture.state.clone(), false)
+                    .oneshot(
+                        request
+                            .body(Body::empty())
+                            .expect("test request should build"),
+                    )
+                    .await
+                    .expect("router should respond");
+                assert_eq!(response.status(), expected_status, "{method} {path}");
+            }
         }
     }
 

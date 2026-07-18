@@ -56,7 +56,7 @@ use termd_proto::{
 };
 use termd_proto::{SessionSearchMatchPayload, SessionSearchResultPayload};
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::auth::{
     AccessTokenProofInput, AuthChallengeManager, ChallengeResponseService, CredentialKind,
@@ -66,12 +66,13 @@ use crate::auth::{
     validate_device_public_key_wire, verify_credential,
 };
 use crate::config::DaemonConfig;
+use crate::notifications::{PushNotificationCoordinator, SessionActivitySnapshot};
 use crate::pty::supervisor::{
     SupervisorTerminalClientFrame, decode_supervisor_terminal_client_frame,
 };
 use crate::pty::{
     CommandSpec, PtyAttachmentBootstrap, PtyBackend, PtyRestoreInfo, PtySize, PtySupervisorStatus,
-    PtyTerminalFrame,
+    PtyTerminalFrame, SessionActivityEvent,
 };
 use crate::runtime::{RuntimeError, SessionRuntime};
 use crate::session::{
@@ -87,6 +88,7 @@ use crate::state::{
 
 use super::screen::TerminalScreen;
 const AUTH_CHALLENGE_TTL_MS: u64 = 60_000;
+const SESSION_ACTIVITY_EVENT_QUEUE_CAPACITY: usize = 256;
 const LIVE_OUTPUT_MIN_BYTES: usize = 16 * 1024;
 const LIVE_OUTPUT_BYTES_PER_CELL: usize = 8;
 // 中文注释：supervisor 会按 PTY read 边界生成 terminal frame，很多命令会变成
@@ -712,6 +714,8 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     session_file_http_uploads: HashMap<String, SessionFileHttpUploadState>,
     daemon_clients: HashMap<DeviceId, DaemonClientRecord>,
     client_history: ClientHistoryStore,
+    push_notifications: PushNotificationCoordinator,
+    push_activity_events: Option<mpsc::Receiver<SessionActivityEvent>>,
     #[cfg(test)]
     session_output_history: HashMap<SessionId, SessionOutputHistory>,
     daemon_clients_signal: watch::Sender<u64>,
@@ -855,6 +859,14 @@ where
         B: 'static,
     {
         let client_history = ClientHistoryStore::open(&config.state_path)?;
+        let push_notifications = PushNotificationCoordinator::open(
+            daemon_identity.server_id(),
+            &config.state_path,
+        )
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "Web Push state is unavailable; notifications are disabled");
+            PushNotificationCoordinator::unavailable(daemon_identity.server_id())
+        });
         let auth_service = ChallengeResponseService::new(
             daemon_identity.public_identity(),
             AuthChallengeManager::new(),
@@ -862,8 +874,13 @@ where
         );
         let (daemon_clients_signal, _) = watch::channel(0);
         let (v070_metadata_signal, _) = watch::channel(0);
-        let runtime =
-            SessionRuntime::new_with_activity_change_signal(backend, v070_metadata_signal.clone());
+        let (activity_event_tx, activity_event_rx) =
+            mpsc::channel(SESSION_ACTIVITY_EVENT_QUEUE_CAPACITY);
+        let runtime = SessionRuntime::new_with_activity_signals(
+            backend,
+            v070_metadata_signal.clone(),
+            activity_event_tx,
+        );
         let ownership = SessionOwnership::open(&config.state_path, runtime.backend_handle())
             .map_err(|error| StateError::InvalidOwnershipState {
                 source: error.to_string(),
@@ -887,6 +904,8 @@ where
             session_file_http_uploads: HashMap::new(),
             daemon_clients: HashMap::new(),
             client_history,
+            push_notifications,
+            push_activity_events: Some(activity_event_rx),
             #[cfg(test)]
             session_output_history: HashMap::new(),
             daemon_clients_signal,
@@ -971,6 +990,10 @@ where
 
     pub fn server_id(&self) -> ServerId {
         self.daemon_identity.server_id()
+    }
+
+    pub fn push_notifications(&self) -> PushNotificationCoordinator {
+        self.push_notifications.clone()
     }
 
     pub fn daemon_public_identity(&self) -> &DaemonPublicIdentity {
@@ -1326,6 +1349,39 @@ where
 
     pub fn v070_metadata_signal(&self) -> watch::Receiver<u64> {
         self.v070_metadata_signal.subscribe()
+    }
+
+    pub fn push_activity_snapshot(&self) -> Vec<SessionActivitySnapshot> {
+        self.session_index
+            .iter()
+            .filter_map(|(session_id, internal_id)| {
+                let activity = self.runtime.session_activity(internal_id).ok()?;
+                Some(SessionActivitySnapshot {
+                    session_id: *session_id,
+                    session_name: self.session_names.get(session_id).cloned(),
+                    activity,
+                })
+            })
+            .collect()
+    }
+
+    pub fn take_push_activity_events(&mut self) -> Option<mpsc::Receiver<SessionActivityEvent>> {
+        self.push_activity_events.take()
+    }
+
+    pub fn push_activity_event_snapshot(
+        &self,
+        event: SessionActivityEvent,
+    ) -> Option<SessionActivitySnapshot> {
+        let session_id = SessionId(uuid::Uuid::parse_str(&event.session_id).ok()?);
+        if self.session_index.get(&session_id)? != &event.session_id {
+            return None;
+        }
+        Some(SessionActivitySnapshot {
+            session_id,
+            session_name: self.session_names.get(&session_id).cloned(),
+            activity: event.activity,
+        })
     }
 
     fn notify_v070_metadata_changed(&self) {
