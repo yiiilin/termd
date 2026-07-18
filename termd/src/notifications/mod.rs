@@ -811,6 +811,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn payload_localizes_and_sanitizes_session_names() {
+        let session_id = SessionId::new();
+        let fallback_event = ActivityEvent {
+            session_id,
+            session_name: Some("\n\t".to_owned()),
+            activity: SessionAiActivityPayload {
+                kind: SessionActivityKind::Ai,
+                agent: SessionActivityAgent::ClaudeCode,
+                state: SessionActivityState::Attention,
+                changed_at_ms: UnixTimestampMillis(1),
+            },
+        };
+        let fallback = push_message_payload(
+            ServerId::new(),
+            PushNotificationLocale::EnUs,
+            &fallback_event,
+        );
+        assert_eq!(
+            fallback.session_name,
+            format!("Session {}", &session_id.0.to_string()[..8])
+        );
+        assert_eq!(fallback.agent, "claude_code");
+        assert_eq!(fallback.state, "attention");
+        assert!(fallback.body.ends_with(": Claude Code needs attention"));
+
+        let sanitized_event = ActivityEvent {
+            session_id,
+            session_name: Some(format!("{}\nignored", "会".repeat(100))),
+            activity: SessionAiActivityPayload {
+                kind: SessionActivityKind::Ai,
+                agent: SessionActivityAgent::ZCode,
+                state: SessionActivityState::Idle,
+                changed_at_ms: UnixTimestampMillis(2),
+            },
+        };
+        let sanitized = push_message_payload(
+            ServerId::new(),
+            PushNotificationLocale::ZhCn,
+            &sanitized_event,
+        );
+        assert_eq!(
+            sanitized.session_name.chars().count(),
+            PUSH_SESSION_NAME_MAX_CHARS
+        );
+        assert!(!sanitized.session_name.chars().any(char::is_control));
+        assert_eq!(sanitized.agent, "zcode");
+        assert_eq!(sanitized.state, "idle");
+        assert!(sanitized.body.ends_with("：ZCode 已就绪"));
+    }
+
     #[tokio::test]
     async fn attention_mode_filters_completion_but_delivers_attention() {
         let state_dir = TestStateDir::new("attention-mode");
@@ -898,6 +949,49 @@ mod tests {
         })
         .await
         .unwrap();
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_subscription_is_removed_without_delivery() {
+        let state_dir = TestStateDir::new("invalid-subscription");
+        let delivery = Arc::new(FakeDelivery::new([]));
+        let coordinator = PushNotificationCoordinator::open_with_delivery(
+            ServerId::new(),
+            state_dir.state_path(),
+            delivery.clone(),
+        )
+        .unwrap();
+        let worker = coordinator.start_delivery_worker().unwrap();
+        let device_id = DeviceId::new();
+        let session_id = SessionId::new();
+        let (mut subscription, _, _) = test_subscription(
+            "https://push.example.test/invalid",
+            crate::state::web_push::PushNotificationMode::All,
+        );
+        subscription.p256dh = "not-base64url".to_owned();
+        coordinator
+            .upsert_subscription(device_id, subscription)
+            .unwrap();
+
+        coordinator.initialize_activity_snapshot(vec![activity_snapshot(
+            session_id,
+            SessionActivityState::Running,
+            1,
+        )]);
+        assert!(coordinator.observe_activity_change(activity_snapshot(
+            session_id,
+            SessionActivityState::Completed,
+            2,
+        )));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while coordinator.is_subscribed(device_id).unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(delivery.request_count.load(Ordering::SeqCst), 0);
         worker.abort();
     }
 
