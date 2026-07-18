@@ -549,6 +549,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
         session_id: "00000000-0000-0000-0000-000000000501",
         state: "running",
         size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        activity: { kind: "ai", agent: "codex", state: "running", changed_at_ms: 10 },
       },
     ],
     attachOutput: "termd-e2e-ready\n",
@@ -577,7 +578,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     await expect(openProgressIcon).toBeVisible();
     await expect(openProgressIcon).toHaveCSS("width", "18px");
     await expect(openProgressIcon).toHaveCSS("height", "18px");
-    await expect(openProgressButton.locator("img[data-avatar-style='thumbs']")).toHaveCount(0);
+    await expect(openProgressButton.locator("img[data-session-avatar]")).toHaveCount(0);
 
     await openProgressButton.click();
     const openProgressPopover = terminalPane.getByTestId("terminal-open-progress");
@@ -704,19 +705,78 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
 
     const sessionsPanel = page.getByRole("region", { name: "sessions" });
     // session UUID 已从 UI 隐藏；测试按用户实际看到的可访问名称打开会话。
-    const openSessionButton = sessionsPanel.getByRole("button", { name: "Open Lagrange" });
+    const openSessionButton = sessionsPanel.getByRole("button", { name: "Open Lagrange, Codex is running" });
     const sessionRow = sessionsPanel.locator(".session-row").filter({
-      has: page.getByRole("button", { name: "Open Lagrange" }),
+      has: page.getByRole("button", { name: "Open Lagrange, Codex is running" }),
     });
     await expect(sessionRow).toBeVisible();
     const sessionAvatarFrame = sessionRow.locator(".session-avatar");
-    const sessionAvatar = sessionRow.locator("img[data-avatar-style='thumbs']");
+    const sessionAvatar = sessionRow.locator("img[data-avatar-style='identicon']");
     await expect(sessionAvatar).toBeVisible();
     await expect(sessionAvatarFrame).toHaveCSS("width", "28px");
     await expect(sessionAvatarFrame).toHaveCSS("height", "28px");
     await expect.poll(() => sessionAvatar.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+    const sessionVisual = sessionRow.getByTitle("Codex is running");
+    await expect(sessionVisual).toHaveAttribute("title", "Codex is running");
+    await expect(sessionVisual).toHaveAttribute("aria-hidden", "true");
+    await expect(sessionVisual).toHaveClass(/activity-running/);
+    await expect(sessionVisual).toHaveCSS("width", "28px");
+    await expect(sessionVisual).toHaveCSS("height", "28px");
+    await expect(sessionVisual.locator("svg")).toHaveCount(0);
+    await expect(sessionRow.locator(".session-activity-indicator")).toHaveCount(0);
+    await expect.poll(() => sessionVisual.evaluate((element) => {
+      return window.getComputedStyle(element, "::after").content;
+    })).toBe("none");
+    const runningSurface = await sessionRow.evaluate((element) => {
+      const surface = window.getComputedStyle(element);
+      return {
+        backgroundColor: surface.backgroundColor,
+        animationName: surface.animationName,
+      };
+    });
+    expect(runningSurface.backgroundColor).toMatch(/^(rgb|color\(srgb)/);
+    expect(runningSurface.animationName).toBe("session-activity-row-breathe");
+    const staticSurfaceColors: string[] = [];
+    for (const expected of [
+      "activity-completed",
+      "activity-attention",
+      "activity-error",
+    ]) {
+      await sessionRow.evaluate((element, className) => {
+        element.classList.remove("activity-running", "activity-completed", "activity-attention", "activity-error");
+        element.classList.add(className);
+      }, expected);
+      const staticSurface = await sessionRow.evaluate((element) => {
+        const surface = window.getComputedStyle(element);
+        return { backgroundColor: surface.backgroundColor, animationName: surface.animationName };
+      });
+      expect(staticSurface.backgroundColor).toMatch(/^(rgb|color\(srgb)/);
+      expect(staticSurface.animationName).toBe("none");
+      staticSurfaceColors.push(staticSurface.backgroundColor);
+    }
+    expect(new Set(staticSurfaceColors).size).toBe(3);
+    await sessionRow.evaluate((element) => {
+      element.classList.remove("activity-completed", "activity-attention", "activity-error");
+      element.classList.add("activity-running");
+    });
+    await expect.poll(() => sessionRow.evaluate((element) => (
+      window.getComputedStyle(element).animationName
+    ))).toBe("session-activity-row-breathe");
     if (testInfo.project.name === "chromium") {
-      await page.screenshot({ path: "test-results/session-thumbs-desktop.png", fullPage: true });
+      await page.getByRole("button", { name: "Collapse sidebar" }).click();
+      const collapsedSessionButton = page.locator(".collapsed-session-list .selected-session-dot");
+      await expect(collapsedSessionButton).toBeVisible();
+      await expect(collapsedSessionButton).toHaveClass(/activity-running/);
+      const collapsedSurface = await collapsedSessionButton.evaluate((element) => {
+        const surface = window.getComputedStyle(element);
+        return { backgroundColor: surface.backgroundColor, animationName: surface.animationName };
+      });
+      expect(collapsedSurface.backgroundColor).toBe(runningSurface.backgroundColor);
+      expect(collapsedSurface.animationName).toBe("session-activity-row-breathe");
+      await page.getByRole("button", { name: "Expand sidebar" }).click();
+    }
+    if (testInfo.project.name === "chromium") {
+      await page.screenshot({ path: "test-results/session-activity-row-desktop.png", fullPage: true });
     }
 
     await openSessionButton.click();

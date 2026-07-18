@@ -1,10 +1,10 @@
-import { Bot, Check, CircleAlert, Cog, Pencil, Trash2, X } from "lucide-react";
+import { Check, Pencil, Trash2, X } from "lucide-react";
 import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { flushSync } from "react-dom";
 import type { SessionAiActivityPayload, SessionSummaryPayload, UUID } from "../protocol/types";
 import { sessionDisplayName } from "../session-names";
 import { useI18n, type Translate } from "../i18n";
-import { SessionThumbsAvatar } from "./SessionThumbsAvatar";
+import { SessionIdenticonAvatar } from "./SessionIdenticonAvatar";
 
 export function sessionActivityClassName(activity?: SessionAiActivityPayload | null): string {
   return activity ? `activity-${activity.state}` : "";
@@ -22,38 +22,7 @@ function SessionAvatar(props: { sessionId: UUID; compact?: boolean }) {
       className={["session-avatar", props.compact ? "compact" : ""].filter(Boolean).join(" ")}
       aria-hidden="true"
     >
-      <SessionThumbsAvatar sessionId={props.sessionId} />
-    </span>
-  );
-}
-
-function SessionActivityIndicator(props: {
-  activity?: SessionAiActivityPayload | null;
-  compact?: boolean;
-}) {
-  const { t } = useI18n();
-  const activity = props.activity;
-  if (!activity) return null;
-  const label = sessionActivityLabel(t, activity);
-  const compact = Boolean(props.compact);
-  return (
-    <span
-      className={["session-activity-indicator", compact ? "compact" : "", sessionActivityClassName(activity)]
-        .filter(Boolean)
-        .join(" ")}
-      aria-hidden="true"
-      title={label}
-    >
-      <Bot className="session-activity-bot" size={compact ? 8 : 10} strokeWidth={2} />
-      {activity.state === "running" ? (
-        <Cog className="session-activity-work-gear" size={compact ? 6 : 7} strokeWidth={2.2} />
-      ) : activity.state === "attention" ? (
-        <CircleAlert className="session-activity-attention-badge" size={compact ? 6 : 7} strokeWidth={2.4} />
-      ) : (
-        <span className="session-activity-ok-badge">
-          <Check size={compact ? 5 : 6} strokeWidth={3} />
-        </span>
-      )}
+      <SessionIdenticonAvatar sessionId={props.sessionId} />
     </span>
   );
 }
@@ -63,10 +32,21 @@ function SessionVisual(props: {
   activity?: SessionAiActivityPayload | null;
   compact?: boolean;
 }) {
+  const { t } = useI18n();
+  const activityLabel = sessionActivityLabel(t, props.activity);
   return (
-    <span className={["session-visual", props.compact ? "compact" : ""].filter(Boolean).join(" ")}>
+    <span
+      className={[
+        "session-visual",
+        props.compact ? "compact" : "",
+        sessionActivityClassName(props.activity),
+      ]
+        .filter(Boolean)
+        .join(" ")}
+      aria-hidden="true"
+      title={activityLabel}
+    >
       <SessionAvatar sessionId={props.sessionId} compact={props.compact} />
-      <SessionActivityIndicator activity={props.activity} compact={props.compact} />
     </span>
   );
 }

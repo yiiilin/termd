@@ -49,7 +49,7 @@ describe("SessionList", () => {
     expect(within(openButton).queryByRole("button")).toBeNull();
     expect(within(row as HTMLElement).queryByRole("button", { name: /Drag/ })).toBeNull();
     const avatar = (row as HTMLElement).querySelector<HTMLImageElement>(
-      '[data-session-avatar="00000000-0000-0000-0000-000000000401"][data-avatar-style="thumbs"]',
+      '[data-session-avatar="00000000-0000-0000-0000-000000000401"][data-avatar-style="identicon"]',
     );
     expect(avatar?.getAttribute("src")).toMatch(/^data:image\/svg\+xml/);
     expect(within(row as HTMLElement).getByRole("button", { name: "Rename session" })).toBeInTheDocument();
@@ -92,11 +92,11 @@ describe("SessionList", () => {
 
     const alphaAvatars = Array.from(
       document.querySelectorAll<HTMLImageElement>(
-        `[data-session-avatar="${alphaId}"][data-avatar-style="thumbs"]`,
+        `[data-session-avatar="${alphaId}"][data-avatar-style="identicon"]`,
       ),
     );
     const betaAvatar = document.querySelector<HTMLImageElement>(
-      `[data-session-avatar="${betaId}"][data-avatar-style="thumbs"]`,
+      `[data-session-avatar="${betaId}"][data-avatar-style="identicon"]`,
     );
     const alphaSources = alphaAvatars.map((avatar) => avatar.getAttribute("src"));
 
@@ -203,16 +203,26 @@ describe("SessionList", () => {
     expect(runningButton.closest(".session-row"))
       .toHaveClass("selected", "has-new-output", "activity-running");
     const runningRow = runningButton.closest(".session-row") as HTMLElement;
-    const runningIndicator = within(runningRow).getByTitle("Codex is running");
-    expect(runningIndicator).toHaveAttribute("aria-hidden", "true");
-    expect(runningIndicator.querySelector(".session-activity-work-gear")).not.toBeNull();
+    const runningVisual = within(runningRow).getByTitle("Codex is running");
+    expect(runningVisual).toHaveAttribute("title", "Codex is running");
+    expect(runningVisual).toHaveAttribute("aria-hidden", "true");
+    expect(runningVisual).toHaveClass("session-visual", "activity-running");
+    expect(runningVisual.querySelector("svg")).toBeNull();
     expect(within(runningButton).queryByTitle("Codex is running")).toBeNull();
-    expect(screen.getByTitle("OpenCode finished").querySelector(".session-activity-ok-badge")).not.toBeNull();
-    expect(screen.getByTitle("Claude Code needs attention").querySelector(".session-activity-attention-badge")).not.toBeNull();
+    expect(screen.getByTitle("OpenCode finished")).toHaveClass("activity-completed");
+    expect(screen.getByTitle("OpenCode finished").closest(".session-row"))
+      .toHaveClass("activity-completed");
+    expect(screen.getByTitle("Claude Code needs attention")).toHaveClass("activity-attention");
+    expect(screen.getByTitle("Claude Code needs attention").closest(".session-row"))
+      .toHaveClass("activity-attention");
+    const idleVisual = screen.getByTitle("ZCode is ready");
+    expect(idleVisual).toHaveAttribute("title", "ZCode is ready");
+    expect(idleVisual).toHaveClass("activity-idle");
+    expect(document.querySelector(".session-activity-indicator")).toBeNull();
     expect(document.querySelectorAll(".session-avatar")).toHaveLength(4);
     expect(
       runningRow.querySelector(
-        '[data-session-avatar="00000000-0000-0000-0000-000000000401"][data-avatar-style="thumbs"]',
+        '[data-session-avatar="00000000-0000-0000-0000-000000000401"][data-avatar-style="identicon"]',
       ),
     ).not.toBeNull();
   });
@@ -347,7 +357,36 @@ describe("SessionList", () => {
       name: "Select done, new output, ZCode finished",
     });
     expect(button).toHaveClass("selected-session-dot", "has-new-output", "activity-completed");
-    expect(within(button).getByTitle("ZCode finished")).toHaveClass("compact");
-    expect(within(button).getByTitle("ZCode finished")).toHaveAttribute("aria-hidden", "true");
+    const visual = within(button).getByTitle("ZCode finished");
+    expect(visual).toHaveClass("session-visual", "compact", "activity-completed");
+    expect(visual).toHaveAttribute("title", "ZCode finished");
+    expect(visual).toHaveAttribute("aria-hidden", "true");
+    expect(visual.querySelector("svg")).toBeNull();
+  });
+
+  it("在折叠 rail 为未选中会话也保留 AI 状态背景 class", () => {
+    render(
+      <div className="collapsed-session-list">
+        <CollapsedSessionButton
+          session={{
+            session_id: "00000000-0000-0000-0000-000000000402",
+            name: "waiting",
+            state: "running",
+            size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+            activity: { kind: "ai", agent: "claude_code", state: "attention", changed_at_ms: 20 },
+          }}
+          selected={false}
+          hasNewOutput={false}
+          onAttach={vi.fn()}
+        />
+      </div>,
+    );
+
+    const button = screen.getByRole("button", {
+      name: "Select waiting, Claude Code needs attention",
+    });
+    expect(button).toHaveClass("activity-attention");
+    expect(within(button).getByTitle("Claude Code needs attention"))
+      .toHaveClass("session-visual", "activity-attention");
   });
 });

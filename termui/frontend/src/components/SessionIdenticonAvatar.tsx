@@ -1,20 +1,20 @@
 import { Avatar, Style } from "@dicebear/core";
-import thumbs from "@dicebear/styles/thumbs.json";
+import identicon from "@dicebear/styles/identicon.json";
 import { useMemo } from "react";
 import type { UUID } from "../protocol/types";
 
-const thumbsStyle = new Style(thumbs);
+const identiconStyle = new Style(identicon);
 const SESSION_AVATAR_CACHE_LIMIT = 128;
 const avatarSources = new Map<UUID, string>();
 
-function sessionThumbsDataUri(sessionId: UUID): string {
+function sessionIdenticonDataUri(sessionId: UUID): string {
   const cached = avatarSources.get(sessionId);
   if (cached) {
     avatarSources.delete(sessionId);
     avatarSources.set(sessionId, cached);
     return cached;
   }
-  const source = new Avatar(thumbsStyle, {
+  const source = new Avatar(identiconStyle, {
     seed: sessionId,
     size: 64,
   }).toDataUri();
@@ -28,12 +28,12 @@ function sessionThumbsDataUri(sessionId: UUID): string {
   return source;
 }
 
-export function SessionThumbsAvatar(props: { sessionId: UUID; className?: string }) {
-  const source = useMemo(() => sessionThumbsDataUri(props.sessionId), [props.sessionId]);
+export function SessionIdenticonAvatar(props: { sessionId: UUID; className?: string }) {
+  const source = useMemo(() => sessionIdenticonDataUri(props.sessionId), [props.sessionId]);
   return (
     <img
       className={props.className}
-      data-avatar-style="thumbs"
+      data-avatar-style="identicon"
       data-session-avatar={props.sessionId}
       src={source}
       alt=""

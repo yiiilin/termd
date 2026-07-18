@@ -91,7 +91,7 @@ describe("SessionOpenProgressControl", () => {
     expect(button).toHaveAttribute("aria-expanded", "true");
     expect(button.querySelector("svg[data-open-progress-icon='opening']"))
       .toHaveClass("terminal-open-progress-icon", "lucide-loader-circle");
-    expect(button.querySelector("img[data-avatar-style='thumbs']")).toBeNull();
+    expect(button.querySelector("img[data-session-avatar]")).toBeNull();
     const openingProgress = screen.getByTestId("terminal-open-progress");
     expect(openingProgress).toHaveTextContent("Opening terminal");
     expect(openingProgress).toHaveTextContent("Connect terminal channel");
