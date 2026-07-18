@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AccessTokenManager } from "../protocol/access-token";
 import { generateDeviceIdentity } from "../protocol/auth";
+import { V070Client } from "../protocol/v070-client";
 
 describe("AccessTokenManager v0.7", () => {
   it("deduplicates challenge exchange and refreshes sixty seconds before expiry", async () => {
@@ -64,6 +65,43 @@ describe("AccessTokenManager v0.7", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(refreshed).toHaveBeenCalledWith("token-b");
+  });
+
+  it("uses the access token manager for authenticated Push HTTP requests", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ challenge: "challenge-push" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: "push.header.signature",
+        expires_at_ms: Date.now() + 300_000,
+        refresh_at_ms: Date.now() + 240_000,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(Response.json({
+        server_id: "00000000-0000-0000-0000-000000000070",
+        application_server_key: "vapid-public-key",
+        subscribed: false,
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
+    const client = new V070Client({
+      server_id: "00000000-0000-0000-0000-000000000070",
+      daemon_public_key: "ed25519-v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      url: "wss://relay.example/ws",
+      paired_at_ms: 1,
+      device_certificate: "device.certificate.signature",
+    }, device);
+
+    try {
+      const response = await client.requestPush("/api/push/config", { method: "GET" });
+
+      expect(response.ok).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock.mock.calls[2]?.[0]).toBe("https://relay.example/api/push/config");
+      const headers = new Headers(fetchMock.mock.calls[2]?.[1]?.headers);
+      expect(headers.get("authorization")).toBe("Bearer push.header.signature");
+      expect(headers.get("x-termd-server-id")).toBe("00000000-0000-0000-0000-000000000070");
+    } finally {
+      client.close();
+    }
   });
 });
 

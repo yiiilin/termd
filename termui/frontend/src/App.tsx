@@ -16,7 +16,7 @@ import {
   UsersRound,
   X,
 } from "lucide-react";
-import { V070Client, type MetadataDeliveryKind } from "./protocol/v070-client";
+import { V070Client } from "./protocol/v070-client";
 import { ProtocolClientError, toSafeError } from "./protocol/errors";
 import { migrateDeviceCertificate, pairDeviceOverHttp } from "./protocol/pairing-client";
 import { parsePairingQrPayload } from "./protocol/pairing-payload";
@@ -27,7 +27,6 @@ import type {
   EffectiveTheme,
   PairedServerState,
   SafeError,
-  SessionAiActivityPayload,
   SessionCreatedPayload,
   SessionAttachedPayload,
   SessionFileEntryPayload,
@@ -84,6 +83,7 @@ import { resolveTheme } from "./theme";
 import type { BrowserPreferences } from "./protocol/types";
 import { recordTermdDiagnostic } from "./diagnostics";
 import { displayUrlWithoutQueryOrFragment, stripSensitiveUrlParts } from "./protocol/url";
+import { removeBrowserPushForServer, syncBrowserPushPreference } from "./push-notifications";
 
 const DaemonClientsPanel = lazy(() => import("./components/DaemonClientsPanel").then((module) => ({ default: module.DaemonClientsPanel })));
 const DaemonManagerPanel = lazy(() => import("./components/DaemonManagerPanel").then((module) => ({ default: module.DaemonManagerPanel })));
@@ -150,6 +150,11 @@ type AppSurface = "admin" | "workspace";
 interface AttachUiOptions {
   closeMobilePanel?: boolean;
   preservePendingInput?: boolean;
+}
+
+interface PendingNotificationTarget {
+  serverId: UUID;
+  sessionId: UUID;
 }
 
 interface MobileTitlePullGesture {
@@ -383,6 +388,7 @@ export default function App() {
   const [daemonStatusError, setDaemonStatusError] = useState<SafeError | undefined>();
   const [metadataReady, setMetadataReady] = useState(false);
   const [metadataRetryNonce, setMetadataRetryNonce] = useState(0);
+  const [pushPermissionRevision, setPushPermissionRevision] = useState(0);
   const [selectedSessionId, setSelectedSessionId] = useState<UUID | undefined>();
   const [attachedSessionId, setAttachedSessionId] = useState<UUID | undefined>();
   const [renamingSessionId, setRenamingSessionId] = useState<UUID | undefined>();
@@ -545,6 +551,7 @@ export default function App() {
   } | null>(null);
   const urlTouchedRef = useRef(false);
   const autoCheckedServerRef = useRef<UUID | undefined>(undefined);
+  const pendingNotificationTargetRef = useRef<PendingNotificationTarget | undefined>(undefined);
   const selectedSessionIdRef = useRef<UUID | undefined>(undefined);
   const sessionOpenAttemptIdRef = useRef(0);
   const activeSurfaceRef = useRef<AppSurface>(activeSurface);
@@ -564,7 +571,7 @@ export default function App() {
   const terminalResumePendingRef = useRef(false);
   const terminalResumeTaskRef = useRef<Promise<void> | undefined>(undefined);
   const terminalResumeMountedRef = useRef(false);
-  const lastNotificationAtRef = useRef(0);
+  const pushPreferenceSyncQueueRef = useRef<Promise<void>>(Promise.resolve());
   const fileEditorResetRef = useRef<() => void>(() => {});
   const isMobileLayout = useMobileLayout();
   const mobileTerminalInputMode = useMobileTerminalInputMode(isMobileLayout);
@@ -574,10 +581,9 @@ export default function App() {
   const effectiveTheme = resolveTheme(preferences.theme, systemTheme);
   const effectiveLocale = resolveLocale(preferences.language);
   const t = useMemo(() => createTranslator(effectiveLocale), [effectiveLocale]);
-  const notificationPreferencesRef = useRef(preferences);
-  const notificationTranslatorRef = useRef(t);
-  notificationPreferencesRef.current = preferences;
-  notificationTranslatorRef.current = t;
+  const pushPreferenceServersKey = state.pairedServers
+    .map((server) => `${server.server_id}:${server.url}:${server.device_certificate ?? ""}`)
+    .join("|");
   const visibleFileTransferProgress = visibleProgressForSession(attachedSessionId);
   const clearSessionFiles = useCallback(() => {
     fileEditorResetRef.current();
@@ -614,15 +620,52 @@ export default function App() {
   }, [status]);
 
   useEffect(() => {
-    void loadBrowserState().then((loaded) => {
-      setState(loaded);
+    const notificationTarget = consumeNotificationTargetFromUrl();
+    pendingNotificationTargetRef.current = notificationTarget;
+    void loadBrowserState().then(async (loaded) => {
+      let nextState = loaded;
+      const targetServer = notificationTarget
+        ? loaded.pairedServers.find((server) => server.server_id === notificationTarget.serverId)
+        : undefined;
+      if (notificationTarget && targetServer && loaded.device) {
+        if (loaded.defaultServerId !== targetServer.server_id) {
+          nextState = await selectDefaultServer(targetServer.server_id);
+        }
+        activeServerIdRef.current = targetServer.server_id;
+      } else if (notificationTarget) {
+        pendingNotificationTargetRef.current = undefined;
+      }
+      setState(nextState);
       if (!urlTouchedRef.current) {
-        setUrl(browserReachableWsUrl(loaded.defaultUrl ?? defaultServer(loaded)?.url ?? defaultWsUrlFromPage()));
+        setUrl(browserReachableWsUrl(nextState.defaultUrl ?? defaultServer(nextState)?.url ?? defaultWsUrlFromPage()));
       }
       // 已配对的浏览器默认进入工作台；连接失败时再回落到后台管理页重新选择 daemon。
-      setActiveSurface(defaultServer(loaded) && loaded.device ? "workspace" : "admin");
+      setActiveSurface(defaultServer(nextState) && nextState.device ? "workspace" : "admin");
     });
   }, []);
+
+  useEffect(() => {
+    const device = state.device;
+    if (!device || state.pairedServers.length === 0) {
+      return;
+    }
+    const sync = () => syncBrowserPushPreference({
+      device,
+      servers: state.pairedServers,
+      preference: preferences.notifications ?? "off",
+      locale: effectiveLocale,
+    });
+    pushPreferenceSyncQueueRef.current = pushPreferenceSyncQueueRef.current
+      .catch(() => undefined)
+      .then(sync)
+      .catch(() => undefined);
+  }, [
+    effectiveLocale,
+    preferences.notifications,
+    pushPermissionRevision,
+    pushPreferenceServersKey,
+    state.device?.device_id,
+  ]);
 
   useEffect(() => {
     document.documentElement.lang = effectiveLocale;
@@ -929,14 +972,25 @@ export default function App() {
     (nextPreferences: BrowserPreferences) => {
       // 偏好是当前浏览器的纯 UI 状态；先乐观更新，保存失败再显示错误。
       setState((current) => ({ ...current, preferences: nextPreferences }));
-      if (nextPreferences.notifications !== "off" && typeof Notification !== "undefined" && Notification.permission === "default") {
-        void Notification.requestPermission().catch(() => undefined);
+      if (
+        nextPreferences.notifications !== preferences.notifications &&
+        nextPreferences.notifications !== "off" &&
+        typeof Notification !== "undefined" &&
+        Notification.permission === "default"
+      ) {
+        try {
+          void Notification.requestPermission()
+            .then(() => setPushPermissionRevision((current) => current + 1))
+            .catch(() => undefined);
+        } catch {
+          // 浏览器权限 API 失败不能影响本地设置保存。
+        }
       }
       void saveBrowserPreferences(nextPreferences)
         .then((nextState) => setState(nextState))
         .catch(setSafeError);
     },
-    [setSafeError],
+    [preferences.notifications, setSafeError],
   );
 
   const isIgnoredClosingSessionError = useCallback((sessionId: UUID, caught: unknown) => {
@@ -1412,27 +1466,35 @@ export default function App() {
   const handleForgetDaemon = useCallback(
     async (serverId: UUID) => {
       const wasActive = activeServer?.server_id === serverId;
-      if (wasActive) {
-        disconnectAttach();
-        resetWorkspaceState();
-        setMobilePanel(undefined);
-        setMobileMenuOpen(false);
-      }
-
       try {
-      const nextState = await forgetDaemon(serverId);
-      setState(nextState);
-      setRenamingDaemonId(undefined);
+        const targetServer = state.pairedServers.find((server) => server.server_id === serverId);
+        if (targetServer) {
+          const cleanup = pushPreferenceSyncQueueRef.current
+            .catch(() => undefined)
+            .then(() => removeBrowserPushForServer(targetServer, state.device));
+          pushPreferenceSyncQueueRef.current = cleanup;
+          await cleanup;
+        }
+        if (wasActive) {
+          disconnectAttach();
+          resetWorkspaceState();
+          setMobilePanel(undefined);
+          setMobileMenuOpen(false);
+        }
+
+        const nextState = await forgetDaemon(serverId);
+        setState(nextState);
+        setRenamingDaemonId(undefined);
         setDaemonRenameDraft("");
         setConnectionEditorOpen(false);
         setMobilePanel(undefined);
         setMobileMenuOpen(false);
 
-      const nextServer = defaultServer(nextState);
-      activeServerIdRef.current = nextServer?.server_id;
-      const nextUrl = nextState.defaultUrl ?? nextServer?.url ?? defaultWsUrlFromPage();
-      setUrl(browserReachableWsUrl(nextUrl));
-      setActiveSurface("admin");
+        const nextServer = defaultServer(nextState);
+        activeServerIdRef.current = nextServer?.server_id;
+        const nextUrl = nextState.defaultUrl ?? nextServer?.url ?? defaultWsUrlFromPage();
+        setUrl(browserReachableWsUrl(nextUrl));
+        setActiveSurface("admin");
 
         if (!nextState.pairedServers.length) {
           setConnectionEditorOpen(false);
@@ -1444,7 +1506,14 @@ export default function App() {
         setSafeError(caught);
       }
     },
-    [activeServer?.server_id, disconnectAttach, resetWorkspaceState, setSafeError],
+    [
+      activeServer?.server_id,
+      disconnectAttach,
+      resetWorkspaceState,
+      setSafeError,
+      state.device,
+      state.pairedServers,
+    ],
   );
 
   const handlePair = useCallback(async (rawPairingInput?: string) => {
@@ -1725,6 +1794,13 @@ export default function App() {
       );
       confirmedSessionSizesRef.current = new Map(list.sessions.map((session) => [session.session_id, session.size]));
       const visibleSessions = list.sessions.filter((session) => !closedSessionIdsRef.current.has(session.session_id));
+      const notificationTarget = pendingNotificationTargetRef.current;
+      const preferredSessionId =
+        notificationTarget &&
+        notificationTarget.serverId === requestServerId &&
+        visibleSessions.some((session) => session.session_id === notificationTarget.sessionId)
+          ? notificationTarget.sessionId
+          : undefined;
       const localKnownSessionIds = new Set([
         ...sessionsRef.current.map((session) => session.session_id),
         ...sessionOrderRef.current,
@@ -1743,6 +1819,7 @@ export default function App() {
         attachedSessionRef.current;
       const nextSelectedSessionId = resolveVisibleSelectedSessionId({
         userDetached: userDetachedRef.current,
+        preferredSessionId,
         stickySessionId,
         renamingSessionId: renamingSessionIdRef.current,
         attachedSessionId: attachedSessionRef.current,
@@ -1764,6 +1841,9 @@ export default function App() {
       );
       // 列表刷新可能晚于用户点击 session 返回；不能用“第一行”覆盖用户刚选择/正在 attach 的目标。
       selectSession(nextSelectedSessionId);
+      if (preferredSessionId && pendingNotificationTargetRef.current === notificationTarget) {
+        pendingNotificationTargetRef.current = undefined;
+      }
       // session 列表刷新可能来自后台轮询或 cursor 同步；已有 attach 时保留右侧文件树，
       // 避免用户刷新 session 列表后文件 panel 被短暂清空。
       if (!attachedSessionRef.current) {
@@ -1908,14 +1988,7 @@ export default function App() {
       }
       return new Set(current).add(sessionId);
     });
-    maybeNotifyBrowser(
-      preferences,
-      t("sessions.openNewOutput", {
-        name: sessionDisplayName(sessions.find((session) => session.session_id === sessionId) ?? { session_id: sessionId }),
-      }),
-      lastNotificationAtRef,
-    );
-  }, [preferences, sessions, t]);
+  }, []);
 
   const applyConfirmedSessionSize = useCallback((sessionId: UUID, size: TerminalSize) => {
     const confirmedResizeKey = terminalSizeKey(sessionId, size);
@@ -3090,7 +3163,6 @@ export default function App() {
       let latencyTimer: number | undefined;
       let latencyInFlight = false;
       let latencyRestartPending = false;
-      let previousMetadataSessions: SessionSummaryPayload[] | undefined;
       try {
         client = await authenticatedWorkspaceClient(APP_CONNECTION_TIMEOUT_MS);
         if (!isCurrentMetadataClient()) {
@@ -3154,12 +3226,6 @@ export default function App() {
           if (Array.isArray(metadata.sessions)) {
             const visibleSessions = (metadata.sessions as SessionSummaryPayload[])
               .filter((session) => !closedSessionIdsRef.current.has(session.session_id));
-            notifyAiActivityTransitions(
-              metadataAiActivityTransitions(deliveryKind, previousMetadataSessions, visibleSessions),
-              notificationPreferencesRef.current,
-              notificationTranslatorRef.current,
-            );
-            previousMetadataSessions = visibleSessions;
             const currentAttachedSession = visibleSessions.find(
               (session) => session.session_id === attachedSessionRef.current,
             );
@@ -4472,6 +4538,32 @@ function clampFilesPanelWidth(width: number, viewportWidth: number): number {
   return Math.max(MIN_FILES_PANEL_WIDTH, Math.min(width, viewportCap));
 }
 
+function consumeNotificationTargetFromUrl(): PendingNotificationTarget | undefined {
+  if (typeof window === "undefined") {
+    return undefined;
+  }
+  const url = new URL(window.location.href);
+  const serverId = url.searchParams.get("termd_server_id");
+  const sessionId = url.searchParams.get("termd_session_id");
+  if (serverId === null && sessionId === null) {
+    return undefined;
+  }
+  url.searchParams.delete("termd_server_id");
+  url.searchParams.delete("termd_session_id");
+  window.history.replaceState(
+    window.history.state,
+    "",
+    `${url.pathname}${url.search}${url.hash}`,
+  );
+  return isUuid(serverId) && isUuid(sessionId) ? { serverId, sessionId } : undefined;
+}
+
+function isUuid(value: string | null): value is UUID {
+  return Boolean(
+    value && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value),
+  );
+}
+
 export function defaultWsUrlFromPage(
   location: (Pick<Location, "protocol" | "host"> & Partial<Pick<Location, "pathname">>) | undefined = globalThis.location,
 ): string {
@@ -4647,88 +4739,6 @@ function daemonAddressForTitle(rawUrl: string): string {
 
 function terminalSizeDisplay(size: TerminalSize): string {
   return `${size.cols}x${size.rows}`;
-}
-
-export interface SessionAiActivityTransition {
-  session: SessionSummaryPayload;
-  activity: SessionAiActivityPayload;
-}
-
-export function aiActivityTransitions(
-  previousSessions: readonly SessionSummaryPayload[] | undefined,
-  nextSessions: readonly SessionSummaryPayload[],
-): SessionAiActivityTransition[] {
-  if (previousSessions === undefined) {
-    return [];
-  }
-  const previousById = new Map(previousSessions.map((session) => [session.session_id, session]));
-  return nextSessions.flatMap((session) => {
-    const previousActivity = previousById.get(session.session_id)?.activity;
-    const activity = session.activity;
-    if (
-      previousActivity?.state !== "running" ||
-      !activity ||
-      (activity.state !== "idle" && activity.state !== "attention" && activity.state !== "completed")
-    ) {
-      return [];
-    }
-    return [{ session, activity }];
-  });
-}
-
-export function metadataAiActivityTransitions(
-  deliveryKind: MetadataDeliveryKind,
-  previousSessions: readonly SessionSummaryPayload[] | undefined,
-  nextSessions: readonly SessionSummaryPayload[],
-): SessionAiActivityTransition[] {
-  return deliveryKind === "snapshot" ? [] : aiActivityTransitions(previousSessions, nextSessions);
-}
-
-export function notifyAiActivityTransitions(
-  transitions: readonly SessionAiActivityTransition[],
-  preferences: BrowserPreferences,
-  t: Translate,
-): void {
-  if (preferences.notifications === "off" || typeof Notification === "undefined" || Notification.permission !== "granted") {
-    return;
-  }
-  for (const { session, activity } of transitions) {
-    const agent = t(`sessions.activity.agent.${activity.agent}`);
-    const status = t(`sessions.activity.${activity.state}`, { agent });
-    try {
-      new Notification("Termd", {
-        body: t("sessions.activity.notification", { name: sessionDisplayName(session), status }),
-        tag: `termd-session-activity-${session.session_id}`,
-        silent: true,
-      });
-    } catch {
-      // 浏览器通知失败不应影响 metadata 主链路。
-    }
-  }
-}
-
-function maybeNotifyBrowser(
-  preferences: BrowserPreferences,
-  body: string,
-  lastNotificationAtRef: React.MutableRefObject<number>,
-): void {
-  if (preferences.notifications === "off" || typeof Notification === "undefined" || Notification.permission !== "granted") {
-    return;
-  }
-  const now = Date.now();
-  if (now - lastNotificationAtRef.current < 3000) {
-    return;
-  }
-  lastNotificationAtRef.current = now;
-  try {
-    new Notification("Termd", {
-      body,
-      tag: "termd-session-activity",
-      silent: true,
-    });
-  } catch {
-    // 浏览器通知失败不应影响终端主链路。
-  }
 }
 
 function formatBytesCompact(bytes: number): string {
@@ -4977,6 +4987,7 @@ function isVisibleSelectedSessionCandidate(
 
 function resolveVisibleSelectedSessionId(input: {
   userDetached: boolean;
+  preferredSessionId?: UUID;
   stickySessionId?: UUID;
   renamingSessionId?: UUID;
   attachedSessionId?: UUID;
@@ -4989,6 +5000,13 @@ function resolveVisibleSelectedSessionId(input: {
     return undefined;
   }
   const visibleSessionIds = new Set(input.visibleSessions.map((session) => session.session_id));
+  if (
+    input.preferredSessionId &&
+    visibleSessionIds.has(input.preferredSessionId) &&
+    !input.closedSessionIds.has(input.preferredSessionId)
+  ) {
+    return input.preferredSessionId;
+  }
   if (
     isVisibleSelectedSessionCandidate(
       input.stickySessionId,

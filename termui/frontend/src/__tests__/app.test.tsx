@@ -6,16 +6,13 @@ import userEvent from "@testing-library/user-event";
 import App, {
   APP_VERSION,
   APP_CONNECTION_TIMEOUT_MS,
-  aiActivityTransitions,
   browserReachableWsUrl,
   isExclusiveMetadataClient,
   DAEMON_LATENCY_POLL_INTERVAL_MS,
   defaultWsUrlFromPage,
   knownServerWsUrlCandidates,
   latencyLevelClass,
-  metadataAiActivityTransitions,
   networkRateFromSamples,
-  notifyAiActivityTransitions,
   pairingWsUrlCandidates,
 } from "../App";
 import { decodeSupervisorTerminalClientFrame } from "../protocol/supervisor-terminal";
@@ -39,7 +36,6 @@ import { MockDaemon } from "../test/mock-daemon";
 import { fallbackSessionDisplayName } from "../session-names";
 import { resetFileEditorDialogMonacoCacheForTests } from "../components/FileEditorDialog";
 import { SessionFilesPanel } from "../components/SessionFilesPanel";
-import { createTranslator } from "../i18n";
 
 const DEFAULT_SESSION_ID = "00000000-0000-0000-0000-000000000401";
 const DEFAULT_SESSION_NAME = fallbackSessionDisplayName(DEFAULT_SESSION_ID);
@@ -53,112 +49,6 @@ describe("metadata effect client ownership", () => {
     expect(isExclusiveMetadataClient(client, replacement, undefined, undefined)).toBe(false);
     expect(isExclusiveMetadataClient(client, client, client, undefined)).toBe(false);
     expect(isExclusiveMetadataClient(client, client, undefined, client)).toBe(false);
-  });
-});
-
-describe("AI activity notifications", () => {
-  const size = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
-  const activity = (state: "idle" | "running" | "attention" | "completed", changedAt: number) => ({
-    kind: "ai" as const,
-    agent: "codex" as const,
-    state,
-    changed_at_ms: changedAt,
-  });
-
-  it("hydrates the first metadata frame and only emits running to non-running transitions", () => {
-    const runningSessions = [
-      { session_id: "one", name: "One", state: "running" as const, size, activity: activity("running", 1) },
-      { session_id: "two", name: "Two", state: "running" as const, size, activity: activity("running", 1) },
-      { session_id: "three", name: "Three", state: "running" as const, size, activity: activity("running", 1) },
-      { session_id: "removed", state: "running" as const, size, activity: activity("running", 1) },
-    ];
-    const settledSessions = [
-      { ...runningSessions[0], activity: activity("completed", 2) },
-      { ...runningSessions[1], activity: activity("attention", 2) },
-      { ...runningSessions[2], activity: activity("idle", 2) },
-      { session_id: "new", state: "running" as const, size, activity: activity("completed", 2) },
-    ];
-
-    expect(metadataAiActivityTransitions("snapshot", undefined, settledSessions)).toEqual([]);
-    expect(metadataAiActivityTransitions("snapshot", runningSessions, settledSessions)).toEqual([]);
-    expect(metadataAiActivityTransitions("update", runningSessions, settledSessions).map(({ session, activity }) => [
-      session.session_id,
-      activity.state,
-    ])).toEqual([
-      ["one", "completed"],
-      ["two", "attention"],
-      ["three", "idle"],
-    ]);
-    expect(metadataAiActivityTransitions("update", settledSessions, settledSessions)).toEqual([]);
-  });
-
-  it("uses independent per-session tags without the background-output throttle", () => {
-    const originalNotification = Object.getOwnPropertyDescriptor(globalThis, "Notification");
-    const calls: Array<{ title: string; options?: NotificationOptions }> = [];
-    class TestNotification {
-      static permission = "granted";
-      constructor(title: string, options?: NotificationOptions) {
-        calls.push({ title, options });
-      }
-    }
-    Object.defineProperty(globalThis, "Notification", {
-      configurable: true,
-      value: TestNotification,
-    });
-    try {
-      const previous = [
-        { session_id: "one", name: "Build", state: "running" as const, size, activity: activity("running", 1) },
-        { session_id: "two", name: "Review", state: "running" as const, size, activity: activity("running", 1) },
-      ];
-      const next = [
-        { ...previous[0], activity: activity("completed", 2) },
-        { ...previous[1], activity: activity("attention", 2) },
-      ];
-
-      notifyAiActivityTransitions(
-        aiActivityTransitions(previous, next),
-        { language: "en-US", theme: "light", notifications: "mentions", mobileShortcuts: [] },
-        createTranslator("en-US"),
-      );
-
-      expect(calls).toEqual([
-        {
-          title: "Termd",
-          options: {
-            body: "Build: Codex finished",
-            tag: "termd-session-activity-one",
-            silent: true,
-          },
-        },
-        {
-          title: "Termd",
-          options: {
-            body: "Review: Codex needs attention",
-            tag: "termd-session-activity-two",
-            silent: true,
-          },
-        },
-      ]);
-
-      notifyAiActivityTransitions(
-        aiActivityTransitions(previous, next),
-        { language: "en-US", theme: "light", notifications: "off", mobileShortcuts: [] },
-        createTranslator("en-US"),
-      );
-      TestNotification.permission = "denied";
-      notifyAiActivityTransitions(
-        aiActivityTransitions(previous, next),
-        { language: "en-US", theme: "light", notifications: "all", mobileShortcuts: [] },
-        createTranslator("en-US"),
-      );
-      expect(calls).toHaveLength(2);
-    } finally {
-      if (originalNotification) {
-        Object.defineProperty(globalThis, "Notification", originalNotification);
-      } else {
-        Reflect.deleteProperty(globalThis, "Notification");
-      }
-    }
   });
 });
 
@@ -1918,6 +1808,62 @@ describe("termui web 工作台", () => {
     });
   });
 
+  it("AI activity 更新不再由页面直接创建系统通知", async () => {
+    const notifications = vi.fn();
+    class TestNotification {
+      static permission = "granted";
+      constructor(...args: unknown[]) {
+        notifications(...args);
+      }
+    }
+    vi.stubGlobal("Notification", TestNotification);
+    daemon.setSessions([{
+      session_id: DEFAULT_SESSION_ID,
+      name: "Build",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+      activity: { kind: "ai", agent: "codex", state: "running", changed_at_ms: 1 },
+    }]);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("Build");
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(await screen.findByLabelText("All AI activity"));
+    daemon.setSessions([{
+      session_id: DEFAULT_SESSION_ID,
+      name: "Build",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+      activity: { kind: "ai", agent: "codex", state: "completed", changed_at_ms: 2 },
+    }]);
+
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    expect(notifications).not.toHaveBeenCalled();
+  });
+
+  it("开启后台通知时会在设置点击中请求浏览器权限", async () => {
+    const requestPermission = vi.fn(async () => "denied" as NotificationPermission);
+    class TestNotification {
+      static permission = "default";
+      static requestPermission = requestPermission;
+    }
+    vi.stubGlobal("Notification", TestNotification);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(await screen.findByLabelText("Needs attention"));
+
+    expect(requestPermission).toHaveBeenCalledTimes(1);
+    await waitFor(async () => {
+      await expect(loadBrowserState()).resolves.toMatchObject({
+        preferences: { notifications: "mentions" },
+      });
+    });
+  });
+
   it("已 attach 终端切换主题会重建 xterm 并请求完整 snapshot", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -3452,6 +3398,69 @@ describe("termui web 工作台", () => {
       ).toBeGreaterThan(sessionListRequestsBeforeSwitch));
       await waitForWorkspaceSession(DEFAULT_SESSION_NAME, { timeout: 5000 });
     } finally {
+      await secondDaemon.stop();
+    }
+  });
+
+  it("通知 URL 会切换到目标 daemon 并在列表确认后 attach 指定 session", async () => {
+    const targetSessionId = "00000000-0000-4000-8000-000000000422";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: "00000000-0000-4000-8000-000000000421",
+          name: "alpha",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+        {
+          session_id: targetSessionId,
+          name: "beta",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      attachOutput: "first-daemon-ready\n",
+    });
+    const secondDaemon = await MockDaemon.start({
+      token: "second-token",
+      sessions: [{
+        session_id: "00000000-0000-4000-8000-000000000521",
+        name: "second",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      }],
+      attachOutput: "second-daemon-ready\n",
+    });
+    const user = userEvent.setup();
+    const firstRender = render(<App />);
+
+    try {
+      await pairWithInvite(user, daemon);
+      await waitForWorkspaceSession("alpha");
+      await user.click(screen.getByRole("button", { name: "Daemons" }));
+      await setConnectionUrl(user, secondDaemon.url);
+      fireEvent.change(screen.getByLabelText("Pairing token"), {
+        target: { value: pairingInviteCode(secondDaemon, "second-token") },
+      });
+      await user.click(screen.getByRole("button", { name: "Pair" }));
+      await waitForWorkspaceSession("second");
+
+      firstRender.unmount();
+      const firstAttachCount = daemon.attachedSessions.length;
+      const secondAttachCount = secondDaemon.attachedSessions.length;
+      window.history.replaceState(null, "", `/?termd_server_id=${daemon.serverId}&termd_session_id=${targetSessionId}`);
+
+      render(<App />);
+
+      await waitForWorkspaceSession("beta", { timeout: 5000 });
+      await waitFor(() => expect(daemon.attachedSessions.slice(firstAttachCount)).toContain(targetSessionId));
+      expect(secondDaemon.attachedSessions).toHaveLength(secondAttachCount);
+      expect(window.location.search).toBe("");
+      await expect(loadBrowserState()).resolves.toMatchObject({ defaultServerId: daemon.serverId });
+    } finally {
+      window.history.replaceState(null, "", "/");
       await secondDaemon.stop();
     }
   });

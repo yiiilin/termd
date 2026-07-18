@@ -3,21 +3,18 @@ export function registerTermdServiceWorker(): void {
     return;
   }
 
-  // 旧版本曾注册 PWA shell cache；新版前端启动时主动清理，避免用户浏览器继续运行
-  // 与当前 daemon/relay 协议不匹配的旧 bundle。IndexedDB 配对状态不在 Cache API 里。
-  void cleanupTermdServiceWorkers();
+  // 清理历史全局 PWA worker，但保留每个 daemon 独立的 Web Push scope。
+  void cleanupLegacyTermdServiceWorkers().catch(() => undefined);
 }
 
-async function cleanupTermdServiceWorkers(): Promise<void> {
+async function cleanupLegacyTermdServiceWorkers(): Promise<void> {
   const serviceWorker = navigator.serviceWorker;
-
-  // 中文注释：register() 本身会安装/更新这份清理型 SW；这里随后就要注销历史注册，
-  // 不能再强制 update()，否则 Chromium 可能在 update/unregister 竞态中抛 pageerror。
-  const registration = await serviceWorker.register("./service-worker.js").catch(() => undefined);
-
-  const registrations = await serviceWorker.getRegistrations?.().catch(() => undefined);
-  const candidates = registrations ?? (registration ? [registration] : []);
-  await Promise.all(candidates.map((candidate) => candidate.unregister().catch(() => false)));
+  const registrations = await serviceWorker.getRegistrations?.().catch(() => []);
+  await Promise.all(
+    (registrations ?? [])
+      .filter((registration) => !isPushWorkerScope(registration.scope))
+      .map((registration) => registration.unregister().catch(() => false)),
+  );
 
   if ("caches" in globalThis) {
     const keys = await caches.keys().catch(() => []);
@@ -26,5 +23,13 @@ async function cleanupTermdServiceWorkers(): Promise<void> {
         .filter((key) => key.startsWith("termd-"))
         .map((key) => caches.delete(key).catch(() => false)),
     );
+  }
+}
+
+function isPushWorkerScope(scope: string): boolean {
+  try {
+    return new URL(scope).pathname.includes("/.termd-push/");
+  } catch {
+    return false;
   }
 }

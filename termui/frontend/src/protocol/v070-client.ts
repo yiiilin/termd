@@ -35,6 +35,8 @@ interface TransportLike {
 
 type JsonRequest = (path: string, payload: unknown) => Promise<any>;
 type HttpRequest = (path: string, init?: RequestInit) => Promise<Response>;
+export type PushApiPath = "/api/push/config" | "/api/push/subscription";
+
 interface PendingTerminalOpen {
   sessionId?: UUID;
   promise: Promise<any>;
@@ -285,6 +287,10 @@ export class V070Client {
 
   async forgetDaemonClient(deviceId: UUID): Promise<any> {
     return this.jsonRequest("/api/control/daemon/client_forget", { device_id: deviceId });
+  }
+
+  async requestPush(path: PushApiPath, init: RequestInit = {}): Promise<Response> {
+    return this.httpRequest(path, init);
   }
 
   async listSessionFiles(sessionId: UUID, path?: string): Promise<any> {

@@ -8,15 +8,17 @@ describe("PWA 外壳", () => {
     vi.unstubAllGlobals();
   });
 
-  it("注册清理型 service worker 并注销旧 PWA 缓存", async () => {
-    const update = vi.fn(() => Promise.resolve());
-    const unregister = vi.fn(() => Promise.resolve(true));
-    const register = vi.fn(() => Promise.resolve({ update, unregister }));
-    const getRegistrations = vi.fn(() => Promise.resolve([{ unregister }]));
+  it("清理旧 service worker 和 PWA 缓存但保留 scoped Push worker", async () => {
+    const unregisterLegacy = vi.fn(() => Promise.resolve(true));
+    const unregisterPush = vi.fn(() => Promise.resolve(true));
+    const getRegistrations = vi.fn(() => Promise.resolve([
+      { scope: "https://termd.test/", unregister: unregisterLegacy },
+      { scope: "https://termd.test/.termd-push/server-1/", unregister: unregisterPush },
+    ]));
     const keys = vi.fn(() => Promise.resolve(["termd-web-shell-v1", "other-cache"]));
     const deleteCache = vi.fn(() => Promise.resolve(true));
     vi.stubGlobal("navigator", {
-      serviceWorker: { register, getRegistrations },
+      serviceWorker: { getRegistrations },
     });
     vi.stubGlobal("caches", {
       keys,
@@ -24,31 +26,22 @@ describe("PWA 外壳", () => {
     });
 
     registerTermdServiceWorker();
-    await vi.waitFor(() => expect(unregister).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(unregisterLegacy).toHaveBeenCalledTimes(1));
 
-    expect(register).toHaveBeenCalledWith("./service-worker.js");
-    expect(update).not.toHaveBeenCalled();
+    expect(unregisterPush).not.toHaveBeenCalled();
     expect(getRegistrations).toHaveBeenCalledTimes(1);
     expect(deleteCache).toHaveBeenCalledWith("termd-web-shell-v1");
     expect(deleteCache).not.toHaveBeenCalledWith("other-cache");
   });
 
-  it("清理型 service worker 不强制 update，避免注销竞态污染页面错误", async () => {
-    // 中文注释：Chromium 可能在清理型 SW 立即 unregister 的竞态中让 update() reject。
-    // register() 已足够触发清理脚本，后续注销流程不应再主动 update。
-    const update = vi.fn(() => Promise.reject(new Error("invalid state")));
-    const unregister = vi.fn(() => Promise.resolve(true));
-    const register = vi.fn(() => Promise.resolve({ update, unregister }));
-    const getRegistrations = vi.fn(() => Promise.resolve([{ unregister }]));
+  it("service worker 查询失败不会影响应用启动", async () => {
+    const getRegistrations = vi.fn(() => Promise.reject(new Error("unavailable")));
     vi.stubGlobal("navigator", {
-      serviceWorker: { register, getRegistrations },
+      serviceWorker: { getRegistrations },
     });
 
     registerTermdServiceWorker();
-    await vi.waitFor(() => expect(unregister).toHaveBeenCalledTimes(1));
-
-    expect(update).not.toHaveBeenCalled();
-    expect(getRegistrations).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(getRegistrations).toHaveBeenCalledTimes(1));
   });
 
   it("manifest 声明可安装的 termd Web 应用", async () => {
@@ -70,13 +63,15 @@ describe("PWA 外壳", () => {
     expect(manifest.icons?.some((icon) => icon.src === "./icons/termd.svg" && icon.purpose?.includes("maskable"))).toBe(true);
   });
 
-  it("service worker 只负责清理历史缓存，不再拦截前端资源", async () => {
+  it("service worker 只处理 Push，不缓存或拦截前端资源", async () => {
     const source = await readFile(resolve(process.cwd(), "public/service-worker.js"), "utf8");
 
-    expect(source).toContain('const CACHE_PREFIX = "termd-"');
-    expect(source).toContain("self.registration.unregister()");
-    expect(source).not.toContain("clients.claim()");
+    expect(source).toContain('self.addEventListener("push"');
+    expect(source).toContain('self.addEventListener("notificationclick"');
+    expect(source).toContain("self.registration.showNotification");
+    expect(source).not.toContain('self.addEventListener("fetch"');
+    expect(source).not.toContain("self.registration.unregister()");
+    expect(source).not.toContain("caches.");
     expect(source).not.toContain("event.respondWith(");
-    expect(source).not.toContain("event.respondWith(cacheFirst(request))");
   });
 });
