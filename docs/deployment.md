@@ -239,7 +239,7 @@ daemon registry JSON 示例：
 
 ## installer 与 service 行为
 
-release 资产和 GHCR 镜像由同一个 tag 驱动。项目上传的 GitHub Release assets 恰好是 `termd`、`termrelay`、`termctl` 的 Linux amd64 与 arm64 六个裸二进制；项目不上传自有的 `tar.gz`、checksum 文件或 `install-*.sh`。GitHub 自动生成的 Source code（zip/tar.gz）归档不属于项目上传的 assets，也无法由 release workflow 禁用。首次安装按 [README 安装流程](../README.md#安装)选择架构并运行二进制自带的 installer；仓库中的模板脚本只保留给源码开发和旧自动化兼容，不是 Release 安装入口。
+tag workflow 只发布 GitHub Release assets，不构建或推送 GHCR 等容器镜像。项目上传的 assets 恰好是 `termd`、`termrelay`、`termctl` 的 Linux amd64 与 arm64 六个裸二进制；项目不上传自有的 `tar.gz`、checksum 文件或 `install-*.sh`。GitHub 自动生成的 Source code（zip/tar.gz）归档不属于项目上传的 assets，也无法由 release workflow 禁用。首次安装按 [README 安装流程](../README.md#安装)选择架构并运行二进制自带的 installer；仓库中的模板脚本只保留给源码开发和旧自动化兼容，不是 Release 安装入口。
 
 - `termd` installer 创建 `termd.service` 和 `/etc/termd/termd.env`。`KillMode=process` 使普通 daemon restart 不会把独立 supervisor 一起终止。
 - `termrelay` installer 创建 `termrelay.service`、setup token 和 daemon registry；relay 本身不承担 supervisor 生命周期。
@@ -257,7 +257,7 @@ sudo sqlite3 -readonly /var/lib/termd/daemon-state.sqlite \
 
 查询无结果才允许停止当前 daemon 并回滚。数据库没有 `session_ownership` 表也满足 precheck；查询返回任何行时应保持当前 daemon 运行并等待收敛，不能删除 ledger 行、socket 或 supervisor 进程来绕过检查。
 
-## GitHub Release 与 GHCR
+## GitHub Release
 
 - tag 采用纯版本号，例如 `0.1.2`。
 - 本机从源码更新正在运行的 daemon 时，优先使用 `scripts/update-local-termd.sh`：
@@ -294,17 +294,17 @@ sudo sqlite3 -readonly /var/lib/termd/daemon-state.sqlite \
   staged diff。使用 `--allow-dirty` 时，应先处理脚本原样保留的其他 caller 改动，再执行
   输出中的同一流程。
 - tag 推送后，GitHub Actions 会：
-  - 运行 workspace 测试，确认 release tag 与 `Cargo.toml` 版本一致。
+  - 校验 release tag 与 workspace、frontend 版本一致，并检查发布说明包含用户可见变化。
   - 使用 `x86_64-unknown-linux-musl` 和 `aarch64-unknown-linux-musl` 分别构建 amd64、arm64 静态二进制；构建前生成 `termui/frontend` 静态资源，确保 `termd` 和 `termrelay` 的内嵌 Web 可用。
-  - 上传并严格检查恰好六个稳定名称的裸二进制，拒绝项目 workflow 生成额外的压缩包、checksum 文件或 installer 脚本资产。
-  - 推送 `ghcr.io/<owner>/termd:<tag>`、`ghcr.io/<owner>/termrelay:<tag>`、`ghcr.io/<owner>/termctl:<tag>` 镜像。
-  - 这些镜像使用 `scratch` 运行层；`termd` 和 `termrelay` 同样会内嵌 Web 静态资源。
+  - 上传并严格检查恰好六个稳定名称的裸二进制，发布 GitHub Release，并拒绝项目 workflow 生成额外的压缩包、checksum 文件或 installer 脚本资产。
+  - 不构建或推送任何容器镜像。
 
 ## `termrelay` docker-compose
 
-`termrelay` 还提供一个容器化部署方式，文件在 [deploy/termrelay/docker-compose.yml](../deploy/termrelay/docker-compose.yml)。使用步骤：
+`termrelay` 还提供一个容器化部署方式，文件在 [deploy/termrelay/docker-compose.yml](../deploy/termrelay/docker-compose.yml)。release workflow 不提供容器镜像，使用前需自行构建或提供镜像并设置 `TERMRELAY_IMAGE`。以下命令从仓库根目录执行：
 
 ```bash
+docker build -f docker/termrelay.Dockerfile -t termrelay:local .
 cd deploy/termrelay
 cp .env.example .env
 ```
@@ -321,7 +321,7 @@ sudo chmod 400 /etc/termd/termrelay_setup_token
 docker compose up -d
 ```
 
-compose 会把 setup token 文件作为 Docker secret 挂载到 `/run/secrets/termrelay_setup_token`；release 镜像以 UID/GID `10001` 运行，因此 host 上的 secret 文件需要对 `10001:10001` 可读，同时不能 world-readable。token 文件末尾换行会被忽略，空文件或全空白内容会导致启动失败。不要把真实 token 写进 `.env` 或 compose command，这样 `docker compose config` 和 Docker inspect metadata 只会包含 secret 文件路径，不会展开 token 明文。secret 文件不要放在仓库目录内，也不要提交到 git。
+compose 会把 setup token 文件作为 Docker secret 挂载到 `/run/secrets/termrelay_setup_token`；仓库 `docker/termrelay.Dockerfile` 构建的镜像以 UID/GID `10001` 运行，因此 host 上的 secret 文件需要对 `10001:10001` 可读，同时不能 world-readable。token 文件末尾换行会被忽略，空文件或全空白内容会导致启动失败。不要把真实 token 写进 `.env` 或 compose command，这样 `docker compose config` 和 Docker inspect metadata 只会包含 secret 文件路径，不会展开 token 明文。secret 文件不要放在仓库目录内，也不要提交到 git。
 
 当前协议不使用 `--http-tunnel` 开关；compose 必须代理 `/ws`、`/ws/metadata`、`/ws/terminal`、`/api/auth/*`、`/api/control/*` 和 `/api/files/*`。如果改用自定义 Caddyfile 或额外启用 access log，必须避免 setup token、daemon token、pair ticket、device certificate 和 access token 进入 stdout、文件日志或集中日志系统。
 
@@ -338,4 +338,4 @@ cargo run -p termrelay -- \
   --daemon-registry "$tmp_dir/daemon-registry.json"
 ```
 
-使用 release 容器做本机检查时也只能绑定 loopback，并且镜像 tag 必须显式选择当前 release；不要从本文复制一个历史固定 tag 用于公网部署。测试结束后删除临时目录。
+使用自行构建的容器镜像做本机检查时也只能绑定 loopback，并且镜像 tag 应显式对应当前源码版本；不要从本文复制一个历史固定 tag 用于公网部署。测试结束后删除临时目录。
