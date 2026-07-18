@@ -3886,6 +3886,136 @@ describe("TerminalPane terminal sequence rendering", () => {
   });
 });
 
+describe("TerminalPane mobile terminal quick keys", () => {
+  function renderQuickKeysTerminal(onInput = vi.fn()) {
+    render(
+      <TerminalPane
+        attached
+        sessionSize={{ rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }}
+        mobileInputMode
+        mobileKeyboardOpen
+        outputResetVersion={0}
+        takeOutput={() => []}
+        registerOutputDrain={() => () => undefined}
+        onInput={onInput}
+        onResize={vi.fn()}
+        onCursorChange={vi.fn()}
+      />,
+    );
+    return onInput;
+  }
+
+  it("通过 xterm input/onData 发送快捷键，保持焦点且不重复 click", async () => {
+    const onInput = renderQuickKeysTerminal();
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('.terminal-host textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.focus();
+
+    const escape = screen.getByRole("button", { name: "Escape" });
+    fireTouchPointer(escape, "pointerdown", { pointerId: 71, clientX: 20, clientY: 20 });
+    fireTouchPointer(escape, "pointerup", { pointerId: 71, clientX: 20, clientY: 20 });
+    fireEvent.click(escape);
+
+    expect(onInput).toHaveBeenCalledTimes(1);
+    expect(onInput).toHaveBeenCalledWith("\x1b");
+    expect(document.activeElement).toBe(terminalInput);
+    expect(
+      (globalThis as {
+        __TERMD_TEST_TERMINAL_STATS__?: { operations: Array<{ op: string; text?: string }> };
+      }).__TERMD_TEST_TERMINAL_STATS__?.operations,
+    ).toContainEqual({ op: "input", text: "\x1b" });
+  });
+
+  it("每次方向键都读取当前 DECCKM 模式", () => {
+    const onInput = renderQuickKeysTerminal();
+    const up = screen.getByRole("button", { name: "Arrow up" });
+
+    fireTouchPointer(up, "pointerdown", { pointerId: 72, clientX: 20, clientY: 20 });
+    fireTouchPointer(up, "pointerup", { pointerId: 72, clientX: 20, clientY: 20 });
+    (globalThis as {
+      __TERMD_TEST_TERMINAL__?: { setApplicationCursorKeysMode?: (enabled: boolean) => void };
+    }).__TERMD_TEST_TERMINAL__?.setApplicationCursorKeysMode?.(true);
+    fireTouchPointer(up, "pointerdown", { pointerId: 73, clientX: 20, clientY: 20 });
+    fireTouchPointer(up, "pointerup", { pointerId: 73, clientX: 20, clientY: 20 });
+
+    expect(onInput.mock.calls.map(([data]) => data)).toEqual(["\x1b[A", "\x1bOA"]);
+  });
+
+  it("粘滞修饰键不打断中文 composition，并在目标键后释放", async () => {
+    const onInput = renderQuickKeysTerminal();
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('.terminal-host textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.focus();
+    terminalInput!.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+
+    fireTouchPointer(screen.getByRole("button", { name: "Shift" }), "pointerdown", { pointerId: 74, clientX: 20, clientY: 20 });
+    fireTouchPointer(screen.getByRole("button", { name: "Shift" }), "pointerup", { pointerId: 74, clientX: 20, clientY: 20 });
+    fireTouchPointer(screen.getByRole("button", { name: "Tab" }), "pointerdown", { pointerId: 75, clientX: 20, clientY: 20 });
+    fireTouchPointer(screen.getByRole("button", { name: "Tab" }), "pointerup", { pointerId: 75, clientX: 20, clientY: 20 });
+
+    expect(onInput).toHaveBeenCalledWith("\x1b[Z");
+    expect(screen.getByRole("button", { name: "Shift" })).toHaveAttribute("aria-pressed", "false");
+    expect(document.activeElement).toBe(terminalInput);
+
+    terminalInput!.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "你" }));
+    terminalInput!.value = "你";
+    fireEvent.input(terminalInput!);
+    await waitFor(() => expect(onInput).toHaveBeenCalledWith("你"));
+  });
+
+  it("粘滞 Ctrl 会作用于系统键盘的下一次输入并自动释放", async () => {
+    const onInput = renderQuickKeysTerminal();
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('.terminal-host textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    terminalInput!.focus();
+
+    fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
+    terminalInput!.value = "c";
+    fireEvent.input(terminalInput!);
+
+    expect(onInput).toHaveBeenLastCalledWith("\x03");
+    expect(screen.getByRole("button", { name: "Ctrl" })).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
+    terminalInput!.dispatchEvent(new InputEvent("beforeinput", {
+      bubbles: true,
+      cancelable: true,
+      inputType: "insertText",
+      data: "d",
+    }));
+
+    expect(onInput).toHaveBeenLastCalledWith("\x04");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Ctrl" })).toHaveAttribute("aria-pressed", "false");
+    });
+  });
+
+  it("detach 时清除展开高度，重新 attach 后恢复紧凑栏", async () => {
+    const terminalProps = {
+      sessionSize: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      mobileInputMode: true,
+      mobileKeyboardOpen: true,
+      outputResetVersion: 0,
+      takeOutput: () => [],
+      registerOutputDrain: () => () => undefined,
+      onInput: vi.fn(),
+      onResize: vi.fn(),
+      onCursorChange: vi.fn(),
+    };
+    const view = render(<TerminalPane {...terminalProps} attached />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand terminal keys" }));
+    expect(screen.getByTestId("terminal-pane")).toHaveClass("mobile-quick-keys-expanded");
+
+    view.rerender(<TerminalPane {...terminalProps} attached={false} />);
+    await waitFor(() => expect(screen.getByTestId("terminal-pane")).not.toHaveClass("mobile-quick-keys-expanded"));
+
+    view.rerender(<TerminalPane {...terminalProps} attached />);
+    expect(screen.getByRole("button", { name: "Expand terminal keys" })).toBeVisible();
+    expect(screen.getByTestId("terminal-pane")).not.toHaveClass("mobile-quick-keys-expanded");
+  });
+});
+
 describe("TerminalPane mobile direction gesture", () => {
   it("静止长按不抢系统长按菜单，contextmenu 也不会被阻止", () => {
     vi.useFakeTimers();

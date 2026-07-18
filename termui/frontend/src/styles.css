@@ -1875,10 +1875,216 @@ label {
   -webkit-text-fill-color: transparent;
 }
 
-.terminal-mobile-shortcuts,
 .terminal-mobile-selection-toolbar,
 .terminal-direction-pad {
   display: none;
+}
+
+.terminal-pane.mobile-quick-keys-expanded {
+  --terminal-mobile-shortcuts-height: 120px;
+}
+
+.app-shell.mobile-terminal-input.mobile-keyboard-open {
+  position: fixed;
+  left: var(--termd-visual-viewport-offset-left, 0px);
+  top: var(--termd-visual-viewport-offset-top, 0px);
+  width: var(--termd-layout-viewport-width, var(--termd-visual-viewport-width, 100dvw));
+  max-width: none;
+  height: var(--termd-layout-viewport-height, var(--termd-visual-viewport-height, 100dvh));
+  overflow: hidden;
+}
+
+.app-shell.mobile-keyboard-open .terminal-scrollport {
+  /* 中文注释：快捷键栏是 overlay，键盘打开时终端可视底边要停在快捷键栏上方。 */
+  margin-bottom: var(--terminal-mobile-shortcuts-height);
+}
+
+.terminal-mobile-shortcuts {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 9;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  height: var(--terminal-mobile-shortcuts-height);
+  border-top: 1px solid var(--color-border-subtle);
+  background: var(--color-surface-alt);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 -10px 24px var(--color-popover-shadow);
+  user-select: none;
+}
+
+.terminal-quick-keys-main,
+.terminal-quick-keys-panel-strip {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x;
+}
+
+.terminal-quick-keys-main {
+  flex: 0 0 41px;
+  display: grid;
+  grid-template-columns: repeat(10, minmax(0, 1fr));
+  gap: 3px;
+  padding: 5px 7px 6px;
+  overflow: hidden;
+  touch-action: manipulation;
+}
+
+.terminal-quick-keys-panel {
+  flex: 1 1 78px;
+  min-height: 0;
+  border-bottom: 1px solid var(--color-border-subtle);
+  display: grid;
+  grid-template-rows: 30px minmax(0, 1fr);
+  background: var(--color-surface);
+}
+
+.terminal-quick-keys-tabs {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.terminal-quick-keys-tab {
+  min-width: 0;
+  min-height: 29px;
+  padding: 0 6px;
+  border: 0;
+  border-right: 1px solid var(--color-border-subtle);
+  border-radius: 0;
+  background: transparent;
+  color: var(--color-text-subtle);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  touch-action: pan-x;
+}
+
+.terminal-quick-keys-tab:last-child {
+  border-right: 0;
+}
+
+.terminal-quick-keys-tab[aria-selected="true"] {
+  background: var(--color-surface-selected);
+  color: var(--color-accent-soft);
+  box-shadow: inset 0 -2px 0 var(--color-accent);
+}
+
+.terminal-quick-keys-panel-strip {
+  padding: 5px 7px;
+}
+
+.terminal-quick-keys-main::-webkit-scrollbar,
+.terminal-quick-keys-panel-strip::-webkit-scrollbar {
+  display: none;
+}
+
+.terminal-mobile-shortcut-button {
+  flex: 0 0 46px;
+  width: 46px;
+  min-width: 46px;
+  min-height: 30px;
+  height: 30px;
+  padding: 0 5px;
+  border-color: var(--color-border-mobile);
+  border-radius: 5px;
+  background: var(--color-surface-raised);
+  color: var(--color-terminal-fg);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  touch-action: pan-x;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.terminal-mobile-shortcut-button.icon {
+  flex-basis: 38px;
+  width: 38px;
+  min-width: 38px;
+  padding: 0;
+}
+
+.terminal-quick-keys-main .terminal-mobile-shortcut-button {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+  padding: 0 1px;
+  font-size: 9px;
+  touch-action: manipulation;
+}
+
+.terminal-quick-keys-main .terminal-mobile-shortcut-button.icon {
+  width: 100%;
+  min-width: 0;
+}
+
+.terminal-quick-keys-main .terminal-mobile-shortcut-button.modifier-shift {
+  padding-inline: 0;
+  font-size: 8px;
+}
+
+@media (min-width: 600px) {
+  .terminal-quick-keys-main {
+    grid-template-columns: repeat(10, 46px);
+    justify-content: start;
+  }
+}
+
+.terminal-mobile-shortcut-button.custom {
+  flex-basis: auto;
+  width: auto;
+  min-width: 58px;
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-mobile-shortcut-button.active,
+.terminal-mobile-shortcut-button[aria-pressed="true"] {
+  border-color: var(--color-info);
+  background: color-mix(in srgb, var(--color-info) 18%, var(--color-surface-raised));
+  color: var(--color-info-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-info) 34%, transparent);
+}
+
+.terminal-mobile-shortcut-button:active {
+  border-color: var(--color-accent);
+  background: var(--color-surface-selected);
+  color: var(--color-accent-soft);
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .terminal-pane.mobile-quick-keys-expanded {
+    --terminal-mobile-shortcuts-height: 106px;
+  }
+
+  .terminal-quick-keys-panel {
+    grid-template-rows: 27px minmax(0, 1fr);
+  }
+
+  .terminal-quick-keys-tab {
+    min-height: 26px;
+  }
 }
 
 .terminal-open-progress-control {
@@ -3351,11 +3557,6 @@ label {
     display: none;
   }
 
-  .app-shell.mobile-keyboard-open .terminal-scrollport {
-    /* 中文注释：快捷键栏是 overlay，键盘打开时终端可视底边要停在快捷键栏上方。 */
-    margin-bottom: var(--terminal-mobile-shortcuts-height);
-  }
-
   .workspace-body {
     width: 100%;
     max-width: 100%;
@@ -3565,7 +3766,7 @@ label {
   }
 
   .terminal-mobile-selection-toolbar.keyboard-open {
-    bottom: 48px;
+    bottom: calc(var(--terminal-mobile-shortcuts-height) + 6px);
   }
 
   .terminal-mobile-selection-copy-button {
@@ -3589,64 +3790,6 @@ label {
   }
 
   .terminal-mobile-selection-copy-button:active {
-    border-color: var(--color-accent);
-    background: var(--color-surface-selected);
-    color: var(--color-accent-soft);
-  }
-
-  .terminal-mobile-shortcuts {
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 9;
-    width: 100%;
-    max-width: 100%;
-    min-width: 0;
-    border-top: 1px solid var(--color-border-subtle);
-    background: var(--color-surface-alt);
-    display: flex;
-    gap: 6px;
-    overflow-x: auto;
-    overflow-y: hidden;
-    overscroll-behavior-x: contain;
-    padding: 5px 8px 6px;
-    scrollbar-width: none;
-    -webkit-overflow-scrolling: touch;
-    box-shadow: 0 -10px 24px var(--color-popover-shadow);
-  }
-
-  .terminal-mobile-shortcuts::-webkit-scrollbar {
-    display: none;
-  }
-
-  .terminal-mobile-shortcut-button {
-    flex: 0 0 64px;
-    min-width: 64px;
-    min-height: 30px;
-    padding: 0 8px;
-    border-color: var(--color-border-mobile);
-    border-radius: 6px;
-    background: var(--color-surface-raised);
-    color: var(--color-terminal-fg);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 3px;
-    touch-action: manipulation;
-    user-select: none;
-  }
-
-  .terminal-mobile-paste-button {
-    flex-basis: 82px;
-    min-width: 82px;
-    font-family: var(--font-ui);
-    font-weight: 700;
-  }
-
-  .terminal-mobile-shortcut-button:active {
     border-color: var(--color-accent);
     background: var(--color-surface-selected);
     color: var(--color-accent-soft);

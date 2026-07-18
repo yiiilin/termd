@@ -18,6 +18,9 @@ export interface TerminalRendererBufferState {
 export interface TerminalRendererTerminal {
   cols: number;
   rows: number;
+  modes: {
+    applicationCursorKeysMode: boolean;
+  };
   element?: HTMLElement;
   textarea?: HTMLTextAreaElement;
   buffer?: {
@@ -30,6 +33,7 @@ export interface TerminalRendererTerminal {
   reset(): void;
   refresh(start: number, end: number): void;
   focus(): void;
+  input(data: string, wasUserInput?: boolean): void;
   scrollToLine(line: number): void;
   onData(listener: (data: string) => void): TerminalRendererDisposable;
   onCursorMove(listener: () => void): TerminalRendererDisposable;

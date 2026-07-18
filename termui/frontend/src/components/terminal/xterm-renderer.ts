@@ -325,6 +325,9 @@ function adaptXtermTerminal(
     get rows() {
       return terminal.rows;
     },
+    get modes() {
+      return terminal.modes;
+    },
     get element() {
       return hostElement ?? terminal.element;
     },
@@ -367,6 +370,7 @@ function adaptXtermTerminal(
     },
     refresh: (start, end) => terminal.refresh(start, end),
     focus: () => terminal.focus(),
+    input: (data, wasUserInput) => terminal.input(data, wasUserInput),
     scrollToLine: (line) => {
       terminal.scrollToLine(clampLine(Math.floor(line), 0, Math.max(0, terminal.buffer.active.length - 1)));
       (terminal as XtermDebugTerminal).__termdDebugBufferSync?.();

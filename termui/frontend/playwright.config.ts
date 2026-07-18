@@ -19,6 +19,11 @@ export default defineConfig({
       name: "mobile-chrome",
       use: { ...devices["Pixel 5"] },
     },
+    {
+      name: "mobile-iphone-layout",
+      testMatch: /mobile-terminal-quick-keys\.spec\.ts/,
+      use: { ...devices["iPhone 13"], browserName: "chromium" },
+    },
   ],
   webServer: {
     // 中文注释：真实 relay fixture 会在测试内执行 cargo run。先在 WebServer 启动阶段

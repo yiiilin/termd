@@ -67,6 +67,7 @@ type MockTerminalControl = {
   scrollToLine: (line: number) => void;
   forceCursorPosition: (cursorY: number) => void;
   forceSelectionPosition: (position: TerminalSelectionPosition | undefined) => void;
+  setApplicationCursorKeysMode: (enabled: boolean) => void;
 };
 
 function terminalStats(): TerminalStats {
@@ -185,6 +186,9 @@ vi.mock("@xterm/xterm", () => {
     private xtermWrapper?: HTMLDivElement;
     public cols = 80;
     public rows = 24;
+    public modes = {
+      applicationCursorKeysMode: false,
+    };
     public element: HTMLDivElement | undefined;
     public textarea: HTMLTextAreaElement | undefined;
     public buffer = {
@@ -303,6 +307,9 @@ vi.mock("@xterm/xterm", () => {
                 end: { x: position.end.x + 1, y: position.end.y + 1 },
               }
             : undefined;
+        },
+        setApplicationCursorKeysMode: (enabled) => {
+          this.modes.applicationCursorKeysMode = enabled;
         },
       };
     }
@@ -544,6 +551,11 @@ vi.mock("@xterm/xterm", () => {
         return;
       }
       this.textarea?.focus();
+    }
+
+    input(data: string, _wasUserInput?: boolean) {
+      terminalStats().operations.push({ op: "input", text: data });
+      this.dataListeners.forEach((listener) => listener(data));
     }
 
     refresh() {

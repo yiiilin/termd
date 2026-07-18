@@ -80,6 +80,26 @@ describe("xterm renderer adapter", () => {
     expect(host.dataset.termdRows).toBe("35");
   });
 
+  it("通过 xterm input 注入用户输入，并公开实时 application cursor mode", async () => {
+    vi.resetModules();
+    const { createXtermRenderer } = await import("../components/terminal/xterm-renderer");
+
+    const renderer = createXtermRenderer({ terminalOptions: {} });
+    const host = document.createElement("div");
+    renderer.terminal.open(host);
+    const onData = vi.fn();
+    renderer.terminal.onData(onData);
+
+    renderer.terminal.input("\x1b[A", true);
+    expect(onData).toHaveBeenCalledWith("\x1b[A");
+    expect(renderer.terminal.modes.applicationCursorKeysMode).toBe(false);
+
+    (globalThis as {
+      __TERMD_TEST_TERMINAL__?: { setApplicationCursorKeysMode?: (enabled: boolean) => void };
+    }).__TERMD_TEST_TERMINAL__?.setApplicationCursorKeysMode?.(true);
+    expect(renderer.terminal.modes.applicationCursorKeysMode).toBe(true);
+  });
+
   it("运行期主题更新不会把 rows/cols 重新写入 xterm options", async () => {
     vi.resetModules();
     const { createXtermRenderer } = await import("../components/terminal/xterm-renderer");

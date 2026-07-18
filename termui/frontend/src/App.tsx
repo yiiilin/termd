@@ -3696,6 +3696,7 @@ export default function App() {
         sidebarCollapsed ? "sidebar-is-collapsed" : "",
         connectionReady ? "connection-ready" : "",
         isFilesPanelResizing ? "files-panel-resizing" : "",
+        mobileTerminalInputMode ? "mobile-terminal-input" : "",
         mobileKeyboardOpen ? "mobile-keyboard-open" : "",
         mobileMenuOpen ? "mobile-menu-open" : "",
         mobilePanel ? `mobile-panel-${mobilePanel}` : "",

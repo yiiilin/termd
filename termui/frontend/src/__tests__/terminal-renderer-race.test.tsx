@@ -21,6 +21,7 @@ function fakeRenderer(label: string): TerminalRendererInstance {
   const terminal = {
     cols: 80,
     rows: 24,
+    modes: { applicationCursorKeysMode: false },
     options: {},
     buffer: {
       active: {
@@ -41,6 +42,7 @@ function fakeRenderer(label: string): TerminalRendererInstance {
     reset() {},
     refresh() {},
     focus() {},
+    input() {},
     scrollToLine() {},
     onData: fakeDisposable,
     onCursorMove: fakeDisposable,

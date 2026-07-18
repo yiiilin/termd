@@ -9,14 +9,22 @@ describe("mobile layout regressions", () => {
     expect(css).toContain(".toolbar-actions {\n    display: none;");
     expect(css).toContain(".terminal-scrollport {\n    overflow: hidden;");
     expect(css).toContain("top: var(--termd-visual-viewport-offset-top, 0px);");
+    expect(css).toContain(".app-shell.mobile-terminal-input.mobile-keyboard-open {");
     expect(css).toContain(".app-shell.mobile-keyboard-open .workspace {\n    grid-template-rows: 42px minmax(0, 1fr);");
     expect(css).toContain(".app-shell.mobile-keyboard-open .daemon-status-strip {\n    display: none;");
     expect(css).toContain("--terminal-mobile-shortcuts-height: 42px;");
-    expect(css).toContain(".app-shell.mobile-keyboard-open .terminal-scrollport {\n    /* 中文注释：快捷键栏是 overlay，键盘打开时终端可视底边要停在快捷键栏上方。 */\n    margin-bottom: var(--terminal-mobile-shortcuts-height);");
+    expect(css).toContain(".terminal-pane.mobile-quick-keys-expanded {");
+    expect(css).toContain("--terminal-mobile-shortcuts-height: 120px;");
+    expect(css).toContain(".app-shell.mobile-keyboard-open .terminal-scrollport {\n  /* 中文注释：快捷键栏是 overlay，键盘打开时终端可视底边要停在快捷键栏上方。 */\n  margin-bottom: var(--terminal-mobile-shortcuts-height);");
     expect(css).not.toContain(".app-shell.mobile-keyboard-open .terminal-pane {\n    grid-template-rows: minmax(0, 1fr) 42px;");
     const mobileShortcutsBlock = css.match(/\.terminal-mobile-shortcuts \{[^}]+\}/)?.[0] ?? "";
     expect(mobileShortcutsBlock).toContain("position: absolute;");
     expect(mobileShortcutsBlock).toContain("bottom: 0;");
+    expect(mobileShortcutsBlock).toContain("height: var(--terminal-mobile-shortcuts-height);");
+    expect(mobileShortcutsBlock).not.toContain("safe-area-inset-bottom");
+    expect(css).toContain(".terminal-quick-keys-main {");
+    expect(css).toContain("-webkit-overflow-scrolling: touch;");
+    expect(css).toContain("touch-action: pan-x;");
     expect(css).toContain(".terminal-host {\n    min-width: 0;\n    overflow: hidden;\n    max-width: 100%;");
     expect(css).toContain(".terminal-host .xterm,\n.terminal-host .xterm-screen,\n.terminal-host .xterm-viewport {\n  width: 100%;\n  height: 100%;");
     const terminalSurfaceBlock =

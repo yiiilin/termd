@@ -2040,8 +2040,9 @@ describe("termui web 工作台", () => {
     expect(mobileShortcutsBlock).toContain("width: 100%;");
     expect(css).toContain("overflow-x: auto;");
     expect(css).toContain("scrollbar-width: none;");
-    expect(css).toContain("flex: 0 0 64px;");
-    expect(css).toContain(".terminal-mobile-paste-button {\n    flex-basis: 82px;");
+    expect(css).toContain("flex: 0 0 46px;");
+    expect(mobileShortcutsBlock).not.toContain("safe-area-inset-bottom");
+    expect(css).toContain(".terminal-quick-keys-panel {");
   });
 
   it("基于相邻 daemon 状态快照计算网卡上下行速度", () => {
@@ -3203,6 +3204,7 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
 
     const shell = document.querySelector<HTMLElement>(".app-shell");
+    expect(shell).toHaveClass("mobile-terminal-input");
     expect(shell).not.toHaveClass("mobile-keyboard-open");
     expect(screen.queryByLabelText("mobile terminal shortcuts")).toBeNull();
   });
@@ -4487,6 +4489,7 @@ describe("termui web 工作台", () => {
     });
     terminalInput.focus();
 
+    await user.click(await screen.findByRole("button", { name: "Expand terminal keys" }));
     await user.click(await screen.findByRole("button", { name: "Paste" }));
     await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["shortcut-paste"]));
 
@@ -8151,9 +8154,11 @@ describe("termui web 工作台", () => {
       expect(document.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
     });
 
-    await user.click(screen.getByRole("button", { name: "Send Tab" }));
-    await user.click(screen.getByRole("button", { name: "Send Ctrl-C" }));
-    await user.click(screen.getByRole("button", { name: "Send Ctrl-Z" }));
+    await user.click(screen.getByRole("button", { name: "Tab" }));
+    await user.click(screen.getByRole("button", { name: "Expand terminal keys" }));
+    await user.click(screen.getByRole("tab", { name: "Ctrl combinations" }));
+    await user.click(screen.getByRole("button", { name: "^C" }));
+    await user.click(screen.getByRole("button", { name: "^Z" }));
 
     await waitFor(() => expect(daemon.sessionDataMessages).toEqual(["\t", "\x03", "\x1a"]));
   });
@@ -8170,9 +8175,10 @@ describe("termui web 工作台", () => {
     await screen.findByText(/termd-e2e-ready/);
 
     const shell = document.querySelector<HTMLElement>(".app-shell");
+    expect(shell).toHaveClass("mobile-terminal-input");
     expect(shell).not.toHaveClass("mobile-keyboard-open");
     expect(document.querySelector('textarea[aria-label="Terminal input"]')).not.toBeNull();
-    expect(screen.queryByRole("button", { name: "Send Tab" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Tab" })).toBeNull();
   });
 
   it("移动端长按终端一秒后拖动会发送方向键序列", async () => {

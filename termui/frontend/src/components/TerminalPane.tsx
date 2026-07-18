@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { ClipboardPaste, Copy } from "lucide-react";
+import { Copy } from "lucide-react";
 import type { BrowserMobileShortcut, EffectiveTheme, TerminalSize } from "../protocol/types";
 import { useI18n } from "../i18n";
 import { terminalTheme } from "../theme";
@@ -16,6 +16,11 @@ import {
 } from "./terminal/renderer";
 import { SessionOpenProgressControl } from "./SessionOpenProgressControl";
 import type { SessionOpenProgress } from "../session-open-progress";
+import { MobileTerminalQuickKeys } from "./MobileTerminalQuickKeys";
+import {
+  encodeTerminalInputData,
+  type ModifierState,
+} from "./terminal/mobile-terminal-keys";
 
 export type { TerminalOutputItem } from "./terminal/types";
 
@@ -44,6 +49,7 @@ const TERMINAL_SERVER_SCROLLBACK_RESYNC_MIN_BYTES = 8 * 1024;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_USER_MIN_BYTES = 1024;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_COOLDOWN_MS = 5_000;
 const TERMINAL_SERVER_SCROLLBACK_RESYNC_IDLE_SETTLE_MS = 1_000;
+const EMPTY_MOBILE_MODIFIERS: ModifierState = { ctrl: false, alt: false, shift: false };
 const TERMINAL_SELECTION_DRAG_THRESHOLD_PX = 4;
 const TERMINAL_SURFACE_SELECTOR_FALLBACKS = [
   "canvas",
@@ -96,14 +102,6 @@ function serverScrollableOutputBytes(bytes: Uint8Array): number {
   }
   return 0;
 }
-
-const MOBILE_SHORTCUT_KEYS = [
-  { label: "Tab", ariaKey: "terminal.sendTab", data: "\t" },
-  { label: "Esc", ariaKey: "terminal.sendEscape", data: "\x1b" },
-  { label: "^C", ariaKey: "terminal.sendCtrlC", data: "\x03" },
-  { label: "^Z", ariaKey: "terminal.sendCtrlZ", data: "\x1a" },
-  { label: "^D", ariaKey: "terminal.sendCtrlD", data: "\x04" },
-] as const;
 
 interface TerminalPaneProps {
   attached: boolean;
@@ -221,6 +219,8 @@ export function TerminalPane(props: TerminalPaneProps) {
   const pendingPasteShortcutTimerRef = useRef<number | undefined>(undefined);
   const pasteShortcutSequenceRef = useRef(0);
   const mobileCompositionActiveRef = useRef(false);
+  const mobileModifiersRef = useRef<ModifierState>(EMPTY_MOBILE_MODIFIERS);
+  const bypassMobileModifiersRef = useRef(0);
   const lastMobileCompositionEndAtRef = useRef(0);
   const currentFontSizeRef = useRef(TERMINAL_FONT_SIZE);
   const bottomScrollPassesRef = useRef(0);
@@ -321,6 +321,20 @@ export function TerminalPane(props: TerminalPaneProps) {
   const [copyToastVisible, setCopyToastVisible] = useState(false);
   const [terminalSelectionAvailable, setTerminalSelectionAvailable] = useState(false);
   const [mobileDirectionActive, setMobileDirectionActive] = useState(false);
+  const [mobileQuickKeysExpanded, setMobileQuickKeysExpanded] = useState(false);
+  const [mobileModifiers, setMobileModifiers] = useState<ModifierState>(EMPTY_MOBILE_MODIFIERS);
+
+  const updateMobileModifiers = (next: ModifierState) => {
+    mobileModifiersRef.current = next;
+    setMobileModifiers(next);
+  };
+
+  useEffect(() => {
+    if (!props.attached || !props.mobileInputMode || !props.mobileKeyboardOpen) {
+      setMobileQuickKeysExpanded(false);
+      updateMobileModifiers(EMPTY_MOBILE_MODIFIERS);
+    }
+  }, [props.attached, props.mobileInputMode, props.mobileKeyboardOpen]);
   const [mobileDirection, setMobileDirection] = useState<MobileDirection | undefined>();
   const deferredFrameIdRef = useRef(0);
   const deferredFrameHandlesByIdRef = useRef<Map<number, DeferredTerminalFrameHandle>>(new Map());
@@ -2036,6 +2050,21 @@ export function TerminalPane(props: TerminalPaneProps) {
     focusTerminalInputSink();
   };
 
+  const sendMobileQuickKeyInput = (data: string) => {
+    // 快捷键属于用户输入，交给 xterm input 触发 onData，和物理键盘共用同一发送链路。
+    const terminal = terminalRef.current;
+    if (!terminal) {
+      return;
+    }
+    // 快捷键组件已经把 modifier 编进 data；onData 必须只转发，不能再应用一次。
+    bypassMobileModifiersRef.current += 1;
+    try {
+      terminal.input(data, true);
+    } finally {
+      bypassMobileModifiersRef.current = Math.max(0, bypassMobileModifiersRef.current - 1);
+    }
+  };
+
   const sendNativePasteText = (text: string) => {
     if (!text) {
       return;
@@ -2964,10 +2993,18 @@ export function TerminalPane(props: TerminalPaneProps) {
       terminalResizeReportFrameRef.current = requestTrackedFrame(runResizeReportPass);
     };
     const dataSubscription = terminal.onData((data) => {
+      const encoded = bypassMobileModifiersRef.current > 0
+        ? { data, nextModifiers: mobileModifiersRef.current }
+        : encodeTerminalInputData(data, mobileModifiersRef.current, {
+            applicationCursorKeys: terminal.modes.applicationCursorKeysMode,
+          });
+      if (encoded.nextModifiers !== mobileModifiersRef.current) {
+        updateMobileModifiers(encoded.nextModifiers);
+      }
       recordTermdDiagnostic("terminal_pane_on_data", {
-        chunkLength: data.length,
+        chunkLength: encoded.data.length,
       });
-      onInputRef.current(data);
+      onInputRef.current(encoded.data);
       if (mobileInputModeRef.current && mobileKeyboardOpenRef.current) {
         // 中文注释：移动浏览器可能在原生键盘/IME 输入时自动把 focused textarea 的
         // 外层 scrollport 推到末尾；PTY 无回显时没有后续 cursor/output 事件可供恢复。
@@ -3048,7 +3085,11 @@ export function TerminalPane(props: TerminalPaneProps) {
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
-      sendTerminalControl(event.data);
+      const encoded = encodeTerminalInputData(event.data, mobileModifiersRef.current, {
+        applicationCursorKeys: terminal.modes.applicationCursorKeysMode,
+      });
+      updateMobileModifiers(encoded.nextModifiers);
+      sendTerminalControl(encoded.data);
     };
     const handleMobilePaste = (event: ClipboardEvent) => {
       if (event.defaultPrevented) {
@@ -3862,7 +3903,7 @@ export function TerminalPane(props: TerminalPaneProps) {
 
   return (
     <section
-      className="terminal-pane"
+      className={`terminal-pane${mobileQuickKeysExpanded ? " mobile-quick-keys-expanded" : ""}`}
       data-testid="terminal-pane"
     >
       <div className="terminal-scrollport" ref={scrollportRef} onScroll={handleTerminalScrollportScroll}>
@@ -3922,44 +3963,16 @@ export function TerminalPane(props: TerminalPaneProps) {
         </div>
       ) : null}
       {props.attached && props.mobileInputMode && props.mobileKeyboardOpen ? (
-        <div
-          className="terminal-mobile-shortcuts"
-          aria-label={t("terminal.mobileShortcuts")}
-          onClick={(event) => event.stopPropagation()}
-        >
-          {[...MOBILE_SHORTCUT_KEYS, ...(props.mobileShortcuts ?? [])].map((shortcut) => (
-            <button
-              type="button"
-              key={shortcut.label}
-              className="terminal-mobile-shortcut-button"
-              aria-label={"ariaKey" in shortcut ? t(shortcut.ariaKey) : shortcut.label}
-              title={"ariaKey" in shortcut ? t(shortcut.ariaKey) : shortcut.label}
-              onPointerDown={keepMobileKeyboardFocused}
-              onClick={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                sendTerminalControl(shortcut.data);
-              }}
-            >
-              {shortcut.label}
-            </button>
-          ))}
-          <button
-            type="button"
-            className="terminal-mobile-shortcut-button terminal-mobile-paste-button"
-            aria-label={t("terminal.paste")}
-            title={t("terminal.paste")}
-            onPointerDown={keepMobileKeyboardFocused}
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              void handlePasteShortcut();
-            }}
-          >
-            <ClipboardPaste size={13} aria-hidden="true" />
-            <span>{t("terminal.paste")}</span>
-          </button>
-        </div>
+        <MobileTerminalQuickKeys
+          customShortcuts={props.mobileShortcuts}
+          getApplicationCursorKeysMode={() => Boolean(terminalRef.current?.modes.applicationCursorKeysMode)}
+          modifiers={mobileModifiers}
+          onModifiersChange={updateMobileModifiers}
+          onInput={sendMobileQuickKeyInput}
+          onPaste={() => void handlePasteShortcut()}
+          onPreserveFocus={keepMobileKeyboardFocused}
+          onExpandedChange={setMobileQuickKeysExpanded}
+        />
       ) : null}
       {mobileDirectionActive ? (
         <div className="terminal-direction-pad" aria-label={t("terminal.mobileDirection")}>
