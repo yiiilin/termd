@@ -1,5 +1,37 @@
 import { describe, expect, it, vi } from "vitest";
 
+const IOS_SAFARI_USER_AGENT =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1";
+
+function mockIosSafariUserAgent(): () => void {
+  const descriptor = Object.getOwnPropertyDescriptor(window.navigator, "userAgent");
+  Object.defineProperty(window.navigator, "userAgent", {
+    configurable: true,
+    value: IOS_SAFARI_USER_AGENT,
+  });
+  return () => {
+    if (descriptor) {
+      Object.defineProperty(window.navigator, "userAgent", descriptor);
+    } else {
+      Reflect.deleteProperty(window.navigator, "userAgent");
+    }
+  };
+}
+
+function imeKeyboardEvent(type: "keydown" | "keyup", key: string, keyCode: number): KeyboardEvent {
+  const event = new KeyboardEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    code: key === " " ? "Space" : "Unidentified",
+    key,
+  });
+  Object.defineProperties(event, {
+    keyCode: { value: keyCode },
+    which: { value: keyCode },
+  });
+  return event;
+}
+
 describe("xterm renderer adapter", () => {
   it("补齐 TerminalPane 需要的 renderer contract，并保持 xterm 单栈语义", async () => {
     vi.resetModules();
@@ -98,6 +130,118 @@ describe("xterm renderer adapter", () => {
       __TERMD_TEST_TERMINAL__?: { setApplicationCursorKeysMode?: (enabled: boolean) => void };
     }).__TERMD_TEST_TERMINAL__?.setApplicationCursorKeysMode?.(true);
     expect(renderer.terminal.modes.applicationCursorKeysMode).toBe(true);
+  });
+
+  it("iPhone 中文 IME 在延迟 input 中轮换标点时发送最小替换序列", async () => {
+    const restoreUserAgent = mockIosSafariUserAgent();
+    vi.resetModules();
+    const { createXtermRenderer } = await import("../components/terminal/xterm-renderer");
+    const renderer = createXtermRenderer({ terminalOptions: {} });
+
+    try {
+      const host = document.createElement("div");
+      renderer.terminal.open(host);
+      const textarea = renderer.terminal.textarea;
+      expect(textarea).toBeDefined();
+      const onData = vi.fn();
+      renderer.terminal.onData(onData);
+      textarea!.value = "，";
+
+      textarea!.dispatchEvent(imeKeyboardEvent("keydown", "。", 229));
+
+      // iOS 可能在 xterm 的 keydown timer 已执行后才更新 helper textarea。
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      textarea!.value = "。";
+      textarea!.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: "。",
+        inputType: "insertText",
+      }));
+
+      textarea!.dispatchEvent(imeKeyboardEvent("keyup", "。", 0));
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+      expect(onData).toHaveBeenCalledTimes(1);
+      expect(onData).toHaveBeenCalledWith("\x7f。");
+    } finally {
+      renderer.terminal.dispose();
+      restoreUserAgent();
+      vi.resetModules();
+    }
+  });
+
+  it("iPhone 中文 IME 双空格转换按删除和插入顺序发送句号", async () => {
+    const restoreUserAgent = mockIosSafariUserAgent();
+    vi.resetModules();
+    const { createXtermRenderer } = await import("../components/terminal/xterm-renderer");
+    const renderer = createXtermRenderer({ terminalOptions: {} });
+
+    try {
+      const host = document.createElement("div");
+      renderer.terminal.open(host);
+      const textarea = renderer.terminal.textarea;
+      const onData = vi.fn();
+      renderer.terminal.onData(onData);
+      textarea!.value = " ";
+      textarea!.dispatchEvent(imeKeyboardEvent("keydown", " ", 229));
+
+      textarea!.value = "";
+      textarea!.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: null,
+        inputType: "deleteContentBackward",
+      }));
+      textarea!.value = "。";
+      textarea!.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: "。",
+        inputType: "insertText",
+      }));
+      textarea!.dispatchEvent(imeKeyboardEvent("keyup", " ", 32));
+
+      expect(onData.mock.calls.flat().join("")).toBe("\x7f。");
+    } finally {
+      renderer.terminal.dispose();
+      restoreUserAgent();
+      vi.resetModules();
+    }
+  });
+
+  it("iPhone 中文候选词 composition 保持由 xterm 原输入路径处理", async () => {
+    const restoreUserAgent = mockIosSafariUserAgent();
+    vi.resetModules();
+    const { createXtermRenderer } = await import("../components/terminal/xterm-renderer");
+    const renderer = createXtermRenderer({ terminalOptions: {} });
+
+    try {
+      const host = document.createElement("div");
+      renderer.terminal.open(host);
+      const textarea = renderer.terminal.textarea;
+      const onData = vi.fn();
+      renderer.terminal.onData(onData);
+
+      textarea!.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+      textarea!.dispatchEvent(imeKeyboardEvent("keydown", "Process", 229));
+      textarea!.value = "你";
+      textarea!.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: "你",
+        inputType: "insertCompositionText",
+        isComposing: true,
+      }));
+      textarea!.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "你" }));
+
+      expect(onData).toHaveBeenCalledTimes(1);
+      expect(onData).toHaveBeenCalledWith("你");
+    } finally {
+      renderer.terminal.dispose();
+      restoreUserAgent();
+      vi.resetModules();
+    }
   });
 
   it("运行期主题更新不会把 rows/cols 重新写入 xterm options", async () => {

@@ -22,6 +22,120 @@ type XtermDebugTerminal = Terminal & {
 type XtermAbsoluteRange = { startCol: number; startRow: number; endCol: number; endRow: number };
 const XTERM_CONSTRUCTOR_ONLY_OPTIONS = new Set(["cols", "rows"]);
 
+function isIosInputPlatform(): boolean {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+  return /iP(?:ad|hone|od)/u.test(navigator.userAgent) || (
+    navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1
+  );
+}
+
+function textareaReplacementSequence(previousValue: string, nextValue: string): string {
+  if (previousValue === nextValue) {
+    return "";
+  }
+  let commonPrefixLength = 0;
+  while (
+    commonPrefixLength < previousValue.length &&
+    commonPrefixLength < nextValue.length &&
+    previousValue.charCodeAt(commonPrefixLength) === nextValue.charCodeAt(commonPrefixLength)
+  ) {
+    commonPrefixLength += 1;
+  }
+  const removedCount = previousValue.length - commonPrefixLength;
+  return `${"\x7f".repeat(removedCount)}${nextValue.slice(commonPrefixLength)}`;
+}
+
+function installIosImeInputCompatibility(terminal: Terminal): () => void {
+  const textarea = terminal.textarea;
+  if (!textarea || !isIosInputPlatform()) {
+    return () => undefined;
+  }
+
+  let disposed = false;
+  let isComposing = false;
+  let compositionSettleTimer: number | undefined;
+  let pendingTextareaValue: string | undefined;
+  const flushPendingInput = () => {
+    if (disposed || isComposing || pendingTextareaValue === undefined) {
+      return;
+    }
+    const nextValue = textarea.value;
+    const sequence = textareaReplacementSequence(pendingTextareaValue, nextValue);
+    pendingTextareaValue = nextValue;
+    if (sequence) {
+      terminal.input(sequence, true);
+    }
+  };
+  const handleCompositionStart = () => {
+    if (compositionSettleTimer !== undefined) {
+      window.clearTimeout(compositionSettleTimer);
+      compositionSettleTimer = undefined;
+    }
+    isComposing = true;
+    pendingTextareaValue = undefined;
+  };
+  const handleCompositionEnd = () => {
+    if (compositionSettleTimer !== undefined) {
+      window.clearTimeout(compositionSettleTimer);
+    }
+    compositionSettleTimer = window.setTimeout(() => {
+      compositionSettleTimer = undefined;
+      isComposing = false;
+    }, 0);
+  };
+  const handleInput = (event: Event) => {
+    if (!(event instanceof InputEvent) || pendingTextareaValue === undefined) {
+      return;
+    }
+    if (!event.composed) {
+      pendingTextareaValue = textarea.value;
+      return;
+    }
+    event.stopImmediatePropagation();
+    flushPendingInput();
+  };
+  const handleBlur = () => {
+    pendingTextareaValue = undefined;
+  };
+
+  // xterm.js 6.0 handles keyCode=229 with a keydown timer. On iOS Chinese IMEs the helper
+  // textarea can update after that timer, and punctuation rotation loses its replacement delta.
+  // Keep this workaround scoped to non-composition iOS input until xterm.js #5836 lands.
+  terminal.attachCustomKeyEventHandler((event) => {
+    if (disposed) {
+      return true;
+    }
+    if (event.type === "keydown" && event.keyCode === 229 && !isComposing) {
+      pendingTextareaValue ??= textarea.value;
+      return false;
+    }
+    if (event.type === "keyup" && pendingTextareaValue !== undefined) {
+      flushPendingInput();
+      pendingTextareaValue = undefined;
+    }
+    return true;
+  });
+  textarea.addEventListener("compositionstart", handleCompositionStart);
+  textarea.addEventListener("compositionend", handleCompositionEnd);
+  textarea.addEventListener("input", handleInput, true);
+  textarea.addEventListener("blur", handleBlur);
+
+  return () => {
+    disposed = true;
+    if (compositionSettleTimer !== undefined) {
+      window.clearTimeout(compositionSettleTimer);
+      compositionSettleTimer = undefined;
+    }
+    pendingTextareaValue = undefined;
+    textarea.removeEventListener("compositionstart", handleCompositionStart);
+    textarea.removeEventListener("compositionend", handleCompositionEnd);
+    textarea.removeEventListener("input", handleInput, true);
+    textarea.removeEventListener("blur", handleBlur);
+  };
+}
+
 function clampLine(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
@@ -302,6 +416,7 @@ function adaptXtermTerminal(
   cleanupDebugBufferMirror: () => void = () => undefined,
 ): TerminalRendererTerminal {
   let cleanupDebugSelectionBridge: () => void = () => undefined;
+  let cleanupIosImeInputCompatibility: () => void = () => undefined;
   let hostElement: HTMLElement | undefined;
   let manualSelectionText: string | undefined;
   let manualSelectionPosition:
@@ -348,6 +463,8 @@ function adaptXtermTerminal(
       parent.setAttribute("aria-multiline", "true");
       terminal.open(parent);
       terminal.textarea?.setAttribute("aria-label", "Terminal input");
+      cleanupIosImeInputCompatibility();
+      cleanupIosImeInputCompatibility = installIosImeInputCompatibility(terminal);
       cleanupDebugSelectionBridge();
       cleanupDebugSelectionBridge = installDebugSelectionBridge(terminal, terminalFacade);
       (terminal as XtermDebugTerminal).__termdDebugBufferSync?.();
@@ -406,6 +523,7 @@ function adaptXtermTerminal(
       (terminal as XtermDebugTerminal).__termdDebugBufferSync?.();
     },
     dispose: () => {
+      cleanupIosImeInputCompatibility();
       cleanupDebugSelectionBridge();
       cleanupDebugBufferMirror();
       hostElement = undefined;

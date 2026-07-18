@@ -179,6 +179,7 @@ vi.mock("@xterm/xterm", () => {
     private pendingRenderReady = false;
     private serializedWriteInFlight = false;
     private serializedWriteQueue: Array<{ data: string | Uint8Array; callback?: () => void }> = [];
+    private customKeyEventHandler?: (event: KeyboardEvent) => boolean;
     private selection = "";
     private selectionPosition: { start: { x: number; y: number }; end: { x: number; y: number } } | undefined;
     private absoluteCursorY = 0;
@@ -233,6 +234,10 @@ vi.mock("@xterm/xterm", () => {
       addon?.activate?.(this);
     }
 
+    attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean) {
+      this.customKeyEventHandler = handler;
+    }
+
     open(parent: HTMLElement) {
       this.element = parent as HTMLDivElement;
       this.element.dataset.buffer = "";
@@ -267,6 +272,12 @@ vi.mock("@xterm/xterm", () => {
       const textarea = document.createElement("textarea");
       textarea.className = "xterm-helper-textarea";
       textarea.setAttribute("aria-label", "Terminal input");
+      textarea.addEventListener("keydown", (event) => {
+        this.customKeyEventHandler?.(event);
+      }, true);
+      textarea.addEventListener("keyup", (event) => {
+        this.customKeyEventHandler?.(event);
+      }, true);
       textarea.addEventListener("input", () => {
         const value = textarea.value;
         textarea.value = "";

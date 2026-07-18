@@ -306,3 +306,143 @@ test("mobile terminal quick keys follow keyboard viewport in portrait and landsc
     await daemon.stop();
   }
 });
+
+test("iPhone Chinese IME punctuation rotation preserves replacement semantics", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile-iphone-layout", "iPhone input event emulation only");
+  test.setTimeout(60_000);
+
+  const sessionId = "00000000-0000-0000-0000-0000000006a2";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [{
+      session_id: sessionId,
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    }],
+    attachOutput: "ios-ime-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await page.getByRole("button", { name: "Pair" }).click();
+    await expect.poll(() => page.locator(".terminal-host").getAttribute("data-termd-buffer"))
+      .toContain("ios-ime-ready");
+
+    const baseline = daemon.decryptedInputs.length;
+    await page.locator('.terminal-host textarea[aria-label="Terminal input"]').evaluate(async (textarea) => {
+      const input = textarea as HTMLTextAreaElement;
+      const imeKey = (type: "keydown" | "keyup", key: string, keyCode: number) => {
+        const event = new KeyboardEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          code: key === " " ? "Space" : "Unidentified",
+          key,
+        });
+        Object.defineProperties(event, {
+          keyCode: { value: keyCode },
+          which: { value: keyCode },
+        });
+        return event;
+      };
+
+      input.value = "，";
+      input.dispatchEvent(imeKey("keydown", "。", 229));
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      input.value = "。";
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: "。",
+        inputType: "insertText",
+      }));
+      input.dispatchEvent(imeKey("keyup", "。", 0));
+    });
+    await expect.poll(() => daemon.decryptedInputs.slice(baseline).join("")).toBe("\x7f。");
+
+    const doubleSpaceBaseline = daemon.decryptedInputs.length;
+    await page.locator('.terminal-host textarea[aria-label="Terminal input"]').evaluate((textarea) => {
+      const input = textarea as HTMLTextAreaElement;
+      const imeKey = (type: "keydown" | "keyup", key: string, keyCode: number) => {
+        const event = new KeyboardEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          code: "Space",
+          key,
+        });
+        Object.defineProperties(event, {
+          keyCode: { value: keyCode },
+          which: { value: keyCode },
+        });
+        return event;
+      };
+
+      input.value = " ";
+      input.dispatchEvent(imeKey("keydown", " ", 229));
+      input.value = "";
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: null,
+        inputType: "deleteContentBackward",
+      }));
+      input.value = "。";
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: "。",
+        inputType: "insertText",
+      }));
+      input.dispatchEvent(imeKey("keyup", " ", 32));
+    });
+    await expect.poll(() => daemon.decryptedInputs.slice(doubleSpaceBaseline).join(""))
+      .toBe("\x7f。");
+
+    const compositionBaseline = daemon.decryptedInputs.length;
+    await page.locator('.terminal-host textarea[aria-label="Terminal input"]').evaluate(async (textarea) => {
+      const input = textarea as HTMLTextAreaElement;
+      const imeKey = (type: "keydown" | "keyup", key: string, keyCode: number) => {
+        const event = new KeyboardEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          code: "Unidentified",
+          key,
+        });
+        Object.defineProperties(event, {
+          keyCode: { value: keyCode },
+          which: { value: keyCode },
+        });
+        return event;
+      };
+
+      input.value = "";
+      input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+      input.value = "你";
+      input.dispatchEvent(new CompositionEvent("compositionupdate", { bubbles: true, data: "你" }));
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: "你",
+        inputType: "insertCompositionText",
+        isComposing: true,
+      }));
+      input.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "你" }));
+
+      input.dispatchEvent(imeKey("keydown", "，", 229));
+      input.value = "你，";
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: "，",
+        inputType: "insertText",
+      }));
+      input.dispatchEvent(imeKey("keyup", "，", 0));
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    await expect.poll(() => daemon.decryptedInputs.slice(compositionBaseline).join(""))
+      .toBe("你，");
+  } finally {
+    await daemon.stop();
+  }
+});
