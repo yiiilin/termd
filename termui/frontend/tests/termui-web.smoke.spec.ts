@@ -723,7 +723,13 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     await expect(sessionVisual).toHaveCSS("width", "28px");
     await expect(sessionVisual).toHaveCSS("height", "28px");
     await expect(sessionVisual.locator("svg")).toHaveCount(0);
-    await expect(sessionRow.locator(".session-activity-indicator")).toHaveCount(0);
+    const sessionActivityIndicator = sessionRow.locator(".session-activity-indicator");
+    await expect(sessionActivityIndicator).toHaveText("Codex is running");
+    await expect(sessionActivityIndicator.locator("svg")).toHaveCount(1);
+    await expect(sessionActivityIndicator.locator("svg")).toHaveCSS(
+      "animation-name",
+      "session-activity-icon-spin",
+    );
     await expect.poll(() => sessionVisual.evaluate((element) => {
       return window.getComputedStyle(element, "::after").content;
     })).toBe("none");
@@ -735,7 +741,24 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       };
     });
     expect(runningSurface.backgroundColor).toMatch(/^(rgb|color\(srgb)/);
-    expect(runningSurface.animationName).toBe("session-activity-row-breathe");
+    expect(runningSurface.animationName).toBe("none");
+    const runningLight = await sessionRow.evaluate((element) => {
+      const light = window.getComputedStyle(element, "::before");
+      return {
+        animationName: light.animationName,
+        backgroundImage: light.backgroundImage,
+        content: light.content,
+      };
+    });
+    expect(runningLight.content).toBe('\"\"');
+    expect(runningLight.animationName).toBe("session-activity-border-spin");
+    expect(runningLight.backgroundImage).toContain("conic-gradient");
+    const initialActivityAngle = await sessionRow.evaluate((element) => (
+      window.getComputedStyle(element, "::before").getPropertyValue("--session-activity-angle")
+    ));
+    await expect.poll(() => sessionRow.evaluate((element) => (
+      window.getComputedStyle(element, "::before").getPropertyValue("--session-activity-angle")
+    ))).not.toBe(initialActivityAngle);
     const staticSurfaceColors: string[] = [];
     for (const expected of [
       "activity-completed",
@@ -760,8 +783,14 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       element.classList.add("activity-running");
     });
     await expect.poll(() => sessionRow.evaluate((element) => (
-      window.getComputedStyle(element).animationName
-    ))).toBe("session-activity-row-breathe");
+      window.getComputedStyle(element, "::before").animationName
+    ))).toBe("session-activity-border-spin");
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await expect.poll(() => sessionRow.evaluate((element) => (
+      window.getComputedStyle(element, "::before").animationName
+    ))).toBe("none");
+    await expect(sessionActivityIndicator.locator("svg")).toHaveCSS("animation-name", "none");
+    await page.emulateMedia({ reducedMotion: "no-preference" });
     if (testInfo.project.name === "chromium") {
       await page.getByRole("button", { name: "Collapse sidebar" }).click();
       const collapsedSessionButton = page.locator(".collapsed-session-list .selected-session-dot");
@@ -772,7 +801,10 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
         return { backgroundColor: surface.backgroundColor, animationName: surface.animationName };
       });
       expect(collapsedSurface.backgroundColor).toBe(runningSurface.backgroundColor);
-      expect(collapsedSurface.animationName).toBe("session-activity-row-breathe");
+      expect(collapsedSurface.animationName).toBe("none");
+      await expect.poll(() => collapsedSessionButton.evaluate((element) => (
+        window.getComputedStyle(element, "::before").animationName
+      ))).toBe("session-activity-border-spin");
       await page.getByRole("button", { name: "Expand sidebar" }).click();
     }
     if (testInfo.project.name === "chromium") {

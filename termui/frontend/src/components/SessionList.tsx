@@ -1,4 +1,4 @@
-import { Check, Pencil, Trash2, X } from "lucide-react";
+import { Check, CircleAlert, CircleCheck, LoaderCircle, Pencil, Trash2, X } from "lucide-react";
 import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { flushSync } from "react-dom";
 import type { SessionAiActivityPayload, SessionSummaryPayload, UUID } from "../protocol/types";
@@ -47,6 +47,31 @@ function SessionVisual(props: {
       title={activityLabel}
     >
       <SessionAvatar sessionId={props.sessionId} compact={props.compact} />
+    </span>
+  );
+}
+
+function SessionActivityIndicator(props: { activity?: SessionAiActivityPayload | null }) {
+  const { t } = useI18n();
+  if (!props.activity || props.activity.state === "idle") {
+    return null;
+  }
+  const activityLabel = sessionActivityLabel(t, props.activity);
+  const ActivityIcon = props.activity.state === "running"
+    ? LoaderCircle
+    : props.activity.state === "attention"
+      ? CircleAlert
+      : CircleCheck;
+  return (
+    <span
+      className={[
+        "session-activity-indicator",
+        sessionActivityClassName(props.activity),
+      ].join(" ")}
+      aria-hidden="true"
+    >
+      <ActivityIcon size={11} strokeWidth={2.25} />
+      <span>{activityLabel}</span>
     </span>
   );
 }
@@ -358,6 +383,7 @@ export function SessionList(props: SessionListProps) {
                     }}
                   >
                     <strong>{displayName}</strong>
+                    <SessionActivityIndicator activity={session.activity} />
                   </button>
                 )}
               </div>

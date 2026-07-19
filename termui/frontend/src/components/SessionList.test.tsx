@@ -191,12 +191,14 @@ describe("SessionList", () => {
     const runningButton = screen.getByRole("button", {
       name: "Open active, new output, Codex is running",
     });
-    expect(screen.getByRole("button", {
+    const attentionButton = screen.getByRole("button", {
       name: "Open waiting, Claude Code needs attention",
-    })).toBeInTheDocument();
-    expect(screen.getByRole("button", {
+    });
+    const completedButton = screen.getByRole("button", {
       name: "Open done, OpenCode finished",
-    })).toBeInTheDocument();
+    });
+    expect(attentionButton).toBeInTheDocument();
+    expect(completedButton).toBeInTheDocument();
     expect(screen.getByRole("button", {
       name: "Open ready, ZCode is ready",
     })).toBeInTheDocument();
@@ -208,7 +210,13 @@ describe("SessionList", () => {
     expect(runningVisual).toHaveAttribute("aria-hidden", "true");
     expect(runningVisual).toHaveClass("session-visual", "activity-running");
     expect(runningVisual.querySelector("svg")).toBeNull();
-    expect(within(runningButton).queryByTitle("Codex is running")).toBeNull();
+    const runningIndicator = within(runningButton).getByText("Codex is running").closest(".session-activity-indicator");
+    expect(runningIndicator).toHaveClass("activity-running");
+    expect(runningIndicator?.querySelector("svg")).not.toBeNull();
+    expect(within(attentionButton).getByText("Claude Code needs attention").closest(".session-activity-indicator"))
+      .toHaveClass("activity-attention");
+    expect(within(completedButton).getByText("OpenCode finished").closest(".session-activity-indicator"))
+      .toHaveClass("activity-completed");
     expect(screen.getByTitle("OpenCode finished")).toHaveClass("activity-completed");
     expect(screen.getByTitle("OpenCode finished").closest(".session-row"))
       .toHaveClass("activity-completed");
@@ -218,7 +226,7 @@ describe("SessionList", () => {
     const idleVisual = screen.getByTitle("ZCode is ready");
     expect(idleVisual).toHaveAttribute("title", "ZCode is ready");
     expect(idleVisual).toHaveClass("activity-idle");
-    expect(document.querySelector(".session-activity-indicator")).toBeNull();
+    expect(document.querySelectorAll(".session-activity-indicator")).toHaveLength(3);
     expect(document.querySelectorAll(".session-avatar")).toHaveLength(4);
     expect(
       runningRow.querySelector(

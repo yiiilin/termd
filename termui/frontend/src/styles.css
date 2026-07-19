@@ -63,6 +63,8 @@
   --color-accent: #a7c080;
   --color-accent-soft: #d3c6aa;
   --color-accent-border: #48584e;
+  --color-success: #82c896;
+  --color-success-soft: #c7efd2;
   --color-info: #7fbbb3;
   --color-info-soft: #d3eee9;
   --color-focus: #7fbbb3;
@@ -150,6 +152,8 @@
   --color-accent: #8da101;
   --color-accent-soft: #4f5b1a;
   --color-accent-border: #a7c080;
+  --color-success: #2f8f57;
+  --color-success-soft: #256f45;
   --color-info: #3a94c5;
   --color-info-soft: #286983;
   --color-focus: #3a94c5;
@@ -580,48 +584,44 @@ label {
   background: var(--color-surface-selected);
 }
 
-.collapsed-session-list .icon-button.selected-session-dot.activity-running,
-.collapsed-session-list .icon-button.selected-session-dot.activity-completed,
-.collapsed-session-list .icon-button.selected-session-dot.activity-attention,
-.collapsed-session-list .icon-button.selected-session-dot.activity-error {
-  border-color: var(--color-accent);
-}
-
 .collapsed-session-list .icon-button.activity-running {
-  background: color-mix(in srgb, var(--color-info) 9%, var(--color-surface-raised));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-info) 34%, transparent);
-  animation: session-activity-row-breathe 2.2s ease-in-out infinite;
+  border-color: color-mix(in srgb, var(--color-info) 58%, var(--color-border-control));
+  background: color-mix(in srgb, var(--color-info) 13%, var(--color-surface-raised));
+  box-shadow: 0 0 8px color-mix(in srgb, var(--color-info) 20%, transparent);
 }
 
 .collapsed-session-list .icon-button.activity-completed {
-  background: color-mix(in srgb, var(--color-accent) 9%, var(--color-surface-raised));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 36%, transparent);
+  border-color: var(--color-success);
+  background: color-mix(in srgb, var(--color-success) 13%, var(--color-surface-raised));
+  box-shadow: 0 0 7px color-mix(in srgb, var(--color-success) 22%, transparent);
 }
 
 .collapsed-session-list .icon-button.activity-attention {
-  background: color-mix(in srgb, var(--color-warning) 9%, var(--color-surface-raised));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-warning) 36%, transparent);
+  border-color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 13%, var(--color-surface-raised));
+  box-shadow: 0 0 7px color-mix(in srgb, var(--color-warning) 24%, transparent);
 }
 
 .collapsed-session-list .icon-button.activity-error {
-  background: color-mix(in srgb, var(--color-danger) 9%, var(--color-surface-raised));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-danger) 36%, transparent);
+  border-color: var(--color-danger);
+  background: color-mix(in srgb, var(--color-danger) 13%, var(--color-surface-raised));
+  box-shadow: 0 0 7px color-mix(in srgb, var(--color-danger) 22%, transparent);
 }
 
 .collapsed-session-list .icon-button.selected-session-dot.activity-running {
-  background: color-mix(in srgb, var(--color-info) 9%, var(--color-surface-selected));
+  background: color-mix(in srgb, var(--color-info) 13%, var(--color-surface-selected));
 }
 
 .collapsed-session-list .icon-button.selected-session-dot.activity-completed {
-  background: color-mix(in srgb, var(--color-accent) 9%, var(--color-surface-selected));
+  background: color-mix(in srgb, var(--color-success) 13%, var(--color-surface-selected));
 }
 
 .collapsed-session-list .icon-button.selected-session-dot.activity-attention {
-  background: color-mix(in srgb, var(--color-warning) 9%, var(--color-surface-selected));
+  background: color-mix(in srgb, var(--color-warning) 13%, var(--color-surface-selected));
 }
 
 .collapsed-session-list .icon-button.selected-session-dot.activity-error {
-  background: color-mix(in srgb, var(--color-danger) 9%, var(--color-surface-selected));
+  background: color-mix(in srgb, var(--color-danger) 13%, var(--color-surface-selected));
 }
 
 .collapsed-session-list .session-visual.compact,
@@ -1082,44 +1082,76 @@ label {
 }
 
 .session-row.activity-running {
-  background: color-mix(in srgb, var(--color-info) 9%, var(--color-surface-raised));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-info) 34%, transparent);
-  animation: session-activity-row-breathe 2.2s ease-in-out infinite;
+  border-color: color-mix(in srgb, var(--color-info) 58%, var(--color-border-control));
+  background: color-mix(in srgb, var(--color-info) 13%, var(--color-surface-raised));
+  box-shadow: 0 0 8px color-mix(in srgb, var(--color-info) 20%, transparent);
 }
 
 .session-row.activity-completed {
-  background: color-mix(in srgb, var(--color-accent) 9%, var(--color-surface-raised));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 36%, transparent);
+  border-color: var(--color-success);
+  background: color-mix(in srgb, var(--color-success) 13%, var(--color-surface-raised));
+  box-shadow: 0 0 7px color-mix(in srgb, var(--color-success) 22%, transparent);
 }
 
 .session-row.activity-attention {
-  background: color-mix(in srgb, var(--color-warning) 9%, var(--color-surface-raised));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-warning) 36%, transparent);
+  border-color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 13%, var(--color-surface-raised));
+  box-shadow: 0 0 7px color-mix(in srgb, var(--color-warning) 24%, transparent);
 }
 
 .session-row.activity-error {
-  background: color-mix(in srgb, var(--color-danger) 9%, var(--color-surface-raised));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-danger) 36%, transparent);
+  border-color: var(--color-danger);
+  background: color-mix(in srgb, var(--color-danger) 13%, var(--color-surface-raised));
+  box-shadow: 0 0 7px color-mix(in srgb, var(--color-danger) 22%, transparent);
 }
 
 .session-row.selected.activity-running,
 .session-row.selected.has-new-output.activity-running {
-  background: color-mix(in srgb, var(--color-info) 9%, var(--color-surface-selected));
+  background: color-mix(in srgb, var(--color-info) 13%, var(--color-surface-selected));
 }
 
 .session-row.selected.activity-completed,
 .session-row.selected.has-new-output.activity-completed {
-  background: color-mix(in srgb, var(--color-accent) 9%, var(--color-surface-selected));
+  background: color-mix(in srgb, var(--color-success) 13%, var(--color-surface-selected));
 }
 
 .session-row.selected.activity-attention,
 .session-row.selected.has-new-output.activity-attention {
-  background: color-mix(in srgb, var(--color-warning) 9%, var(--color-surface-selected));
+  background: color-mix(in srgb, var(--color-warning) 13%, var(--color-surface-selected));
 }
 
 .session-row.selected.activity-error,
 .session-row.selected.has-new-output.activity-error {
-  background: color-mix(in srgb, var(--color-danger) 9%, var(--color-surface-selected));
+  background: color-mix(in srgb, var(--color-danger) 13%, var(--color-surface-selected));
+}
+
+.session-row.activity-running::before,
+.collapsed-session-list .icon-button.activity-running::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: 7px;
+  padding: 2px;
+  background: conic-gradient(
+    from var(--session-activity-angle),
+    transparent 0deg 270deg,
+    color-mix(in srgb, var(--color-info) 20%, transparent) 286deg,
+    var(--color-info) 310deg,
+    var(--color-info-soft) 324deg,
+    var(--color-info) 338deg,
+    transparent 356deg 360deg
+  );
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--color-info) 78%, transparent));
+  pointer-events: none;
+  animation: session-activity-border-spin 1.8s linear infinite;
 }
 
 .session-row.dragging {
@@ -1255,21 +1287,31 @@ label {
   object-fit: cover;
 }
 
-@keyframes session-activity-row-breathe {
-  0%,
-  100% {
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-info) 22%, transparent);
+@property --session-activity-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes session-activity-border-spin {
+  to {
+    --session-activity-angle: 360deg;
   }
-  50% {
-    box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--color-info) 48%, transparent);
+}
+
+@keyframes session-activity-icon-spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .session-row.activity-running,
-  .collapsed-session-list .icon-button.activity-running {
+  .session-row.activity-running::before,
+  .collapsed-session-list .icon-button.activity-running::before {
     animation: none;
+    background: var(--color-info);
   }
+
 }
 
 .session-open-button strong {
@@ -1283,6 +1325,57 @@ label {
 
 .session-main span {
   overflow-wrap: anywhere;
+}
+
+.session-row .session-activity-indicator {
+  min-width: 0;
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  line-height: 1.2;
+  font-weight: 600;
+}
+
+.session-activity-indicator svg {
+  flex: 0 0 auto;
+}
+
+.session-activity-indicator.activity-running svg {
+  transform-origin: center;
+  animation: session-activity-icon-spin 1.1s linear infinite;
+}
+
+.session-row .session-activity-indicator > span {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  font-size: inherit;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.session-activity-indicator.activity-running {
+  color: var(--color-info-soft);
+}
+
+.session-activity-indicator.activity-completed {
+  color: var(--color-success-soft);
+}
+
+.session-activity-indicator.activity-attention {
+  color: color-mix(in srgb, var(--color-warning) 72%, var(--color-text-strong));
+}
+
+.session-activity-indicator.activity-error {
+  color: var(--color-danger-text);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-activity-indicator.activity-running svg {
+    animation: none;
+  }
 }
 
 .session-actions {
@@ -2040,6 +2133,13 @@ label {
 .terminal-quick-keys-main .terminal-mobile-shortcut-button.modifier-shift {
   padding-inline: 0;
   font-size: 8px;
+}
+
+@media (max-width: 360px) {
+  .terminal-quick-keys-main {
+    gap: 2px;
+    padding-inline: 4px;
+  }
 }
 
 @media (min-width: 600px) {

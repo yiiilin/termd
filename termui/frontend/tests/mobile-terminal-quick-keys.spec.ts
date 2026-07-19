@@ -105,8 +105,8 @@ async function compactQuickKeysGeometry(quickKeys: Locator) {
         return rect.left >= mainRect.left - 1 && rect.right <= mainRect.right + 1;
       }),
       buttonContentFits: requiredButtons.every((button) => (
-        button.scrollWidth <= button.clientWidth + 1 &&
-        button.scrollHeight <= button.clientHeight + 1
+        button.scrollWidth <= button.clientWidth &&
+        button.scrollHeight <= button.clientHeight
       )),
     };
   });
