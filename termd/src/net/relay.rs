@@ -45,7 +45,14 @@ const MAX_METADATA_TIMESTAMP_MS: u64 = 9_007_199_254_740_991;
 // relay mux transport 失败只会断开当前 relay 连接并触发重连，不关闭持久 session/supervisor。
 // 公网 relay 往往还隔着 TLS 和反向代理，2s 级 deadline 容易把短暂抖动误判成断线。
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const RELAY_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const RELAY_DATA_CONNECT_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+const RELAY_DATA_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
+const RELAY_DATA_CONNECT_RETRY_DELAYS: &[Duration] = &[
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(10),
+];
 const RELAY_ROUTE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_SEND_DEADLINE: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
@@ -65,6 +72,19 @@ type RelayWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStr
 type RelaySender = futures_util::stream::SplitSink<RelayWs, Message>;
 type RelayReceiver = futures_util::stream::SplitStream<RelayWs>;
 type RelayDataTaskMap = HashMap<RelayClientId, JoinHandle<()>>;
+
+#[derive(Debug, Clone, Copy)]
+struct RelayDataConnectRetryPolicy {
+    total_timeout: Duration,
+    attempt_timeout: Duration,
+    retry_delays: &'static [Duration],
+}
+
+const RELAY_DATA_CONNECT_RETRY_POLICY: RelayDataConnectRetryPolicy = RelayDataConnectRetryPolicy {
+    total_timeout: RELAY_DATA_CONNECT_TOTAL_TIMEOUT,
+    attempt_timeout: RELAY_DATA_CONNECT_ATTEMPT_TIMEOUT,
+    retry_delays: RELAY_DATA_CONNECT_RETRY_DELAYS,
+};
 
 enum RelayEstablishedDataOutcome {
     SocketClosed,
@@ -862,16 +882,15 @@ async fn run_relay_data_connection(
 ) -> Result<(), RelayConnectorError> {
     let relay_endpoint = base.canonical_url();
     let url = base.daemon_mux_url(server_id);
-    let (sender, mut receiver) = connect_relay_route_socket_with_timeout(
+    let (sender, mut receiver) = connect_relay_data_route_socket_with_policy(
         &url,
         proxy.as_ref(),
         server_id,
-        ProtoRouteRole::DaemonData,
         daemon_admission_token.as_deref(),
-        Some(route_generation),
-        Some(client_id),
-        Some(data_token),
-        RELAY_DATA_CONNECT_TIMEOUT,
+        route_generation,
+        client_id,
+        data_token,
+        RELAY_DATA_CONNECT_RETRY_POLICY,
     )
     .await?;
     let outcome = match route_kind {
@@ -901,6 +920,80 @@ async fn run_relay_data_connection(
     };
     let _ = outcome;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_relay_data_route_socket_with_policy(
+    url: &str,
+    proxy: Option<&RelayProxyUrl>,
+    server_id: ServerId,
+    daemon_admission_token: Option<&str>,
+    route_generation: ProtoNonce,
+    client_id: RelayClientId,
+    data_token: ProtoNonce,
+    policy: RelayDataConnectRetryPolicy,
+) -> Result<(RelaySender, RelayReceiver), RelayConnectorError> {
+    let connect_deadline = Instant::now() + policy.total_timeout;
+    let mut attempt = 1_u64;
+    let mut retry_delays = policy.retry_delays.iter().copied();
+
+    loop {
+        let remaining = connect_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(RelayConnectorError::ConnectTimeout);
+        }
+        let attempt_deadline = (Instant::now() + policy.attempt_timeout).min(connect_deadline);
+        let attempt_timeout = attempt_deadline.saturating_duration_since(Instant::now());
+        let result = connect_relay_route_socket_with_deadline(
+            url,
+            proxy,
+            server_id,
+            ProtoRouteRole::DaemonData,
+            daemon_admission_token,
+            Some(route_generation.clone()),
+            Some(client_id),
+            Some(data_token.clone()),
+            attempt_deadline,
+            attempt_timeout,
+        )
+        .await;
+
+        match result {
+            Ok(socket) => return Ok(socket),
+            Err(error @ RelayConnectorError::ConnectTimeout) => {
+                let Some(retry_delay) = retry_delays.next() else {
+                    return Err(error);
+                };
+                let remaining = connect_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                // 中文注释：relay 的 pending 配对窗口优先于最后一档退避；如果完整等待
+                // 已经放不下，就跳过这次等待，用剩余窗口立刻发起最后一次建连。
+                let effective_delay = if retry_delay < remaining {
+                    retry_delay
+                } else {
+                    Duration::ZERO
+                };
+                warn!(
+                    layer = "termd",
+                    relay = relay_route_log_url(url),
+                    server_id = %server_id.0,
+                    client_id = client_id.0,
+                    attempt,
+                    retry_delay_ms = effective_delay.as_millis() as u64,
+                    configured_retry_delay_ms = retry_delay.as_millis() as u64,
+                    remaining_ms = remaining.as_millis() as u64,
+                    "relay daemon data pipe connect timed out; retrying after backoff"
+                );
+                if !effective_delay.is_zero() {
+                    tokio::time::sleep(effective_delay).await;
+                }
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn run_relay_http_data_connection(
@@ -1717,11 +1810,39 @@ async fn connect_relay_route_socket_with_timeout(
     data_token: Option<ProtoNonce>,
     connect_timeout: Duration,
 ) -> Result<(RelaySender, RelayReceiver), RelayConnectorError> {
+    connect_relay_route_socket_with_deadline(
+        url,
+        proxy,
+        server_id,
+        role,
+        daemon_admission_token,
+        route_generation,
+        client_id,
+        data_token,
+        Instant::now() + connect_timeout,
+        connect_timeout,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_relay_route_socket_with_deadline(
+    url: &str,
+    proxy: Option<&RelayProxyUrl>,
+    server_id: ServerId,
+    role: ProtoRouteRole,
+    daemon_admission_token: Option<&str>,
+    route_generation: Option<ProtoNonce>,
+    client_id: Option<RelayClientId>,
+    data_token: Option<ProtoNonce>,
+    connect_deadline: Instant,
+    connect_timeout: Duration,
+) -> Result<(RelaySender, RelayReceiver), RelayConnectorError> {
     let relay_log_url = relay_route_log_url(url);
     let emit_phase_logs = matches!(role, ProtoRouteRole::DaemonData);
     let mut progress = RelayRouteConnectProgress::new();
 
-    let (socket, _) = match connect_relay_websocket(url, proxy, connect_timeout).await {
+    let (socket, _) = match connect_relay_websocket(url, proxy, connect_deadline).await {
         Ok(socket) => socket,
         Err(error) => {
             if emit_phase_logs {
@@ -1761,6 +1882,7 @@ async fn connect_relay_route_socket_with_timeout(
         route_generation,
         client_id,
         data_token,
+        connect_deadline,
     )
     .await
     {
@@ -1791,7 +1913,15 @@ async fn connect_relay_route_socket_with_timeout(
         );
     }
     progress.mark_route_hello_sent();
-    if let Err(error) = read_route_ready(&mut sender, &mut receiver, server_id, role).await {
+    if let Err(error) = read_route_ready(
+        &mut sender,
+        &mut receiver,
+        server_id,
+        role,
+        connect_deadline,
+    )
+    .await
+    {
         if emit_phase_logs {
             warn!(
                 layer = "termd",
@@ -1821,6 +1951,7 @@ async fn connect_relay_route_socket_with_timeout(
     Ok((sender, receiver))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_route_hello(
     sender: &mut RelaySender,
     server_id: ServerId,
@@ -1829,6 +1960,7 @@ async fn send_route_hello(
     route_generation: Option<ProtoNonce>,
     client_id: Option<RelayClientId>,
     data_token: Option<ProtoNonce>,
+    connect_deadline: Instant,
 ) -> Result<(), RelayConnectorError> {
     let envelope = ProtoEnvelope::new(
         ProtoMessageType::RouteHello,
@@ -1848,7 +1980,8 @@ async fn send_route_hello(
         },
     );
     let raw = serde_json::to_string(&envelope).map_err(|_| RelayConnectorError::InvalidEnvelope)?;
-    send_relay_message_with_deadline(sender, Message::Text(raw), RELAY_SEND_DEADLINE).await
+    let send_deadline = (Instant::now() + RELAY_SEND_DEADLINE).min(connect_deadline);
+    send_relay_message_until_deadline(sender, Message::Text(raw), send_deadline).await
 }
 
 async fn read_route_ready(
@@ -1856,8 +1989,9 @@ async fn read_route_ready(
     receiver: &mut RelayReceiver,
     expected_server_id: ServerId,
     expected_role: ProtoRouteRole,
+    connect_deadline: Instant,
 ) -> Result<(), RelayConnectorError> {
-    let route_deadline = Instant::now() + RELAY_ROUTE_READY_TIMEOUT;
+    let route_deadline = (Instant::now() + RELAY_ROUTE_READY_TIMEOUT).min(connect_deadline);
     loop {
         let Some(message) = (match tokio::time::timeout_at(route_deadline, receiver.next()).await {
             Ok(message) => message,
@@ -1892,12 +2026,9 @@ async fn read_route_ready(
                 return Ok(());
             }
             Message::Ping(payload) => {
-                send_relay_message_with_deadline(
-                    sender,
-                    Message::Pong(payload),
-                    RELAY_PONG_DEADLINE,
-                )
-                .await?;
+                let pong_deadline = (Instant::now() + RELAY_PONG_DEADLINE).min(route_deadline);
+                send_relay_message_until_deadline(sender, Message::Pong(payload), pong_deadline)
+                    .await?;
             }
             Message::Pong(_) | Message::Frame(_) => {}
             Message::Close(_) => return Err(RelayConnectorError::ReceiveFailed),
@@ -1941,7 +2072,18 @@ async fn send_relay_message_with_deadline<S>(
 where
     S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    match timeout(deadline, sender.send(message)).await {
+    send_relay_message_until_deadline(sender, message, Instant::now() + deadline).await
+}
+
+async fn send_relay_message_until_deadline<S>(
+    sender: &mut S,
+    message: Message,
+    deadline: Instant,
+) -> Result<(), RelayConnectorError>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    match tokio::time::timeout_at(deadline, sender.send(message)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(RelayConnectorError::SendFailed),
         Err(_) => Err(RelayConnectorError::SendTimeout),
@@ -1968,7 +2110,7 @@ where
 async fn connect_relay_websocket(
     url: &str,
     proxy: Option<&RelayProxyUrl>,
-    connect_timeout: Duration,
+    connect_deadline: Instant,
 ) -> Result<
     (
         RelayWs,
@@ -1978,8 +2120,8 @@ async fn connect_relay_websocket(
 > {
     let tls_connector = relay_tls_connector();
     let Some(proxy) = proxy else {
-        return timeout(
-            connect_timeout,
+        return tokio::time::timeout_at(
+            connect_deadline,
             tokio_tungstenite::connect_async_tls_with_config(
                 url,
                 Some(relay_websocket_config()),
@@ -1993,13 +2135,13 @@ async fn connect_relay_websocket(
     };
 
     let target = relay_target_from_ws_url(url).ok_or(RelayConnectorError::UnsupportedUrl)?;
-    let stream = timeout(connect_timeout, connect_proxy_tunnel(proxy, &target))
+    let stream = tokio::time::timeout_at(connect_deadline, connect_proxy_tunnel(proxy, &target))
         .await
         .map_err(|_| RelayConnectorError::ConnectTimeout)?
         .map_err(|_| RelayConnectorError::ConnectFailed)?;
 
-    timeout(
-        connect_timeout,
+    tokio::time::timeout_at(
+        connect_deadline,
         tokio_tungstenite::client_async_tls_with_config(
             url,
             stream,
@@ -2319,6 +2461,144 @@ fn authority_contains_credentials(authority: &str) -> bool {
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn relay_data_connect_uses_configured_retry_backoff() {
+        assert_eq!(
+            RELAY_DATA_CONNECT_RETRY_DELAYS,
+            &[
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(3),
+                Duration::from_secs(10),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_data_connect_retries_timeout_before_route_hello() {
+        const TEST_RETRY_DELAYS: &[Duration] = &[Duration::from_millis(10)];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_id = ServerId::new();
+        let client_id = RelayClientId(41);
+        let route_generation = ProtoNonce("retry-route-generation".to_owned());
+        let data_token = ProtoNonce("retry-data-token".to_owned());
+        let expected_generation = route_generation.clone();
+        let expected_data_token = data_token.clone();
+        let relay_peer = tokio::spawn(async move {
+            let (stalled_stream, _) = listener.accept().await.unwrap();
+            let (retry_stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(retry_stream).await.unwrap();
+            let message = tokio::time::timeout(Duration::from_millis(500), socket.next())
+                .await
+                .expect("retried data socket should send route hello")
+                .expect("retried data socket should remain open")
+                .unwrap();
+            let raw = message.into_text().expect("route hello should be text");
+            let route_hello: ProtoEnvelope<ProtoRouteHelloPayload> =
+                serde_json::from_str(&raw).unwrap();
+            assert_eq!(route_hello.kind, ProtoMessageType::RouteHello);
+            assert_eq!(route_hello.payload.server_id, server_id);
+            assert_eq!(route_hello.payload.role, ProtoRouteRole::DaemonData);
+            assert_eq!(
+                route_hello.payload.route_generation,
+                Some(expected_generation)
+            );
+            assert_eq!(route_hello.payload.client_id, Some(client_id));
+            assert_eq!(route_hello.payload.data_token, Some(expected_data_token));
+
+            let route_ready = ProtoEnvelope::new(
+                ProtoMessageType::RouteReady,
+                ProtoRouteReadyPayload {
+                    server_id,
+                    role: ProtoRouteRole::DaemonData,
+                },
+            );
+            socket
+                .send(Message::Text(serde_json::to_string(&route_ready).unwrap()))
+                .await
+                .unwrap();
+            drop(stalled_stream);
+        });
+
+        let policy = RelayDataConnectRetryPolicy {
+            total_timeout: Duration::from_secs(1),
+            attempt_timeout: Duration::from_millis(100),
+            retry_delays: TEST_RETRY_DELAYS,
+        };
+        let (sender, receiver) = connect_relay_data_route_socket_with_policy(
+            &format!("ws://{addr}"),
+            None,
+            server_id,
+            None,
+            route_generation,
+            client_id,
+            data_token,
+            policy,
+        )
+        .await
+        .expect("second data websocket attempt should connect");
+
+        drop(sender);
+        drop(receiver);
+        relay_peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_data_connect_route_ready_respects_total_deadline_without_retry() {
+        const TEST_RETRY_DELAYS: &[Duration] = &[Duration::from_millis(10)];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_id = ServerId::new();
+        let client_id = RelayClientId(42);
+        let relay_peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            tokio::time::timeout(Duration::from_millis(500), socket.next())
+                .await
+                .expect("data socket should send route hello")
+                .expect("data socket should remain open")
+                .unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_err(),
+                "route_ready timeout must not retry the websocket"
+            );
+        });
+
+        let policy = RelayDataConnectRetryPolicy {
+            total_timeout: Duration::from_millis(200),
+            attempt_timeout: Duration::from_secs(1),
+            retry_delays: TEST_RETRY_DELAYS,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            connect_relay_data_route_socket_with_policy(
+                &format!("ws://{addr}"),
+                None,
+                server_id,
+                None,
+                ProtoNonce("route-ready-timeout-generation".to_owned()),
+                client_id,
+                ProtoNonce("route-ready-timeout-token".to_owned()),
+                policy,
+            ),
+        )
+        .await;
+
+        let error = match result {
+            Ok(Err(error)) => error,
+            Ok(Ok(_)) => panic!("stalled route_ready unexpectedly connected"),
+            Err(_) => panic!("stalled route_ready exceeded the total connect deadline"),
+        };
+        assert!(matches!(error, RelayConnectorError::RouteReadyTimeout));
+        relay_peer.await.unwrap();
+    }
 
     #[tokio::test]
     async fn relay_metadata_pong_echoes_client_timestamp() {
