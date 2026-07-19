@@ -372,6 +372,25 @@ function GitPanel({
   const { t } = useI18n();
   const worktrees = git?.worktrees ?? [];
   const graph = git?.graph ?? [];
+  const currentWorktree = worktrees.find((worktree) => worktree.is_current) ?? worktrees[0];
+  const repositoryPath = git?.repository_root ?? git?.cwd ?? "";
+  const repositoryName = repositoryPath ? lastPathSegment(repositoryPath) : t("git.repository");
+  const branchLabel = currentWorktree?.branch ?? currentWorktree?.head ?? t("git.detached");
+  const stagedCount = worktrees.reduce((count, worktree) => count + worktree.staged.length, 0);
+  const unstagedCount = worktrees.reduce((count, worktree) => count + worktree.unstaged.length, 0);
+  const commitCount = graph.filter((line) => line.includes("*")).length;
+  const hasChanges = stagedCount + unstagedCount > 0;
+  const hasError = Boolean(error || git?.error);
+  const statusTone = !attachedSessionId || hasError ? "muted" : loading && !git ? "loading" : hasChanges ? "dirty" : "clean";
+  const statusLabel = !attachedSessionId
+    ? t("files.detached")
+    : hasError
+      ? t("files.unavailable")
+      : loading && !git
+        ? t("files.loading")
+        : hasChanges
+          ? t("git.dirty")
+          : t("git.clean");
   const [filesCollapsed, setFilesCollapsed] = useState(false);
   const [graphCollapsed, setGraphCollapsed] = useState(false);
   const [changesPaneHeight, setChangesPaneHeight] = useState<number | undefined>();
@@ -445,6 +464,44 @@ function GitPanel({
       aria-label={t("app.git")}
       style={splitActive ? ({ "--git-changes-pane-height": `${changesPaneHeight}px` } as CSSProperties) : undefined}
     >
+      <header className="git-overview" aria-label={t("git.workspace")}>
+        <div className="git-overview-topline">
+          <div className="git-overview-identity">
+            <span className="git-overview-kicker">{t("git.workspace")}</span>
+            <strong className="git-overview-repository" title={repositoryPath}>
+              {repositoryName}
+            </strong>
+            <span className="git-overview-path" title={repositoryPath}>
+              {repositoryPath || t("git.repository")}
+            </span>
+          </div>
+          <div className={`git-overview-status git-overview-status-${statusTone}`} role="status">
+            <span className="git-status-dot" aria-hidden="true" />
+            <span>{statusLabel}</span>
+          </div>
+        </div>
+        <div className="git-overview-bottomline">
+          <div className="git-overview-branch" title={branchLabel}>
+            <GitBranch size={14} aria-hidden="true" />
+            <span>{currentWorktree?.head ? t("git.head") : branchLabel}</span>
+            {currentWorktree?.head ? <code title={currentWorktree.head}>{currentWorktree.head}</code> : null}
+          </div>
+          <div className="git-overview-metrics" aria-label={t("git.summary")}>
+            <GitMetric label={t("git.staged")} count={stagedCount} tone="staged" />
+            <GitMetric label={t("git.unstaged")} count={unstagedCount} tone="unstaged" />
+            <GitMetric label={t("git.commits")} count={commitCount} tone="commits" />
+          </div>
+          <button
+            type="button"
+            className="icon-button git-overview-refresh"
+            aria-label={t("git.refresh")}
+            disabled={!attachedSessionId || loading}
+            onClick={onRefresh}
+          >
+            <RefreshCw size={15} aria-hidden="true" />
+          </button>
+        </div>
+      </header>
       <section ref={statusPaneRef} className="git-status-pane" aria-label={t("git.status")}>
         <header className="git-section-header">
           <button
@@ -457,18 +514,7 @@ function GitPanel({
             {filesCollapsed ? <ChevronRight size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}
             <span>{t("git.changes")}</span>
           </button>
-          <span className="git-repo-label" title={git?.repository_root ?? git?.cwd ?? ""}>
-            {git?.repository_root ? lastPathSegment(git.repository_root) : t("git.repository")}
-          </span>
-          <button
-            type="button"
-            className="icon-button"
-            aria-label={t("git.refresh")}
-            disabled={!attachedSessionId || loading}
-            onClick={onRefresh}
-          >
-            <RefreshCw size={15} aria-hidden="true" />
-          </button>
+          <span className="git-section-count">{stagedCount + unstagedCount}</span>
         </header>
         {!filesCollapsed ? (
           <div className="git-section-body git-status-body" role="tree" aria-label={t("git.changesTree")}>
@@ -524,12 +570,22 @@ function GitPanel({
             {graphCollapsed ? <ChevronRight size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}
             <span>{t("git.graph")}</span>
           </button>
+          <span className="git-section-count">{commitCount}</span>
         </header>
         {!graphCollapsed ? (
           graph.length > 0 ? <GitGraph lines={graph} /> : <div className="files-empty">{t("git.noCommits")}</div>
         ) : null}
       </section>
     </div>
+  );
+}
+
+function GitMetric({ label, count, tone }: { label: string; count: number; tone: "staged" | "unstaged" | "commits" }) {
+  return (
+    <span className={`git-metric git-metric-${tone}`}>
+      <strong>{count}</strong>
+      <span>{label}</span>
+    </span>
   );
 }
 
@@ -568,7 +624,7 @@ function GitWorktree({
             {label}
           </span>
         </button>
-        <span className="git-worktree-floating-meta" aria-hidden="true">
+        <span className="git-worktree-floating-meta git-worktree-meta">
           {worktree.head ? <span className="git-worktree-head">{worktree.head}</span> : null}
           {worktree.is_current ? <span className="git-worktree-current">{t("git.cwd")}</span> : null}
         </span>
@@ -633,7 +689,10 @@ function GitChangeSection({
   const { t } = useI18n();
   return (
     <section className="git-change-section">
-      <h3>{title}</h3>
+      <h3>
+        <span>{title}</span>
+        <span className={`git-change-count git-change-count-${staged ? "staged" : "unstaged"}`}>{changes.length}</span>
+      </h3>
       {changes.length > 0 ? (
         <div className="git-change-list">
           {changes.map((change) => (
