@@ -206,6 +206,40 @@ describe("xterm renderer adapter", () => {
     }
   });
 
+  it("iPhone 英文软键盘的普通空格在 input 晚于 keyup 时只发送一次", async () => {
+    const restoreUserAgent = mockIosSafariUserAgent();
+    vi.resetModules();
+    const { createXtermRenderer } = await import("../components/terminal/xterm-renderer");
+    const renderer = createXtermRenderer({ terminalOptions: {} });
+
+    try {
+      const host = document.createElement("div");
+      renderer.terminal.open(host);
+      const textarea = renderer.terminal.textarea;
+      const onData = vi.fn();
+      renderer.terminal.onData(onData);
+
+      textarea!.value = "";
+      textarea!.dispatchEvent(imeKeyboardEvent("keydown", " ", 32));
+      textarea!.dispatchEvent(imeKeyboardEvent("keypress", " ", 32));
+      textarea!.dispatchEvent(imeKeyboardEvent("keyup", " ", 32));
+      textarea!.value = " ";
+      textarea!.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: " ",
+        inputType: "insertText",
+      }));
+
+      expect(onData).toHaveBeenCalledTimes(1);
+      expect(onData).toHaveBeenCalledWith(" ");
+    } finally {
+      renderer.terminal.dispose();
+      restoreUserAgent();
+      vi.resetModules();
+    }
+  });
+
   it("iPhone 大写英文的迟到 input 不重复 keypress 数据", async () => {
     const restoreUserAgent = mockIosSafariUserAgent();
     vi.resetModules();
