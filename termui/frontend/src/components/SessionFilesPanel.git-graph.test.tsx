@@ -1,11 +1,12 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import type { SessionGitResultPayload, UUID } from "../protocol/types";
+import type { SessionGitFileChangePayload, SessionGitResultPayload, UUID } from "../protocol/types";
 import { SessionFilesPanel } from "./SessionFilesPanel";
 
 const SESSION_ID = "00000000-0000-0000-0000-000000000701" as UUID;
 
-function renderGitGraph(graph: string[]) {
+function renderGitGraph(graph: string[], unstaged: SessionGitFileChangePayload[] = []) {
+  const onOpenGitDiff = vi.fn();
   const git: SessionGitResultPayload = {
     session_id: SESSION_ID,
     cwd: "/home/me/termd",
@@ -17,7 +18,7 @@ function renderGitGraph(graph: string[]) {
         head: "a1b2c3d",
         is_current: true,
         staged: [],
-        unstaged: [],
+        unstaged,
       },
     ],
     graph,
@@ -36,7 +37,7 @@ function renderGitGraph(graph: string[]) {
       onOpenDirectory={vi.fn()}
       onOpenFile={vi.fn()}
       onOpenGitFile={vi.fn()}
-      onOpenGitDiff={vi.fn()}
+      onOpenGitDiff={onOpenGitDiff}
       onGitAction={vi.fn()}
       onGoToPath={vi.fn()}
       onRefresh={vi.fn()}
@@ -48,6 +49,8 @@ function renderGitGraph(graph: string[]) {
       onHide={vi.fn()}
     />,
   );
+
+  return { git, onOpenGitDiff };
 }
 
 describe("SessionFilesPanel Git graph", () => {
@@ -66,5 +69,19 @@ describe("SessionFilesPanel Git graph", () => {
     expect(within(headRow!).getByText("origin/main")).toHaveClass("git-graph-ref-remote");
     expect(within(graph).getByText("v0.8.13")).toHaveClass("git-graph-ref-tag");
     expect(graph.querySelectorAll(".git-graph-row-connector")).toHaveLength(1);
+  });
+
+  it("点击变更文件行会打开 diff", () => {
+    const change = { path: "src/main.rs", status: " M" };
+    const { git, onOpenGitDiff } = renderGitGraph([], [change]);
+    const changeRow = screen.getByRole("treeitem", { name: "M src/main.rs" });
+
+    fireEvent.click(changeRow);
+
+    expect(onOpenGitDiff).toHaveBeenCalledWith(git.worktrees[0], change, false);
+
+    onOpenGitDiff.mockClear();
+    fireEvent.click(within(changeRow).getByRole("button", { name: "Diff src/main.rs" }));
+    expect(onOpenGitDiff).toHaveBeenCalledTimes(1);
   });
 });

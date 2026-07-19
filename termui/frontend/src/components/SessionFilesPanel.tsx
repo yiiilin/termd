@@ -700,7 +700,21 @@ function GitChangeSection({
               key={`${change.status}-${change.path}`}
               className="git-change-row"
               role="treeitem"
+              tabIndex={0}
               aria-label={`${change.status.trim() || change.status} ${change.path}`}
+              onClick={(event) => {
+                if ((event.target as HTMLElement).closest("button")) {
+                  return;
+                }
+                onOpenGitDiff(worktree, change, staged);
+              }}
+              onKeyDown={(event) => {
+                if (event.target !== event.currentTarget || (event.key !== "Enter" && event.key !== " ")) {
+                  return;
+                }
+                event.preventDefault();
+                onOpenGitDiff(worktree, change, staged);
+              }}
             >
               <span className="git-change-status">{change.status}</span>
               <span className="git-change-path" title={change.path}>
