@@ -275,6 +275,12 @@ vi.mock("@xterm/xterm", () => {
       textarea.addEventListener("keydown", (event) => {
         this.customKeyEventHandler?.(event);
       }, true);
+      textarea.addEventListener("keypress", (event) => {
+        if (this.customKeyEventHandler?.(event) === false || event.key.length !== 1) {
+          return;
+        }
+        this.dataListeners.forEach((listener) => listener(event.key));
+      }, true);
       textarea.addEventListener("keyup", (event) => {
         this.customKeyEventHandler?.(event);
       }, true);

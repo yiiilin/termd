@@ -18,7 +18,7 @@ function mockIosSafariUserAgent(): () => void {
   };
 }
 
-function imeKeyboardEvent(type: "keydown" | "keyup", key: string, keyCode: number): KeyboardEvent {
+function imeKeyboardEvent(type: "keydown" | "keypress" | "keyup", key: string, keyCode: number): KeyboardEvent {
   const event = new KeyboardEvent(type, {
     bubbles: true,
     cancelable: true,
@@ -26,6 +26,7 @@ function imeKeyboardEvent(type: "keydown" | "keyup", key: string, keyCode: numbe
     key,
   });
   Object.defineProperties(event, {
+    charCode: { value: type === "keypress" ? keyCode : 0 },
     keyCode: { value: keyCode },
     which: { value: keyCode },
   });
@@ -164,6 +165,40 @@ describe("xterm renderer adapter", () => {
 
       expect(onData).toHaveBeenCalledTimes(1);
       expect(onData).toHaveBeenCalledWith("\x7f。");
+    } finally {
+      renderer.terminal.dispose();
+      restoreUserAgent();
+      vi.resetModules();
+    }
+  });
+
+  it("iPhone 英文软键盘的 keypress 和 input 只发送一个空格", async () => {
+    const restoreUserAgent = mockIosSafariUserAgent();
+    vi.resetModules();
+    const { createXtermRenderer } = await import("../components/terminal/xterm-renderer");
+    const renderer = createXtermRenderer({ terminalOptions: {} });
+
+    try {
+      const host = document.createElement("div");
+      renderer.terminal.open(host);
+      const textarea = renderer.terminal.textarea;
+      const onData = vi.fn();
+      renderer.terminal.onData(onData);
+
+      textarea!.value = "";
+      textarea!.dispatchEvent(imeKeyboardEvent("keydown", " ", 229));
+      textarea!.dispatchEvent(imeKeyboardEvent("keypress", " ", 32));
+      textarea!.value = " ";
+      textarea!.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: " ",
+        inputType: "insertText",
+      }));
+      textarea!.dispatchEvent(imeKeyboardEvent("keyup", " ", 32));
+
+      expect(onData).toHaveBeenCalledTimes(1);
+      expect(onData).toHaveBeenCalledWith(" ");
     } finally {
       renderer.terminal.dispose();
       restoreUserAgent();

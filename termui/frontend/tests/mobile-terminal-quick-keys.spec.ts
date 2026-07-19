@@ -307,7 +307,7 @@ test("mobile terminal quick keys follow keyboard viewport in portrait and landsc
   }
 });
 
-test("iPhone Chinese IME punctuation rotation preserves replacement semantics", async ({ page }, testInfo) => {
+test("iPhone keyboard avoids duplicate spaces and preserves Chinese IME replacements", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-iphone-layout", "iPhone input event emulation only");
   test.setTimeout(60_000);
 
@@ -329,6 +329,39 @@ test("iPhone Chinese IME punctuation rotation preserves replacement semantics", 
     await page.getByRole("button", { name: "Pair" }).click();
     await expect.poll(() => page.locator(".terminal-host").getAttribute("data-termd-buffer"))
       .toContain("ios-ime-ready");
+
+    const englishSpaceBaseline = daemon.decryptedInputs.length;
+    await page.locator('.terminal-host textarea[aria-label="Terminal input"]').evaluate((textarea) => {
+      const input = textarea as HTMLTextAreaElement;
+      const spaceKey = (type: "keydown" | "keypress" | "keyup", keyCode: number) => {
+        const event = new KeyboardEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          code: "Space",
+          key: " ",
+        });
+        Object.defineProperties(event, {
+          charCode: { value: type === "keypress" ? 32 : 0 },
+          keyCode: { value: keyCode },
+          which: { value: keyCode },
+        });
+        return event;
+      };
+
+      input.value = "";
+      input.dispatchEvent(spaceKey("keydown", 229));
+      input.dispatchEvent(spaceKey("keypress", 32));
+      input.value = " ";
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: " ",
+        inputType: "insertText",
+      }));
+      input.dispatchEvent(spaceKey("keyup", 32));
+    });
+    await expect.poll(() => daemon.decryptedInputs.slice(englishSpaceBaseline).join(""))
+      .toBe(" ");
 
     const baseline = daemon.decryptedInputs.length;
     await page.locator('.terminal-host textarea[aria-label="Terminal input"]').evaluate(async (textarea) => {

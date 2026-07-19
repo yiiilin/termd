@@ -111,6 +111,9 @@ function installIosImeInputCompatibility(terminal: Terminal): () => void {
       pendingTextareaValue ??= textarea.value;
       return false;
     }
+    if (event.type === "keypress" && pendingTextareaValue !== undefined) {
+      return false;
+    }
     if (event.type === "keyup" && pendingTextareaValue !== undefined) {
       flushPendingInput();
       pendingTextareaValue = undefined;
