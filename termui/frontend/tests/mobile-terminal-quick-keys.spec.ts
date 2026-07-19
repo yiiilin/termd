@@ -363,6 +363,40 @@ test("iPhone keyboard avoids duplicate spaces and preserves Chinese IME replacem
     await expect.poll(() => daemon.decryptedInputs.slice(englishSpaceBaseline).join(""))
       .toBe(" ");
 
+    const uppercaseBaseline = daemon.decryptedInputs.length;
+    await page.locator('.terminal-host textarea[aria-label="Terminal input"]').evaluate((textarea) => {
+      const input = textarea as HTMLTextAreaElement;
+      const uppercaseKey = (type: "keydown" | "keypress" | "keyup") => {
+        const event = new KeyboardEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          code: "KeyA",
+          key: "A",
+          shiftKey: true,
+        });
+        Object.defineProperties(event, {
+          charCode: { value: type === "keypress" ? 65 : 0 },
+          keyCode: { value: 65 },
+          which: { value: 65 },
+        });
+        return event;
+      };
+
+      input.value = "";
+      input.dispatchEvent(uppercaseKey("keydown"));
+      input.dispatchEvent(uppercaseKey("keypress"));
+      input.dispatchEvent(uppercaseKey("keyup"));
+      input.value = "A";
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: "A",
+        inputType: "insertText",
+      }));
+    });
+    await expect.poll(() => daemon.decryptedInputs.slice(uppercaseBaseline).join(""))
+      .toBe("A");
+
     const baseline = daemon.decryptedInputs.length;
     await page.locator('.terminal-host textarea[aria-label="Terminal input"]').evaluate(async (textarea) => {
       const input = textarea as HTMLTextAreaElement;

@@ -206,6 +206,40 @@ describe("xterm renderer adapter", () => {
     }
   });
 
+  it("iPhone 大写英文的迟到 input 不重复 keypress 数据", async () => {
+    const restoreUserAgent = mockIosSafariUserAgent();
+    vi.resetModules();
+    const { createXtermRenderer } = await import("../components/terminal/xterm-renderer");
+    const renderer = createXtermRenderer({ terminalOptions: {} });
+
+    try {
+      const host = document.createElement("div");
+      renderer.terminal.open(host);
+      const textarea = renderer.terminal.textarea;
+      const onData = vi.fn();
+      renderer.terminal.onData(onData);
+
+      textarea!.value = "";
+      textarea!.dispatchEvent(imeKeyboardEvent("keydown", "A", 65));
+      textarea!.dispatchEvent(imeKeyboardEvent("keypress", "A", 65));
+      textarea!.dispatchEvent(imeKeyboardEvent("keyup", "A", 65));
+      textarea!.value = "A";
+      textarea!.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: "A",
+        inputType: "insertText",
+      }));
+
+      expect(onData).toHaveBeenCalledTimes(1);
+      expect(onData).toHaveBeenCalledWith("A");
+    } finally {
+      renderer.terminal.dispose();
+      restoreUserAgent();
+      vi.resetModules();
+    }
+  });
+
   it("iPhone 中文 IME 双空格转换按删除和插入顺序发送句号", async () => {
     const restoreUserAgent = mockIosSafariUserAgent();
     vi.resetModules();

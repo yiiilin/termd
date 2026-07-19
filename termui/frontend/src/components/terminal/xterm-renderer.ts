@@ -111,6 +111,19 @@ function installIosImeInputCompatibility(terminal: Terminal): () => void {
       pendingTextareaValue ??= textarea.value;
       return false;
     }
+    if (
+      event.type === "keydown" &&
+      event.key.length === 1 &&
+      event.key >= "A" &&
+      event.key <= "Z" &&
+      !event.altKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !isComposing
+    ) {
+      pendingTextareaValue ??= textarea.value;
+      return true;
+    }
     if (event.type === "keypress" && pendingTextareaValue !== undefined) {
       return false;
     }
