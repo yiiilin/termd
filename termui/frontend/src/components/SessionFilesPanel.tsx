@@ -768,8 +768,16 @@ function GitGraph({ lines }: { lines: string[] }) {
     <div className="git-graph-lines" aria-label={t("git.commits")}>
       {lines.map((line, index) => {
         const parsed = parseGitGraphLine(line);
+        const commit = parsed.commit ? parseGitCommitText(parsed.commit) : undefined;
+        const rowClassName = [
+          "git-graph-row",
+          commit ? "git-graph-row-commit" : "git-graph-row-connector",
+          commit?.isHead ? "git-graph-row-head" : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
         return (
-          <div key={`${index}-${line}`} className="git-graph-row">
+          <div key={`${index}-${line}`} className={rowClassName}>
             <div className="git-graph-lanes" aria-hidden="true">
               {parsed.lanes.map((lane, laneIndex) => (
                 <span
@@ -779,7 +787,7 @@ function GitGraph({ lines }: { lines: string[] }) {
                 />
               ))}
             </div>
-            {parsed.commit ? <GitGraphCommit commit={parsed.commit} /> : null}
+            {commit ? <GitGraphCommit commit={commit} rawCommit={parsed.commit} /> : null}
           </div>
         );
       })}
@@ -787,15 +795,35 @@ function GitGraph({ lines }: { lines: string[] }) {
   );
 }
 
-function GitGraphCommit({ commit }: { commit: string }) {
-  const parsed = parseGitCommitText(commit);
+type GitGraphRefTone = "head" | "branch" | "remote" | "tag";
 
+interface GitGraphRef {
+  label: string;
+  tone: GitGraphRefTone;
+}
+
+interface GitGraphCommitText {
+  hash: string;
+  message: string;
+  refs: GitGraphRef[];
+  isHead: boolean;
+}
+
+function GitGraphCommit({ commit, rawCommit }: { commit: GitGraphCommitText; rawCommit: string }) {
   return (
-    <span className="git-graph-commit" title={commit}>
-      {parsed.hash ? <span className="git-graph-hash">{parsed.hash}</span> : null}
-      <span className="git-graph-message">{parsed.message}</span>
-      {parsed.ref ? <span className="git-graph-ref">{parsed.ref}</span> : null}
-    </span>
+    <div className={`git-graph-commit${commit.isHead ? " git-graph-commit-head" : ""}`} title={rawCommit}>
+      {commit.hash ? <span className="git-graph-hash">{commit.hash}</span> : null}
+      {commit.message ? <span className="git-graph-message">{commit.message}</span> : null}
+      {commit.refs.length > 0 ? (
+        <span className="git-graph-refs" title={commit.refs.map((ref) => ref.label).join(", ")}>
+          {commit.refs.map((ref) => (
+            <span key={`${ref.tone}-${ref.label}`} className={`git-graph-ref git-graph-ref-${ref.tone}`}>
+              {ref.label}
+            </span>
+          ))}
+        </span>
+      ) : null}
+    </div>
   );
 }
 
@@ -874,14 +902,45 @@ function parseGitGraphLine(line: string): { lanes: string[]; commit: string } {
   };
 }
 
-function parseGitCommitText(commit: string): { hash: string; message: string; ref?: string } {
+function parseGitCommitText(commit: string): GitGraphCommitText {
   const [hash = "", ...rest] = commit.split(/\s+/);
   const text = rest.join(" ").trim();
   const refMatch = text.match(/^\(([^)]+)\)\s*(.*)$/);
   if (refMatch) {
-    return { hash, ref: refMatch[1], message: refMatch[2] || text };
+    const refs = parseGitGraphRefs(refMatch[1]);
+    return { hash, refs, isHead: refs.some((ref) => ref.tone === "head"), message: refMatch[2] || text };
   }
-  return { hash, message: text || commit };
+  return { hash, refs: [], isHead: false, message: text || commit };
+}
+
+function parseGitGraphRefs(refText: string): GitGraphRef[] {
+  return refText
+    .split(",")
+    .map((ref) => ref.trim())
+    .filter(Boolean)
+    .flatMap((ref) => {
+      const headTarget = ref.match(/^HEAD\s*->\s*(.+)$/);
+      if (headTarget) {
+        return [
+          { label: "HEAD", tone: "head" as const },
+          { label: headTarget[1], tone: gitGraphRefTone(headTarget[1]) },
+        ];
+      }
+      if (ref === "HEAD") {
+        return [{ label: ref, tone: "head" as const }];
+      }
+      if (ref.startsWith("tag: ")) {
+        return [{ label: ref.slice(5), tone: "tag" as const }];
+      }
+      return [{ label: ref, tone: gitGraphRefTone(ref) }];
+    });
+}
+
+function gitGraphRefTone(ref: string): GitGraphRefTone {
+  if (/^(origin|upstream|remote)\//.test(ref)) {
+    return "remote";
+  }
+  return "branch";
 }
 
 function gitGraphLaneClass(lane: string): string {
