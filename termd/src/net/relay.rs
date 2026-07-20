@@ -74,10 +74,12 @@ type RelayDataTaskMap = HashMap<RelayClientId, JoinHandle<()>>;
 #[derive(Debug, Clone, Copy)]
 struct RelayDataConnectRetryPolicy {
     attempt_timeouts: &'static [Duration],
+    route_ready_timeout: Duration,
 }
 
 const RELAY_DATA_CONNECT_RETRY_POLICY: RelayDataConnectRetryPolicy = RelayDataConnectRetryPolicy {
     attempt_timeouts: RELAY_DATA_CONNECT_ATTEMPT_TIMEOUTS,
+    route_ready_timeout: RELAY_ROUTE_READY_TIMEOUT,
 };
 
 enum RelayEstablishedDataOutcome {
@@ -940,6 +942,7 @@ async fn connect_relay_data_route_socket_with_policy(
             Some(data_token.clone()),
             attempt_deadline,
             attempt_timeout,
+            Some(policy.route_ready_timeout),
         )
         .await;
 
@@ -1794,6 +1797,7 @@ async fn connect_relay_route_socket_with_timeout(
         data_token,
         Instant::now() + connect_timeout,
         connect_timeout,
+        None,
     )
     .await
 }
@@ -1810,6 +1814,7 @@ async fn connect_relay_route_socket_with_deadline(
     data_token: Option<ProtoNonce>,
     connect_deadline: Instant,
     connect_timeout: Duration,
+    independent_route_ready_timeout: Option<Duration>,
 ) -> Result<(RelaySender, RelayReceiver), RelayConnectorError> {
     let relay_log_url = relay_route_log_url(url);
     let emit_phase_logs = matches!(role, ProtoRouteRole::DaemonData);
@@ -1847,6 +1852,9 @@ async fn connect_relay_route_socket_with_deadline(
     }
     progress.mark_tcp_connected();
     let (mut sender, mut receiver) = socket.split();
+    let route_hello_deadline = independent_route_ready_timeout
+        .map(|_| Instant::now() + RELAY_SEND_DEADLINE)
+        .unwrap_or(connect_deadline);
     if let Err(error) = send_route_hello(
         &mut sender,
         server_id,
@@ -1855,7 +1863,7 @@ async fn connect_relay_route_socket_with_deadline(
         route_generation,
         client_id,
         data_token,
-        connect_deadline,
+        route_hello_deadline,
     )
     .await
     {
@@ -1886,12 +1894,15 @@ async fn connect_relay_route_socket_with_deadline(
         );
     }
     progress.mark_route_hello_sent();
+    let route_ready_deadline = independent_route_ready_timeout
+        .map(|timeout| Instant::now() + timeout)
+        .unwrap_or(connect_deadline);
     if let Err(error) = read_route_ready(
         &mut sender,
         &mut receiver,
         server_id,
         role,
-        connect_deadline,
+        route_ready_deadline,
     )
     .await
     {
@@ -2446,6 +2457,10 @@ mod tests {
                 Duration::from_secs(10),
             ]
         );
+        assert_eq!(
+            RELAY_DATA_CONNECT_RETRY_POLICY.route_ready_timeout,
+            RELAY_ROUTE_READY_TIMEOUT
+        );
     }
 
     #[tokio::test]
@@ -2499,6 +2514,7 @@ mod tests {
 
         let policy = RelayDataConnectRetryPolicy {
             attempt_timeouts: TEST_ATTEMPT_TIMEOUTS,
+            route_ready_timeout: Duration::from_millis(500),
         };
         let (sender, receiver) = connect_relay_data_route_socket_with_policy(
             &format!("ws://{addr}"),
@@ -2512,6 +2528,59 @@ mod tests {
         )
         .await
         .expect("second data websocket attempt should connect");
+
+        drop(sender);
+        drop(receiver);
+        relay_peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_data_connect_route_ready_uses_independent_timeout() {
+        const TEST_ATTEMPT_TIMEOUTS: &[Duration] = &[Duration::from_millis(300)];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_id = ServerId::new();
+        let client_id = RelayClientId(42);
+        let relay_peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            tokio::time::timeout(Duration::from_millis(300), socket.next())
+                .await
+                .expect("data socket should send route hello")
+                .expect("data socket should remain open")
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(450)).await;
+            let route_ready = ProtoEnvelope::new(
+                ProtoMessageType::RouteReady,
+                ProtoRouteReadyPayload {
+                    server_id,
+                    role: ProtoRouteRole::DaemonData,
+                },
+            );
+            socket
+                .send(Message::Text(serde_json::to_string(&route_ready).unwrap()))
+                .await
+                .unwrap();
+        });
+
+        let policy = RelayDataConnectRetryPolicy {
+            attempt_timeouts: TEST_ATTEMPT_TIMEOUTS,
+            route_ready_timeout: Duration::from_secs(1),
+        };
+        let (sender, receiver) = connect_relay_data_route_socket_with_policy(
+            &format!("ws://{addr}"),
+            None,
+            server_id,
+            None,
+            ProtoNonce("independent-route-ready-generation".to_owned()),
+            client_id,
+            ProtoNonce("independent-route-ready-token".to_owned()),
+            policy,
+        )
+        .await
+        .expect("route_ready may arrive after the websocket connect timeout");
 
         drop(sender);
         drop(receiver);
@@ -2546,6 +2615,7 @@ mod tests {
 
         let policy = RelayDataConnectRetryPolicy {
             attempt_timeouts: TEST_ATTEMPT_TIMEOUTS,
+            route_ready_timeout: Duration::from_millis(200),
         };
         let result = tokio::time::timeout(
             Duration::from_secs(1),
@@ -2565,7 +2635,7 @@ mod tests {
         let error = match result {
             Ok(Err(error)) => error,
             Ok(Ok(_)) => panic!("stalled route_ready unexpectedly connected"),
-            Err(_) => panic!("stalled route_ready exceeded the first attempt deadline"),
+            Err(_) => panic!("stalled route_ready exceeded its independent timeout"),
         };
         assert!(matches!(error, RelayConnectorError::RouteReadyTimeout));
         relay_peer.await.unwrap();
