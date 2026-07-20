@@ -45,9 +45,7 @@ const MAX_METADATA_TIMESTAMP_MS: u64 = 9_007_199_254_740_991;
 // relay mux transport 失败只会断开当前 relay 连接并触发重连，不关闭持久 session/supervisor。
 // 公网 relay 往往还隔着 TLS 和反向代理，2s 级 deadline 容易把短暂抖动误判成断线。
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const RELAY_DATA_CONNECT_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
-const RELAY_DATA_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
-const RELAY_DATA_CONNECT_RETRY_DELAYS: &[Duration] = &[
+const RELAY_DATA_CONNECT_ATTEMPT_TIMEOUTS: &[Duration] = &[
     Duration::from_millis(500),
     Duration::from_secs(1),
     Duration::from_secs(3),
@@ -75,15 +73,11 @@ type RelayDataTaskMap = HashMap<RelayClientId, JoinHandle<()>>;
 
 #[derive(Debug, Clone, Copy)]
 struct RelayDataConnectRetryPolicy {
-    total_timeout: Duration,
-    attempt_timeout: Duration,
-    retry_delays: &'static [Duration],
+    attempt_timeouts: &'static [Duration],
 }
 
 const RELAY_DATA_CONNECT_RETRY_POLICY: RelayDataConnectRetryPolicy = RelayDataConnectRetryPolicy {
-    total_timeout: RELAY_DATA_CONNECT_TOTAL_TIMEOUT,
-    attempt_timeout: RELAY_DATA_CONNECT_ATTEMPT_TIMEOUT,
-    retry_delays: RELAY_DATA_CONNECT_RETRY_DELAYS,
+    attempt_timeouts: RELAY_DATA_CONNECT_ATTEMPT_TIMEOUTS,
 };
 
 enum RelayEstablishedDataOutcome {
@@ -933,17 +927,8 @@ async fn connect_relay_data_route_socket_with_policy(
     data_token: ProtoNonce,
     policy: RelayDataConnectRetryPolicy,
 ) -> Result<(RelaySender, RelayReceiver), RelayConnectorError> {
-    let connect_deadline = Instant::now() + policy.total_timeout;
-    let mut attempt = 1_u64;
-    let mut retry_delays = policy.retry_delays.iter().copied();
-
-    loop {
-        let remaining = connect_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(RelayConnectorError::ConnectTimeout);
-        }
-        let attempt_deadline = (Instant::now() + policy.attempt_timeout).min(connect_deadline);
-        let attempt_timeout = attempt_deadline.saturating_duration_since(Instant::now());
+    for (attempt_index, attempt_timeout) in policy.attempt_timeouts.iter().copied().enumerate() {
+        let attempt_deadline = Instant::now() + attempt_timeout;
         let result = connect_relay_route_socket_with_deadline(
             url,
             proxy,
@@ -961,39 +946,27 @@ async fn connect_relay_data_route_socket_with_policy(
         match result {
             Ok(socket) => return Ok(socket),
             Err(error @ RelayConnectorError::ConnectTimeout) => {
-                let Some(retry_delay) = retry_delays.next() else {
+                let Some(next_attempt_timeout) = policy.attempt_timeouts.get(attempt_index + 1)
+                else {
                     return Err(error);
-                };
-                let remaining = connect_deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(error);
-                }
-                // 中文注释：relay 的 pending 配对窗口优先于最后一档退避；如果完整等待
-                // 已经放不下，就跳过这次等待，用剩余窗口立刻发起最后一次建连。
-                let effective_delay = if retry_delay < remaining {
-                    retry_delay
-                } else {
-                    Duration::ZERO
                 };
                 warn!(
                     layer = "termd",
                     relay = relay_route_log_url(url),
                     server_id = %server_id.0,
                     client_id = client_id.0,
-                    attempt,
-                    retry_delay_ms = effective_delay.as_millis() as u64,
-                    configured_retry_delay_ms = retry_delay.as_millis() as u64,
-                    remaining_ms = remaining.as_millis() as u64,
-                    "relay daemon data pipe connect timed out; retrying after backoff"
+                    attempt = attempt_index + 1,
+                    attempt_timeout_ms = attempt_timeout.as_millis() as u64,
+                    next_attempt = attempt_index + 2,
+                    next_attempt_timeout_ms = next_attempt_timeout.as_millis() as u64,
+                    "relay daemon data pipe connect timed out; retrying immediately with longer timeout"
                 );
-                if !effective_delay.is_zero() {
-                    tokio::time::sleep(effective_delay).await;
-                }
-                attempt += 1;
             }
             Err(error) => return Err(error),
         }
     }
+
+    Err(RelayConnectorError::ConnectTimeout)
 }
 
 async fn run_relay_http_data_connection(
@@ -2463,9 +2436,9 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
-    fn relay_data_connect_uses_configured_retry_backoff() {
+    fn relay_data_connect_uses_configured_attempt_timeouts() {
         assert_eq!(
-            RELAY_DATA_CONNECT_RETRY_DELAYS,
+            RELAY_DATA_CONNECT_ATTEMPT_TIMEOUTS,
             &[
                 Duration::from_millis(500),
                 Duration::from_secs(1),
@@ -2477,7 +2450,8 @@ mod tests {
 
     #[tokio::test]
     async fn relay_data_connect_retries_timeout_before_route_hello() {
-        const TEST_RETRY_DELAYS: &[Duration] = &[Duration::from_millis(10)];
+        const TEST_ATTEMPT_TIMEOUTS: &[Duration] =
+            &[Duration::from_millis(100), Duration::from_millis(500)];
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2524,9 +2498,7 @@ mod tests {
         });
 
         let policy = RelayDataConnectRetryPolicy {
-            total_timeout: Duration::from_secs(1),
-            attempt_timeout: Duration::from_millis(100),
-            retry_delays: TEST_RETRY_DELAYS,
+            attempt_timeouts: TEST_ATTEMPT_TIMEOUTS,
         };
         let (sender, receiver) = connect_relay_data_route_socket_with_policy(
             &format!("ws://{addr}"),
@@ -2547,8 +2519,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_data_connect_route_ready_respects_total_deadline_without_retry() {
-        const TEST_RETRY_DELAYS: &[Duration] = &[Duration::from_millis(10)];
+    async fn relay_data_connect_route_ready_timeout_does_not_retry() {
+        const TEST_ATTEMPT_TIMEOUTS: &[Duration] =
+            &[Duration::from_millis(200), Duration::from_millis(500)];
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2572,9 +2545,7 @@ mod tests {
         });
 
         let policy = RelayDataConnectRetryPolicy {
-            total_timeout: Duration::from_millis(200),
-            attempt_timeout: Duration::from_secs(1),
-            retry_delays: TEST_RETRY_DELAYS,
+            attempt_timeouts: TEST_ATTEMPT_TIMEOUTS,
         };
         let result = tokio::time::timeout(
             Duration::from_secs(1),
@@ -2594,7 +2565,7 @@ mod tests {
         let error = match result {
             Ok(Err(error)) => error,
             Ok(Ok(_)) => panic!("stalled route_ready unexpectedly connected"),
-            Err(_) => panic!("stalled route_ready exceeded the total connect deadline"),
+            Err(_) => panic!("stalled route_ready exceeded the first attempt deadline"),
         };
         assert!(matches!(error, RelayConnectorError::RouteReadyTimeout));
         relay_peer.await.unwrap();
