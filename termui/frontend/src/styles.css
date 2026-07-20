@@ -1512,7 +1512,7 @@ label {
   padding: 0 14px;
   color: var(--color-text-toolbar);
   font-size: 12px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .toolbar-title {

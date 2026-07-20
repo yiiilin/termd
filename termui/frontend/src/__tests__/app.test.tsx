@@ -7306,6 +7306,11 @@ describe("termui web 工作台", () => {
     await within(clientPanel).findByText("Review agent");
     expect(within(clientPanel).queryByText("198.51.100.9")).toBeNull();
     expect(within(clientPanel).queryByText("offline")).toBeNull();
+
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const toolbarRule = Array.from(css.matchAll(/(?:^|\n)\.toolbar \{([^}]*)\}/g), (match) => match[1])
+      .find((rule) => rule.includes("min-width: 0;"));
+    expect(toolbarRule).toContain("overflow: visible;");
   });
 
   it("Session 卡片点击即打开，标题行保留管理按钮", async () => {
