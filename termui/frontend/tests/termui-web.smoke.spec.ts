@@ -590,13 +590,15 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     expect(progressPopoverBox!.y).toBeGreaterThanOrEqual(progressButtonBox!.y + progressButtonBox!.height + 4);
     if (testInfo.project.name === "chromium") {
       await page.setViewportSize({ width: 820, height: 768 });
-      const narrowTerminalBox = await terminalPane.boundingBox();
-      const narrowPopoverBox = await openProgressPopover.boundingBox();
-      expect(narrowTerminalBox).not.toBeNull();
-      expect(narrowPopoverBox).not.toBeNull();
-      expect(narrowPopoverBox!.x).toBeGreaterThanOrEqual(narrowTerminalBox!.x);
-      expect(narrowPopoverBox!.x + narrowPopoverBox!.width)
-        .toBeLessThanOrEqual(narrowTerminalBox!.x + narrowTerminalBox!.width);
+      await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Show files panel" })).toBeVisible();
+      await expect.poll(() => terminalPane.evaluate((pane) => {
+        const popover = pane.querySelector<HTMLElement>('[data-testid="terminal-open-progress"]');
+        if (!popover) return false;
+        const terminalRect = pane.getBoundingClientRect();
+        const popoverRect = popover.getBoundingClientRect();
+        return popoverRect.left >= terminalRect.left && popoverRect.right <= terminalRect.right;
+      })).toBe(true);
       await page.screenshot({ path: "test-results/session-open-progress-narrow-desktop.png", fullPage: true });
       await page.setViewportSize({ width: 1366, height: 768 });
     }
@@ -636,7 +638,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       await page.waitForTimeout(250);
       expect(sessionListRequests()).toBe(beforeTitlePull);
       expect(daemon.v070MetadataConnections).toBe(beforeMetadataConnections);
-      await expect(page.getByRole("region", { name: "sessions panel" })).toBeHidden();
+      await expect(page.getByRole("dialog", { name: "sessions panel" })).toBeHidden();
 
       const menu = await openMobileMenu(page);
       await expect(menu.getByRole("button", { name: "Daemons" })).toBeVisible();
@@ -652,7 +654,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
 
       const reopenedMenu = await openMobileMenu(page);
       await reopenedMenu.getByRole("button", { name: "Sessions" }).click();
-      await expect(page.getByRole("region", { name: "sessions panel" })).toBeVisible();
+      await expect(page.getByRole("dialog", { name: "sessions panel" })).toBeVisible();
       await activateButton(page, "Refresh sessions");
 
       // 回归断言：移动端顶部入口必须留在左侧，避免刷新后被布局规则顶到右边。
@@ -843,7 +845,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       await expect
         .poll(async () => (await terminalPane.boundingBox())?.height ?? 0)
         .toBeGreaterThan(280);
-      await expect(page.getByRole("region", { name: "sessions panel" })).toBeHidden();
+      await expect(page.getByRole("dialog", { name: "sessions panel" })).toBeHidden();
       const menu = await openMobileMenu(page);
       const files = menu.getByRole("button", { name: "Files" });
       await expect(files).toBeEnabled();

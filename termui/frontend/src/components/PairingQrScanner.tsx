@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, ImageUp, X } from "lucide-react";
 import QrScanner from "qr-scanner";
 import { useI18n } from "../i18n";
+import { useModalFocus } from "./useModalFocus";
 
 interface PairingQrScannerProps {
   onDetected: (value: string) => void;
@@ -10,21 +11,32 @@ interface PairingQrScannerProps {
 
 export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps) {
   const { t } = useI18n();
+  const dialogRef = useModalFocus<HTMLElement>({ open: true, onClose });
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const scannerRef = useRef<QrScanner | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const activeRef = useRef(true);
+  const detectedRef = useRef(false);
   const [status, setStatus] = useState(t("qr.startingCamera"));
   const [error, setError] = useState<string | undefined>();
   const [manualInvite, setManualInvite] = useState("");
 
   const stopAndDetect = useCallback((value: string) => {
     const trimmed = value.trim();
-    if (!trimmed) {
+    if (!trimmed || !activeRef.current || detectedRef.current) {
       return;
     }
+    detectedRef.current = true;
     scannerRef.current?.stop();
     onDetected(trimmed);
   }, [onDetected]);
+
+  useEffect(() => {
+    activeRef.current = true;
+    return () => {
+      activeRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -139,8 +151,10 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
       });
       stopAndDetect(result.data);
     } catch {
-      setError(t("qr.noQrInImage"));
-      setStatus(t("qr.scanning"));
+      if (activeRef.current && !detectedRef.current) {
+        setError(t("qr.noQrInImage"));
+        setStatus(t("qr.scanning"));
+      }
     } finally {
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
@@ -153,8 +167,16 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
   }, [t]);
 
   return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="qr-scanner-dialog" role="dialog" aria-modal="true" aria-label={t("qr.scanPairing")}>
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
+      <section ref={dialogRef} className="qr-scanner-dialog" role="dialog" aria-modal="true" aria-label={t("qr.scanPairing")}>
         <header className="qr-scanner-header">
           <div className="qr-scanner-title">
             <Camera size={16} aria-hidden="true" />
@@ -191,6 +213,7 @@ export function PairingQrScanner({ onDetected, onClose }: PairingQrScannerProps)
               type="file"
               accept="image/*"
               aria-label={t("qr.uploadQrImage")}
+              tabIndex={-1}
               onChange={(event) => void handleImageUpload(event.currentTarget.files?.[0])}
             />
           </div>

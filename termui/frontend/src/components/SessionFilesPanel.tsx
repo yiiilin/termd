@@ -6,6 +6,7 @@ import type {
 } from "react";
 import {
   ArrowUp,
+  CircleAlert,
   ChevronDown,
   ChevronRight,
   Download,
@@ -21,6 +22,7 @@ import {
   Trash2,
   Undo2,
   Upload,
+  X,
 } from "lucide-react";
 import type {
   SafeError,
@@ -32,7 +34,7 @@ import type {
   SessionGitWorktreePayload,
   UUID,
 } from "../protocol/types";
-import { useI18n, type Translate } from "../i18n";
+import { translateSafeErrorMessage, useI18n, type Translate } from "../i18n";
 
 const GIT_SPLIT_MIN_PANE_HEIGHT = 24;
 const GIT_SPLIT_FALLBACK_PANEL_HEIGHT = 360;
@@ -73,6 +75,8 @@ interface SessionFilesPanelProps {
   onGoToPath: (path: string) => void;
   onRefresh: () => void;
   onRefreshGit: () => void;
+  onDismissError: () => void;
+  onDismissGitError: () => void;
   onFollowTerminalCwdChange: (follow: boolean) => void;
   onUpload: (file: globalThis.File) => void;
   onDownload: (entry: SessionFileEntryPayload) => void;
@@ -103,6 +107,8 @@ export function SessionFilesPanel({
   onGoToPath,
   onRefresh,
   onRefreshGit,
+  onDismissError,
+  onDismissGitError,
   onFollowTerminalCwdChange,
   onUpload,
   onDownload,
@@ -114,7 +120,7 @@ export function SessionFilesPanel({
   const { t } = useI18n();
   const entries = files?.entries ?? [];
   const currentPath = files?.path ?? "";
-  const hasCachedEntries = entries.length > 0;
+  const hasCachedFiles = files !== undefined;
   const transferProgress = uploadProgress
     ? { ...uploadProgress, label: t(uploadProgress.phase === "committing" ? "files.uploadCommitting" : "files.uploadProgress", { name: uploadProgress.name }) }
     : downloadProgress
@@ -194,7 +200,7 @@ export function SessionFilesPanel({
         </button>
       </header>
       {activeTab === "files" ? (
-        <div className="files-tab-body" role="tabpanel" aria-label={t("app.files")}>
+        <div className="files-tab-body" role="tabpanel" aria-label={t("app.files")} aria-busy={loading}>
           <div className="files-toolbar">
             <button
               type="button"
@@ -263,23 +269,33 @@ export function SessionFilesPanel({
               }}
             />
           </div>
+          {attachedSessionId && error ? (
+            <SessionPanelErrorAlert
+              error={error}
+              label={t("files.errorAlert")}
+              dismissLabel={t("files.dismissError")}
+              loading={loading}
+              onRetry={onRefresh}
+              onDismiss={onDismissError}
+            />
+          ) : null}
           <div className="files-list">
             {!attachedSessionId ? <div className="files-empty">{t("files.detached")}</div> : null}
-            {attachedSessionId && loading && !hasCachedEntries ? (
+            {attachedSessionId && loading && !hasCachedFiles ? (
               <div className="files-empty">
                 <RefreshCw size={14} aria-hidden="true" />
                 {t("files.loading")}
               </div>
             ) : null}
-            {attachedSessionId && !loading && error ? <div className="files-empty">{t("files.unavailable")}</div> : null}
-            {attachedSessionId && !loading && !error && entries.length === 0 ? (
+            {attachedSessionId && !loading && error && !hasCachedFiles ? <div className="files-empty">{t("files.unavailable")}</div> : null}
+            {attachedSessionId && hasCachedFiles && entries.length === 0 ? (
               <div className="files-empty">{t("files.emptyDirectory")}</div>
             ) : null}
             {/*
               刷新目录或保存文件时保留旧列表，避免按钮在短暂 loading 期间消失；
               daemon 返回新目录后会用新的 session_files_result 覆盖这里的缓存。
             */}
-            {attachedSessionId && !error && hasCachedEntries
+            {attachedSessionId && hasCachedFiles && entries.length > 0
               ? entries.map((entry) => (
                   <SessionFileRow
                     key={entry.path}
@@ -329,6 +345,7 @@ export function SessionFilesPanel({
           loading={gitLoading}
           error={gitError}
           onRefresh={onRefreshGit}
+          onDismissError={onDismissGitError}
           onOpenGitFile={onOpenGitFile}
           onOpenGitDiff={onOpenGitDiff}
           onGitAction={onGitAction}
@@ -352,6 +369,7 @@ function GitPanel({
   loading,
   error,
   onRefresh,
+  onDismissError,
   onOpenGitFile,
   onOpenGitDiff,
   onGitAction,
@@ -361,6 +379,7 @@ function GitPanel({
   loading: boolean;
   error?: SafeError;
   onRefresh: () => void;
+  onDismissError: () => void;
   onOpenGitFile: (worktree: SessionGitWorktreePayload, change: SessionGitFileChangePayload) => void;
   onOpenGitDiff: (worktree: SessionGitWorktreePayload, change?: SessionGitFileChangePayload, staged?: boolean) => void;
   onGitAction: (
@@ -462,6 +481,7 @@ function GitPanel({
       className={`git-panel git-panel-compact${splitActive ? " git-panel-split-overridden" : ""}${graphResizing ? " git-graph-resizing" : ""}${filesCollapsed ? " git-files-collapsed" : ""}${graphCollapsed ? " git-graph-collapsed" : ""}`}
       role="tabpanel"
       aria-label={t("app.git")}
+      aria-busy={loading}
       style={splitActive ? ({ "--git-changes-pane-height": `${changesPaneHeight}px` } as CSSProperties) : undefined}
     >
       <header className="git-overview" aria-label={t("git.workspace")}>
@@ -502,6 +522,16 @@ function GitPanel({
           </button>
         </div>
       </header>
+      {attachedSessionId && error ? (
+        <SessionPanelErrorAlert
+          error={error}
+          label={t("git.errorAlert")}
+          dismissLabel={t("git.dismissError")}
+          loading={loading}
+          onRetry={onRefresh}
+          onDismiss={onDismissError}
+        />
+      ) : null}
       <section ref={statusPaneRef} className="git-status-pane" aria-label={t("git.status")}>
         <header className="git-section-header">
           <button
@@ -525,12 +555,12 @@ function GitPanel({
                 {t("files.loading")}
               </div>
             ) : null}
-            {attachedSessionId && !loading && error ? <div className="files-empty">{t("files.unavailable")}</div> : null}
-            {attachedSessionId && !error && git?.error ? <div className="files-empty">{git.error}</div> : null}
-            {attachedSessionId && !error && git && !git.error && worktrees.length === 0 ? (
+            {attachedSessionId && !loading && error && !git ? <div className="files-empty">{t("files.unavailable")}</div> : null}
+            {attachedSessionId && git?.error ? <div className="files-empty">{t("files.unavailable")}</div> : null}
+            {attachedSessionId && git && !git.error && worktrees.length === 0 ? (
               <div className="files-empty">{t("git.cleanRepository")}</div>
             ) : null}
-            {attachedSessionId && !error && !git?.error
+            {attachedSessionId && !git?.error
               ? worktrees.map((worktree) => (
                   <GitWorktree
                     key={worktree.path}
@@ -578,6 +608,72 @@ function GitPanel({
       </section>
     </div>
   );
+}
+
+function SessionPanelErrorAlert({
+  error,
+  label,
+  dismissLabel,
+  loading,
+  onRetry,
+  onDismiss,
+}: {
+  error: SafeError;
+  label: string;
+  dismissLabel: string;
+  loading: boolean;
+  onRetry: () => void;
+  onDismiss: () => void;
+}) {
+  const { t } = useI18n();
+  const safeMessage = isSafeSessionPanelError(error)
+    ? translateSafeErrorMessage(error, t)
+    : t("error.protocolOperationFailed");
+  return (
+    <div className="session-panel-error" role="alert" aria-label={label}>
+      <CircleAlert size={15} aria-hidden="true" />
+      <span className="session-panel-error-message">{safeMessage}</span>
+      <button type="button" className="session-panel-error-retry" disabled={loading} onClick={onRetry}>
+        <RefreshCw size={13} aria-hidden="true" />
+        {t(loading ? "files.retrying" : "files.retry")}
+      </button>
+      <button
+        type="button"
+        className="icon-button session-panel-error-dismiss"
+        aria-label={dismissLabel}
+        onClick={onDismiss}
+      >
+        <X size={14} aria-hidden="true" />
+      </button>
+    </div>
+  );
+}
+
+function isSafeSessionPanelError(error: SafeError): boolean {
+  switch (error.code) {
+    case "missing_pairing":
+    case "pairing_server_unknown":
+    case "pairing_payload_server_mismatch":
+    case "route_server_mismatch":
+    case "empty_pairing_candidates":
+    case "connection_closed":
+    case "connection_error":
+    case "unexpected_message":
+    case "invalid_handshake":
+    case "binary_file":
+    case "invalid_file_chunk":
+    case "download_cancelled":
+    case "file_too_large":
+      return true;
+    case "client_error":
+      return error.message === "invalid_file_data" || error.message === "file_read_failed";
+    default:
+      return (
+        error.code.endsWith("_timeout") ||
+        error.message === "operation timed out" ||
+        error.message === "protocol operation failed"
+      );
+  }
 }
 
 function GitMetric({ label, count, tone }: { label: string; count: number; tone: "staged" | "unstaged" | "commits" }) {

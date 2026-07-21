@@ -133,6 +133,58 @@ describe("FileEditorDialog", () => {
     expect(onSave).toHaveBeenCalledWith("new");
   });
 
+  it("dirty 时所有关闭入口都只发出关闭请求并保留草稿", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+
+    render(
+      <FileEditorDialog
+        open
+        path="/tmp/draft.txt"
+        initialText="saved"
+        onSave={vi.fn()}
+        onClose={onClose}
+      />,
+    );
+
+    const editor = screen.getByLabelText("File text");
+    await user.clear(editor);
+    await user.type(editor, "unsaved draft");
+
+    await user.click(screen.getByRole("button", { name: "Close editor" }));
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.mouseDown(screen.getByRole("dialog").parentElement!);
+    editor.focus();
+    await user.keyboard("{Escape}");
+
+    expect(onClose).toHaveBeenCalledTimes(4);
+    expect(editor).toHaveValue("unsaved draft");
+  });
+
+  it("保存失败后保留草稿和 modified 状态", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn().mockRejectedValue(new Error("save failed"));
+
+    render(
+      <FileEditorDialog
+        open
+        path="/tmp/draft.txt"
+        initialText="saved"
+        onSave={onSave}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const editor = screen.getByLabelText("File text");
+    await user.clear(editor);
+    await user.type(editor, "unsaved draft");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith("unsaved draft"));
+    expect(editor).toHaveValue("unsaved draft");
+    expect(screen.getByText("modified")).toBeInTheDocument();
+  });
+
   it("切换文件后同步新的初始文本", () => {
     const { rerender } = render(
       <FileEditorDialog

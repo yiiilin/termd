@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Circle, CircleX, ListChecks, LoaderCircle } from "lucide-react";
 import { useI18n, type Translate } from "../i18n";
 import {
@@ -16,6 +16,8 @@ export function SessionOpenProgressControl({ progress }: SessionOpenProgressCont
   const { t } = useI18n();
   const [detailsOpen, setDetailsOpen] = useState(progress.status === "opening");
   const [nowMs, setNowMs] = useState(() => progress.finishedAtMs ?? Date.now());
+  const controlRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     setDetailsOpen(progress.status === "opening");
@@ -39,6 +41,33 @@ export function SessionOpenProgressControl({ progress }: SessionOpenProgressCont
     const timer = window.setInterval(updateNow, 100);
     return () => window.clearInterval(timer);
   }, [progress.attemptId, progress.finishedAtMs, progress.status]);
+
+  useEffect(() => {
+    if (!detailsOpen) {
+      return;
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.target instanceof Node && !controlRef.current?.contains(event.target)) {
+        setDetailsOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+      event.preventDefault();
+      setDetailsOpen(false);
+      triggerRef.current?.focus();
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [detailsOpen]);
 
   const currentStep = sessionOpenProgressCurrentStep(progress);
   const currentStepIndex = currentStep
@@ -74,8 +103,9 @@ export function SessionOpenProgressControl({ progress }: SessionOpenProgressCont
     [progress],
   );
   return (
-    <div className="terminal-open-progress-control" onClick={(event) => event.stopPropagation()}>
+    <div ref={controlRef} className="terminal-open-progress-control" onClick={(event) => event.stopPropagation()}>
       <button
+        ref={triggerRef}
         type="button"
         className={`icon-button terminal-open-progress-button ${progress.status}`}
         aria-label={buttonLabel}

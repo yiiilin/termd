@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { Check, FileText, Loader2, X } from "lucide-react";
 import type { MonacoCodeEditor } from "./MonacoCodeEditor";
 import { useI18n } from "../i18n";
 import type { EffectiveTheme } from "../protocol/types";
 import { monacoTheme } from "../theme";
+import { useModalFocus } from "./useModalFocus";
 
 export interface FileEditorDialogProps {
   open: boolean;
@@ -18,6 +19,7 @@ export interface FileEditorDialogProps {
   theme?: EffectiveTheme;
   readOnly?: boolean;
   onSave: (text: string) => void | Promise<void>;
+  onDraftChange?: (text: string) => void;
   onClose: () => void;
 }
 
@@ -60,17 +62,25 @@ export function FileEditorDialog({
   theme = "dark",
   readOnly = false,
   onSave,
+  onDraftChange,
   onClose,
 }: FileEditorDialogProps) {
-  const [text, setText] = useState(initialText);
+  const [localText, setLocalText] = useState(initialText);
   const [MonacoEditor, setMonacoEditor] = useState<MonacoCodeEditor | null>(null);
   const [monacoChecked, setMonacoChecked] = useState(false);
   const [monacoUnavailable, setMonacoUnavailable] = useState(false);
   const { t } = useI18n();
+  const canClose = !saving;
+  const requestClose = useCallback(() => {
+    if (canClose) {
+      onClose();
+    }
+  }, [canClose, onClose]);
+  const dialogRef = useModalFocus({ open, onClose: requestClose });
 
   useEffect(() => {
     if (open) {
-      setText(initialText);
+      setLocalText(initialText);
     }
   }, [initialText, open, path]);
 
@@ -97,9 +107,13 @@ export function FileEditorDialog({
   }, [open]);
 
   const title = name?.trim() || basename(path) || t("editor.untitled");
+  const text = localText;
+  const setText = (nextText: string) => {
+    setLocalText(nextText);
+    onDraftChange?.(nextText);
+  };
   const disabled = loading || saving;
   const canEdit = !disabled && !readOnly;
-  const canClose = !saving;
   const isDirty = text !== initialText;
   const saveLabel = saving ? t("editor.savingButton") : t("editor.save");
   const statusText = useMemo(() => {
@@ -125,11 +139,12 @@ export function FileEditorDialog({
       role="presentation"
       onMouseDown={(event) => {
         if (canClose && event.target === event.currentTarget) {
-          onClose();
+          requestClose();
         }
       }}
     >
       <section
+        ref={dialogRef}
         className="file-editor-dialog"
         role="dialog"
         aria-modal="true"
@@ -152,7 +167,7 @@ export function FileEditorDialog({
             <span className="file-editor-status" aria-live="polite">
               {statusText}
             </span>
-            <button type="button" className="icon-button" aria-label={t("editor.close")} disabled={!canClose} onClick={onClose}>
+            <button type="button" className="icon-button" aria-label={t("editor.close")} disabled={!canClose} onClick={requestClose}>
               <X size={16} aria-hidden="true" />
             </button>
           </div>
@@ -209,7 +224,7 @@ export function FileEditorDialog({
         </div>
 
         <footer className="file-editor-footer single-row">
-          <button type="button" disabled={!canClose} onClick={onClose}>
+          <button type="button" disabled={!canClose} onClick={requestClose}>
             {t("editor.cancel")}
           </button>
           <button

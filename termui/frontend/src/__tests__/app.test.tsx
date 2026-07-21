@@ -12,6 +12,7 @@ import App, {
   defaultWsUrlFromPage,
   knownServerWsUrlCandidates,
   latencyLevelClass,
+  mobileTitlePullDistanceForDelta,
   networkRateFromSamples,
   pairingWsUrlCandidates,
 } from "../App";
@@ -36,6 +37,16 @@ import { MockDaemon } from "../test/mock-daemon";
 import { fallbackSessionDisplayName } from "../session-names";
 import { resetFileEditorDialogMonacoCacheForTests } from "../components/FileEditorDialog";
 import { SessionFilesPanel } from "../components/SessionFilesPanel";
+
+const removeBrowserPushForServerMock = vi.hoisted(() => vi.fn<() => Promise<void>>());
+
+vi.mock("../push-notifications", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../push-notifications")>();
+  return {
+    ...actual,
+    removeBrowserPushForServer: removeBrowserPushForServerMock,
+  };
+});
 
 const DEFAULT_SESSION_ID = "00000000-0000-0000-0000-000000000401";
 const DEFAULT_SESSION_NAME = fallbackSessionDisplayName(DEFAULT_SESSION_ID);
@@ -583,6 +594,11 @@ async function pairWithInvite(
   await user.click(screen.getByRole("button", { name: "Pair" }));
 }
 
+async function confirmSessionClose(user: ReturnType<typeof userEvent.setup>): Promise<void> {
+  const prompt = await screen.findByRole("alertdialog", { name: "Close session?" });
+  await user.click(within(prompt).getByRole("button", { name: "Close session" }));
+}
+
 async function expectDaemonUrlInAdmin(user: ReturnType<typeof userEvent.setup>, url: string): Promise<void> {
   if (!screen.queryByLabelText("daemon admin")) {
     await user.click(screen.getByRole("button", { name: "Daemons" }));
@@ -835,6 +851,68 @@ function mockTerminalLayout(input: {
 describe("termui web 工作台", () => {
   let daemon: MockDaemon;
 
+  async function openDirtyEditorWithTwoSessions(user: ReturnType<typeof userEvent.setup>) {
+    const alphaSession = {
+      session_id: "00000000-0000-0000-0000-000000000451",
+      name: "alpha",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const betaSession = {
+      session_id: "00000000-0000-0000-0000-000000000452",
+      name: "beta",
+      state: "running",
+      size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    const alphaPath = "/home/alpha/notes.txt";
+
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [alphaSession, betaSession],
+      sessionFiles: {
+        [alphaSession.session_id]: {
+          session_id: alphaSession.session_id,
+          path: "/home/alpha",
+          entries: [
+            { name: "notes.txt", path: alphaPath, kind: "file", size_bytes: 5, modified_at_ms: null },
+          ],
+        },
+        [betaSession.session_id]: {
+          session_id: betaSession.session_id,
+          path: "/home/beta",
+          entries: [],
+        },
+      },
+      sessionFileReads: {
+        [alphaPath]: {
+          session_id: alphaSession.session_id,
+          path: alphaPath,
+          data_base64: Buffer.from("saved", "utf8").toString("base64"),
+          size_bytes: 5,
+          modified_at_ms: null,
+        },
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await clickSessionCard(user, "alpha");
+    const panel = await screen.findByLabelText("session files");
+    await within(panel).findByText("notes.txt");
+    await user.click(within(panel).getByRole("button", { name: "Edit notes.txt" }));
+    const editor = await screen.findByRole("dialog", { name: "notes.txt" });
+    const fileText = within(editor).getByLabelText("File text");
+    await waitFor(() => expect(fileText).toHaveValue("saved"));
+    fireEvent.change(fileText, { target: { value: "unsaved draft" } });
+    await waitFor(() => expect(within(editor).getByText("modified")).toBeInTheDocument());
+    daemon.attachedSessions.splice(0);
+    daemon.attachRequests.splice(0);
+
+    return { alphaSession, betaSession, alphaPath, editor, fileText };
+  }
+
   it("普通前端操作默认等待 5 秒，避免 relay 输出排队时过早报超时", () => {
     expect(APP_CONNECTION_TIMEOUT_MS).toBe(5000);
   });
@@ -856,6 +934,8 @@ describe("termui web 工作台", () => {
       onGoToPath: vi.fn(),
       onRefresh: vi.fn(),
       onRefreshGit: vi.fn(),
+      onDismissError: vi.fn(),
+      onDismissGitError: vi.fn(),
       onFollowTerminalCwdChange: vi.fn(),
       onUpload: vi.fn(),
       onDownload: vi.fn(),
@@ -917,6 +997,8 @@ describe("termui web 工作台", () => {
       onGoToPath,
       onRefresh: vi.fn(),
       onRefreshGit: vi.fn(),
+      onDismissError: vi.fn(),
+      onDismissGitError: vi.fn(),
       onFollowTerminalCwdChange: vi.fn(),
       onUpload: vi.fn(),
       onDownload: vi.fn(),
@@ -967,6 +1049,8 @@ describe("termui web 工作台", () => {
     qrScannerMock.start.mockReset();
     qrScannerMock.start.mockResolvedValue();
     qrScannerMock.stop.mockClear();
+    removeBrowserPushForServerMock.mockReset();
+    removeBrowserPushForServerMock.mockResolvedValue();
     daemon = await MockDaemon.start({
       token: "secret-token",
       sessions: [
@@ -1799,7 +1883,8 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(document.documentElement).toHaveAttribute("data-theme", "light"));
     expect(document.documentElement).toHaveAttribute("lang", "zh-CN");
     expect(screen.getByRole("dialog", { name: "设置" })).toBeVisible();
-    expect(screen.getByLabelText("守护进程管理器")).toBeInTheDocument();
+    expect(screen.queryByLabelText("守护进程管理器")).toBeNull();
+    expect(screen.getByRole("main", { name: "守护进程管理" })).toBeInTheDocument();
     expect(screen.queryByLabelText("daemon manager")).toBeNull();
     await waitFor(async () => {
       await expect(loadBrowserState()).resolves.toMatchObject({
@@ -2005,7 +2090,7 @@ describe("termui web 工作台", () => {
     expect(css).toContain("--color-bg-page: #e5dfc5;");
     expect(css).toContain("--color-surface: #f3ead3;");
     expect(css).toContain("--color-terminal-bg: #eae4ca;");
-    expect(css).toContain("--color-text: #5c6a72;");
+    expect(css).toContain("--color-text: #505d64;");
     expect(css).not.toContain("--color-surface: #ffffff;");
     expect(css).not.toContain("--color-toast-bg: rgba(255, 255, 255");
   });
@@ -2040,7 +2125,7 @@ describe("termui web 工作台", () => {
     expect(mobileShortcutsBlock).toContain("width: 100%;");
     expect(css).toContain("overflow-x: auto;");
     expect(css).toContain("scrollbar-width: none;");
-    expect(css).toContain("flex: 0 0 46px;");
+    expect(css).toContain("flex: 0 0 44px;");
     expect(mobileShortcutsBlock).not.toContain("safe-area-inset-bottom");
     expect(css).toContain(".terminal-quick-keys-panel {");
   });
@@ -2080,6 +2165,76 @@ describe("termui web 工作台", () => {
     });
     expect(within(status).queryByText(/RTT/)).toBeNull();
     expect(daemon.v070MetadataConnections).toBeGreaterThan(0);
+  });
+
+  it("移动标题栏按 session、RTT、行列数顺序展示正常状态", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+
+    const title = await waitFor(() => {
+      const element = document.querySelector<HTMLElement>(".toolbar-title");
+      expect(element?.querySelector(".toolbar-latency")).not.toBeNull();
+      return element!;
+    });
+    const name = title.querySelector(".toolbar-session-name");
+    const latency = title.querySelector(".toolbar-latency");
+    const size = title.querySelector(".toolbar-session-size");
+    const children = Array.from(title.children);
+
+    expect(name).not.toBeNull();
+    expect(latency).not.toBeNull();
+    expect(size).not.toBeNull();
+    expect(children.indexOf(name!)).toBeLessThan(children.indexOf(latency!));
+    expect(children.indexOf(latency!)).toBeLessThan(children.indexOf(size!));
+    expect(title.querySelector(".toolbar-connection-anomaly")).toBeNull();
+  });
+
+  it("移动标题栏让连接异常覆盖 RTT 和行列数", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: DEFAULT_SESSION_ID,
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionDataError: {
+        code: "invalid_envelope_token",
+        message: "message envelope is invalid private_key=private-value signature=sig",
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Open session list from title" }));
+    const sessionsPanel = await screen.findByLabelText("sessions panel");
+    await clickSessionCard(user, DEFAULT_SESSION_NAME, sessionsPanel);
+    const terminalInput = await waitFor(() => {
+      const input = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(input).not.toBeNull();
+      return input!;
+    });
+    terminalInput.value = "trigger-toolbar-error";
+    fireEvent.input(terminalInput);
+    await screen.findByRole("alert", { name: "Connection error" });
+
+    const title = document.querySelector<HTMLElement>(".toolbar-title");
+    const anomaly = title?.querySelector<HTMLElement>(".toolbar-connection-anomaly");
+    expect(title?.querySelector(".toolbar-session-name")).not.toBeNull();
+    expect(anomaly).toHaveTextContent("Connection error");
+    expect(anomaly).toHaveAttribute("aria-label", expect.stringContaining("protocol operation failed"));
+    expect(anomaly?.getAttribute("aria-label")).not.toContain("private-value");
+    expect(title?.querySelector(".toolbar-latency")).toBeNull();
+    expect(title?.querySelector(".toolbar-session-size")).toBeNull();
   });
 
   it("持续在每次 metadata pong 一秒后发起下一次延迟检测", async () => {
@@ -3049,7 +3204,7 @@ describe("termui web 工作台", () => {
 
     await user.click(within(menu).getByRole("button", { name: "Daemons" }));
     const admin = await screen.findByLabelText("daemon admin");
-    expect(within(admin).getByLabelText("daemon manager")).toBeVisible();
+    expect(await within(admin).findByLabelText("daemon manager")).toBeVisible();
     await user.click(within(admin).getByRole("button", { name: "Open workspace" }));
     await waitForWorkspaceSession();
     await screen.findByText(/termd-e2e-ready/);
@@ -3082,10 +3237,80 @@ describe("termui web 工作台", () => {
     expect(within(secondMenu).getByRole("button", { name: "Files" })).toBeEnabled();
 
     await within(secondMenu).getByRole("button", { name: "Files" }).click();
-    const filesPanel = screen.getByLabelText("session files");
+    const filesPanel = await screen.findByLabelText("session files");
     await expect(filesPanel).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Hide files panel" }));
     await expect(screen.queryByLabelText("session files")).toBeNull();
+  });
+
+  it("移动菜单支持首焦点、Escape、Tab 离开和外部点击关闭", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    const trigger = screen.getByRole("button", { name: "Open mobile workspace menu" });
+
+    await user.click(trigger);
+    let menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    expect(within(menu).getByRole("button", { name: "Daemons" })).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("navigation", { name: "mobile workspace menu" })).toBeNull();
+    expect(trigger).toHaveFocus();
+
+    await user.click(trigger);
+    menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    const settings = within(menu).getByRole("button", { name: "Settings" });
+    settings.focus();
+    await user.tab();
+    expect(screen.queryByRole("navigation", { name: "mobile workspace menu" })).toBeNull();
+
+    await user.click(trigger);
+    await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    await user.click(screen.getByRole("button", { name: "Close mobile workspace menu" }));
+    expect(screen.queryByRole("navigation", { name: "mobile workspace menu" })).toBeNull();
+  });
+
+  it("移动 Sessions 和 Files 覆盖面板约束焦点并用 Escape 回到终端", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    const terminalInput = await waitFor(() => {
+      const input = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(input).not.toBeNull();
+      return input!;
+    });
+    const toolbar = document.querySelector(".toolbar");
+    const workspaceBody = document.querySelector(".workspace-body");
+
+    await user.click(screen.getByRole("button", { name: "Open session list from title" }));
+    const sessionsDialog = await screen.findByRole("dialog", { name: "sessions panel" });
+    expect(within(sessionsDialog).getByRole("button", { name: "Refresh sessions" })).toHaveFocus();
+    expect(toolbar).toHaveAttribute("inert");
+    expect(workspaceBody).toHaveAttribute("inert");
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(within(sessionsDialog).getAllByRole("button").at(-1));
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "sessions panel" })).toBeNull();
+    await waitFor(() => expect(terminalInput).toHaveFocus());
+    expect(toolbar).not.toHaveAttribute("inert");
+    expect(workspaceBody).not.toHaveAttribute("inert");
+
+    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
+    const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    await user.click(within(menu).getByRole("button", { name: "Files" }));
+    const filesDialog = await screen.findByRole("dialog", { name: "Files" });
+    expect(filesDialog).toHaveAttribute("aria-modal", "true");
+    expect(filesDialog.contains(document.activeElement)).toBe(true);
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "Files" })).toBeNull();
+    await waitFor(() => expect(terminalInput).toHaveFocus());
+    expect(toolbar).not.toHaveAttribute("inert");
+    expect(workspaceBody).not.toHaveAttribute("inert");
   });
 
   it("移动端标题栏向下拖动不会创建 session list HTTP 且不打开 session 面板", async () => {
@@ -3109,6 +3334,91 @@ describe("termui web 工作台", () => {
       /\/(?:list|clients|status)(?:\/|$)/u.test(request.path)
     )).toBe(false);
     expect(screen.queryByLabelText("sessions panel")).toBeNull();
+  });
+
+  it("移动端中断下拉回弹后轻点释放不会重复刷新", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    const listSessions = vi.spyOn(V070Client.prototype, "listSessions");
+    const requestsBeforePull = listSessions.mock.calls.length;
+    const title = screen.getByRole("button", { name: "Open session list from title" });
+
+    fireTouchPointer(title, "pointerdown", { pointerId: 27, clientX: 180, clientY: 18 });
+    fireTouchPointer(title, "pointermove", { pointerId: 27, clientX: 180, clientY: 92 });
+    fireTouchPointer(title, "pointerup", { pointerId: 27, clientX: 180, clientY: 92 });
+
+    // Grab the still-expanded return spring, then release without a new pull.
+    fireTouchPointer(title, "pointerdown", { pointerId: 28, clientX: 180, clientY: 82 });
+    fireTouchPointer(title, "pointerup", { pointerId: 28, clientX: 180, clientY: 82 });
+
+    await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(requestsBeforePull + 1));
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+    expect(listSessions).toHaveBeenCalledTimes(requestsBeforePull + 1);
+  });
+
+  it("移动端标题下拉被 pointercancel 后下一次点按仍能打开 Sessions", async () => {
+    setViewportWidth(390);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    const title = screen.getByRole("button", { name: "Open session list from title" });
+
+    fireTouchPointer(title, "pointerdown", { pointerId: 17, clientX: 180, clientY: 18 });
+    fireTouchPointer(title, "pointermove", { pointerId: 17, clientX: 181, clientY: 60 });
+    fireTouchPointer(title, "pointercancel", { pointerId: 17, clientX: 181, clientY: 60 });
+
+    await user.click(title);
+    expect(await screen.findByRole("dialog", { name: "sessions panel" })).toBeInTheDocument();
+  });
+
+  it("移动端 reduced motion 下释放标题下拉会立即归位", async () => {
+    setViewportWidth(390);
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: query === "(prefers-reduced-motion: reduce)",
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      })),
+      writable: true,
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    const title = screen.getByRole("button", { name: "Open session list from title" });
+
+    fireTouchPointer(title, "pointerdown", { pointerId: 18, clientX: 180, clientY: 18 });
+    fireTouchPointer(title, "pointermove", { pointerId: 18, clientX: 180, clientY: 55 });
+    expect(title.style.getPropertyValue("--termd-mobile-title-pull")).not.toBe("");
+    fireTouchPointer(title, "pointerup", { pointerId: 18, clientX: 180, clientY: 55 });
+
+    expect(title.style.getPropertyValue("--termd-mobile-title-pull")).toBe("");
+    expect(title).not.toHaveClass("toolbar-title-pulling");
+  });
+
+  it("移动端标题下拉在边界外使用渐进阻力", () => {
+    expect(mobileTitlePullDistanceForDelta(-20)).toBe(0);
+    expect(mobileTitlePullDistanceForDelta(52)).toBe(52);
+    expect(mobileTitlePullDistanceForDelta(72)).toBe(72);
+
+    const firstOvershoot = mobileTitlePullDistanceForDelta(92);
+    const secondOvershoot = mobileTitlePullDistanceForDelta(112);
+    expect(firstOvershoot).toBeGreaterThan(72);
+    expect(firstOvershoot).toBeLessThan(92);
+    expect(secondOvershoot - firstOvershoot).toBeLessThan(firstOvershoot - 72);
   });
 
   it("移动端软键盘打开时让快捷键栏贴近键盘并隐藏底部状态行", async () => {
@@ -3347,6 +3657,38 @@ describe("termui web 工作台", () => {
     await waitForWorkspaceSession();
   });
 
+  it("保存连接地址期间不能进入随后会被重置的 workspace", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(screen.getByRole("button", { name: "Daemons" }));
+    await setConnectionUrl(user, daemon.url);
+
+    const connect = V070Client.connect.bind(V070Client);
+    let releaseConnect: () => void = () => undefined;
+    const connectSpy = vi.spyOn(V070Client, "connect").mockImplementationOnce(async (...args) => {
+      await new Promise<void>((resolve) => {
+        releaseConnect = resolve;
+      });
+      return connect(...args);
+    });
+
+    try {
+      await user.click(screen.getByRole("button", { name: "Save URL" }));
+
+      expect(screen.getByRole("button", { name: "Workspace" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Open workspace" })).toBeDisabled();
+      expect(screen.getByLabelText("daemon admin")).toBeInTheDocument();
+
+      releaseConnect();
+      await waitForWorkspaceSession();
+    } finally {
+      connectSpy.mockRestore();
+    }
+  });
+
   it("一个 Web 可以保存并切换多个 daemon", async () => {
     const user = userEvent.setup();
     const secondDaemon = await MockDaemon.start({
@@ -3502,15 +3844,55 @@ describe("termui web 工作台", () => {
       expect(screen.getByLabelText("selected daemon")).toHaveTextContent("Laptop relay");
 
       await user.click(within(manager).getByRole("button", { name: /Delete daemon Laptop relay/ }));
+      const firstForgetPrompt = await screen.findByRole("alertdialog", { name: "Forget daemon?" });
+      expect(within(firstForgetPrompt).getByText(/removes the pairing and push notifications/i)).toBeInTheDocument();
+      expect(within(firstForgetPrompt).getByText(/does not stop the daemon or revoke trust/i)).toBeInTheDocument();
+      expect(within(firstForgetPrompt).getByText(/Laptop relay/)).toHaveTextContent(secondDaemon.url);
+      expect(removeBrowserPushForServerMock).not.toHaveBeenCalled();
+      await expect(loadBrowserState()).resolves.toMatchObject({
+        pairedServers: expect.arrayContaining([
+          expect.objectContaining({ server_id: daemon.serverId }),
+          expect.objectContaining({ server_id: secondDaemon.serverId }),
+        ]),
+      });
+
+      await user.click(within(firstForgetPrompt).getByRole("button", { name: "Cancel" }));
+      expect(removeBrowserPushForServerMock).not.toHaveBeenCalled();
+      await expect(loadBrowserState()).resolves.toMatchObject({ pairedServers: expect.arrayContaining([
+        expect.objectContaining({ server_id: secondDaemon.serverId }),
+      ]) });
+
+      let releasePushCleanup: (() => void) | undefined;
+      removeBrowserPushForServerMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+        releasePushCleanup = resolve;
+      }));
+      await user.click(within(manager).getByRole("button", { name: /Delete daemon Laptop relay/ }));
+      const busyForgetPrompt = await screen.findByRole("alertdialog", { name: "Forget daemon?" });
+      await user.click(within(busyForgetPrompt).getByRole("button", { name: "Forget daemon" }));
+      expect(within(busyForgetPrompt).getByRole("button", { name: "Forgetting" })).toBeDisabled();
+      expect(within(busyForgetPrompt).getByRole("button", { name: "Cancel" })).toBeDisabled();
+      fireEvent.keyDown(busyForgetPrompt, { key: "Escape" });
+      expect(screen.getByRole("alertdialog", { name: "Forget daemon?" })).toBeInTheDocument();
+      await expect(loadBrowserState()).resolves.toMatchObject({ pairedServers: expect.arrayContaining([
+        expect.objectContaining({ server_id: secondDaemon.serverId }),
+      ]) });
+      releasePushCleanup?.();
+
       const afterDeleteManager = await screen.findByLabelText("daemon manager");
       expect(within(afterDeleteManager).getByText(daemon.url)).toBeInTheDocument();
       await waitFor(() => expect(screen.queryByText("Laptop relay")).toBeNull());
+      expect(removeBrowserPushForServerMock).toHaveBeenCalledTimes(1);
 
       const remainingManager = afterDeleteManager;
       await user.click(within(remainingManager).getByRole("button", { name: /Delete daemon/ }));
+      const secondForgetPrompt = await screen.findByRole("alertdialog", { name: "Forget daemon?" });
+      await user.click(within(secondForgetPrompt).getByRole("button", { name: "Forget daemon" }));
 
-      await waitFor(() => expect(within(screen.getByLabelText("daemon manager")).getByText("No daemons")).toBeVisible());
+      await waitFor(() => expect(screen.queryByLabelText("daemon manager")).toBeNull());
       expect(await screen.findByLabelText("Pairing token")).toBeInTheDocument();
+      expect(screen.queryByLabelText("selected daemon")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Workspace" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Open workspace" })).toBeNull();
       expect(screen.queryByRole("button", { name: "New session" })).toBeNull();
     } finally {
       await secondDaemon.stop();
@@ -4957,6 +5339,15 @@ describe("termui web 工作台", () => {
     await user.click(within(panel).getByRole("button", { name: "Parent directory" }));
     await within(panel).findByText("alpha.txt");
 
+    await user.click(within(panel).getByRole("button", { name: "Delete src" }));
+    const directoryDeletePrompt = await screen.findByRole("alertdialog", { name: "Delete directory?" });
+    expect(within(directoryDeletePrompt).getByText(srcPath)).toBeInTheDocument();
+    expect(within(directoryDeletePrompt).getByText(/Only an empty directory can be deleted/i)).toBeInTheDocument();
+    expect(daemon.sessionFileDeletes).toEqual([]);
+    await user.click(within(directoryDeletePrompt).getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(daemon.sessionFileDeletes).toContainEqual({ session_id: sessionId, path: srcPath }));
+    await within(panel).findByText("alpha.txt");
+
     await user.click(within(panel).getByRole("button", { name: "Edit alpha.txt" }));
     const editor = await screen.findByRole("dialog", { name: "alpha.txt" });
     await waitFor(() => {
@@ -5000,6 +5391,21 @@ describe("termui web 工作台", () => {
     expect(within(panel).queryByRole("button", { name: "Move alpha.txt" })).toBeNull();
 
     await user.click(within(panel).getByRole("button", { name: "Delete alpha.txt" }));
+    const firstFileDeletePrompt = await screen.findByRole("alertdialog", { name: "Delete file?" });
+    expect(within(firstFileDeletePrompt).getByText("/home/me/project/alpha.txt")).toBeInTheDocument();
+    expect(daemon.sessionFileDeletes).not.toContainEqual({
+      session_id: sessionId,
+      path: "/home/me/project/alpha.txt",
+    });
+    await user.click(within(firstFileDeletePrompt).getByRole("button", { name: "Cancel" }));
+    expect(daemon.sessionFileDeletes).not.toContainEqual({
+      session_id: sessionId,
+      path: "/home/me/project/alpha.txt",
+    });
+
+    await user.click(within(panel).getByRole("button", { name: "Delete alpha.txt" }));
+    const secondFileDeletePrompt = await screen.findByRole("alertdialog", { name: "Delete file?" });
+    await user.click(within(secondFileDeletePrompt).getByRole("button", { name: "Delete" }));
     await waitFor(() => {
       expect(daemon.sessionFileDeletes).toContainEqual({
         session_id: sessionId,
@@ -5203,6 +5609,144 @@ describe("termui web 工作台", () => {
     expect(selectedSessionName()).toBe("beta");
     expect(screen.queryByRole("dialog", { name: "alpha.txt" })).toBeNull();
     expect(within(screen.getByLabelText("session files")).queryByText("alpha.txt")).toBeNull();
+  });
+
+  it("dirty editor 切换 session 时 Stay 保留现场，Save 成功后才 attach 目标", async () => {
+    const user = userEvent.setup();
+    const { alphaSession, betaSession, alphaPath, fileText } = await openDirtyEditorWithTwoSessions(user);
+
+    await clickSessionCard(user, "beta");
+    const firstPrompt = await screen.findByRole("alertdialog", { name: /notes\.txt/ });
+    expect(selectedSessionName()).toBe("alpha");
+    expect(daemon.attachedSessions).toEqual([]);
+    expect(fileText.closest(".file-editor-backdrop")).toHaveAttribute("inert");
+    fileText.focus();
+    expect(firstPrompt).toContainElement(document.activeElement as HTMLElement);
+
+    await user.click(within(firstPrompt).getByRole("button", { name: "Stay" }));
+    expect(screen.queryByRole("alertdialog", { name: /notes\.txt/ })).toBeNull();
+    expect(selectedSessionName()).toBe("alpha");
+    expect(fileText).toHaveValue("unsaved draft");
+
+    await clickSessionCard(user, "beta");
+    const secondPrompt = await screen.findByRole("alertdialog", { name: /notes\.txt/ });
+    expect(daemon.attachedSessions).toEqual([]);
+    await user.click(within(secondPrompt).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(daemon.sessionFileWrites).toContainEqual({
+      session_id: alphaSession.session_id,
+      path: alphaPath,
+      text: "unsaved draft",
+    }));
+    await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
+    expect(selectedSessionName()).toBe("beta");
+    expect(screen.queryByRole("dialog", { name: "notes.txt" })).toBeNull();
+  });
+
+  it("dirty editor 切换 session 时 Discard 丢弃草稿后才 attach 目标", async () => {
+    const user = userEvent.setup();
+    const { betaSession } = await openDirtyEditorWithTwoSessions(user);
+
+    await clickSessionCard(user, "beta");
+    const prompt = await screen.findByRole("alertdialog", { name: /notes\.txt/ });
+    expect(daemon.attachedSessions).toEqual([]);
+    expect(selectedSessionName()).toBe("alpha");
+
+    await user.click(within(prompt).getByRole("button", { name: "Discard" }));
+
+    await waitFor(() => expect(daemon.attachedSessions).toContain(betaSession.session_id));
+    expect(selectedSessionName()).toBe("beta");
+    expect(screen.queryByRole("dialog", { name: "notes.txt" })).toBeNull();
+  });
+
+  it("dirty editor 保存失败时保留草稿且不切换 session", async () => {
+    const user = userEvent.setup();
+    const { fileText } = await openDirtyEditorWithTwoSessions(user);
+    const writeSpy = vi.spyOn(V070Client.prototype, "writeSessionFile").mockRejectedValueOnce(
+      new ProtocolClientError("file_write_failed", "save failed"),
+    );
+
+    try {
+      await clickSessionCard(user, "beta");
+      const prompt = await screen.findByRole("alertdialog", { name: /notes\.txt/ });
+      expect(daemon.attachedSessions).toEqual([]);
+      await user.click(within(prompt).getByRole("button", { name: "Save" }));
+
+      await waitFor(() => expect(within(prompt).getByRole("alert")).toHaveTextContent("save failed"));
+      expect(selectedSessionName()).toBe("alpha");
+      expect(daemon.attachedSessions).toEqual([]);
+      expect(fileText).toHaveValue("unsaved draft");
+      expect(screen.getByText("modified")).toBeInTheDocument();
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
+  it("dirty editor 离开 workspace 前等待决定", async () => {
+    const user = userEvent.setup();
+    const { fileText } = await openDirtyEditorWithTwoSessions(user);
+
+    await user.click(screen.getByRole("button", { name: "Daemons" }));
+    const prompt = await screen.findByRole("alertdialog", { name: /notes\.txt/ });
+    expect(screen.queryByRole("main", { name: "daemon admin" })).toBeNull();
+    expect(fileText).toHaveValue("unsaved draft");
+
+    await user.click(within(prompt).getByRole("button", { name: "Discard" }));
+    expect(await screen.findByRole("main", { name: "daemon admin" })).toBeInTheDocument();
+  });
+
+  it("关闭有 dirty editor 的 session 依次经过不可逆确认和草稿确认", async () => {
+    const user = userEvent.setup();
+    const { alphaSession, fileText } = await openDirtyEditorWithTwoSessions(user);
+
+    const alphaRow = screen.getByRole("button", { name: "Open alpha" }).closest(".session-row");
+    expect(alphaRow).not.toBeNull();
+    await user.click(within(alphaRow as HTMLElement).getByRole("button", { name: "Close session" }));
+    const destructivePrompt = await screen.findByRole("alertdialog", { name: "Close session?" });
+    expect(daemon.closedSessions).toEqual([]);
+    expect(fileText).toHaveValue("unsaved draft");
+
+    await user.click(within(destructivePrompt).getByRole("button", { name: "Close session" }));
+    const unsavedPrompt = await screen.findByRole("alertdialog", { name: /notes\.txt/ });
+    expect(daemon.closedSessions).toEqual([]);
+    expect(fileText).toHaveValue("unsaved draft");
+    await user.click(within(unsavedPrompt).getByRole("button", { name: "Stay" }));
+    expect(daemon.closedSessions).toEqual([]);
+    expect(fileText).toHaveValue("unsaved draft");
+
+    await user.click(within(alphaRow as HTMLElement).getByRole("button", { name: "Close session" }));
+    await user.click(within(await screen.findByRole("alertdialog", { name: "Close session?" })).getByRole("button", { name: "Close session" }));
+    await user.click(within(await screen.findByRole("alertdialog", { name: /notes\.txt/ })).getByRole("button", { name: "Discard" }));
+
+    await waitFor(() => expect(daemon.closedSessions).toEqual([alphaSession.session_id]));
+  });
+
+  it("关闭其他 session 不会要求处理当前 session 的 dirty editor", async () => {
+    const user = userEvent.setup();
+    const { betaSession, fileText } = await openDirtyEditorWithTwoSessions(user);
+
+    const betaRow = screen.getByRole("button", { name: "Open beta" }).closest(".session-row");
+    expect(betaRow).not.toBeNull();
+    await user.click(within(betaRow as HTMLElement).getByRole("button", { name: "Close session" }));
+    await confirmSessionClose(user);
+
+    await waitFor(() => expect(daemon.closedSessions).toEqual([betaSession.session_id]));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByRole("dialog", { name: "notes.txt" })).toBeInTheDocument();
+    expect(fileText).toHaveValue("unsaved draft");
+    expect(selectedSessionName()).toBe("alpha");
+  });
+
+  it("同 session reconnect 保留 dirty editor 草稿", async () => {
+    const user = userEvent.setup();
+    const { alphaSession, fileText } = await openDirtyEditorWithTwoSessions(user);
+
+    daemon.dropConnections();
+
+    await waitFor(() => expect(daemon.attachedSessions).toContain(alphaSession.session_id), { timeout: 2200 });
+    expect(screen.getByRole("dialog", { name: "notes.txt" })).toBeInTheDocument();
+    expect(fileText).toHaveValue("unsaved draft");
+    expect(screen.getByText("modified")).toBeInTheDocument();
   });
 
   it("上传进度在切换 session 后仍保留", async () => {
@@ -6256,6 +6800,113 @@ describe("termui web 工作台", () => {
     }
   });
 
+  it("Files 和 Git 刷新失败时保留缓存，并支持局部 dismiss 与 retry", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-0000000004e1";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        {
+          session_id: sessionId,
+          state: "running",
+          size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 },
+        },
+      ],
+      sessionFiles: {
+        [sessionId]: {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "cached.txt",
+              path: "/home/me/project/cached.txt",
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+        "/home/me/project": {
+          session_id: sessionId,
+          path: "/home/me/project",
+          entries: [
+            {
+              name: "cached.txt",
+              path: "/home/me/project/cached.txt",
+              kind: "file",
+              size_bytes: 6,
+              modified_at_ms: null,
+            },
+          ],
+        },
+      },
+      sessionGit: {
+        [sessionId]: {
+          session_id: sessionId,
+          cwd: "/home/me/project",
+          repository_root: "/home/me/project",
+          worktrees: [
+            {
+              path: "/home/me/project",
+              branch: "main",
+              head: "a1b2c3d",
+              is_current: true,
+              staged: [],
+              unstaged: [{ path: "README.md", status: " M" }],
+            },
+          ],
+          graph: ["* a1b2c3d cached commit"],
+          error: null,
+        },
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await clickSessionCard(user);
+    const panel = await screen.findByLabelText("session files");
+    await within(panel).findByText("cached.txt");
+    await user.click(within(panel).getByLabelText("Follow terminal cwd"));
+
+    const filesSpy = vi.spyOn(V070Client.prototype, "listSessionFiles");
+    filesSpy.mockRejectedValueOnce(new ProtocolClientError("connection_error", "Authorization Bearer raw-secret"));
+    await user.click(within(panel).getByRole("button", { name: "Refresh files" }));
+
+    const filesAlert = await within(panel).findByRole("alert", { name: "Files error" });
+    expect(within(panel).getByText("cached.txt")).toBeInTheDocument();
+    expect(filesAlert).toHaveTextContent("connection error");
+    expect(panel).not.toHaveTextContent("raw-secret");
+    await user.click(within(filesAlert).getByRole("button", { name: "Dismiss files error" }));
+    await waitFor(() => expect(within(panel).queryByRole("alert", { name: "Files error" })).toBeNull());
+    expect(within(panel).getByText("cached.txt")).toBeInTheDocument();
+
+    filesSpy.mockRejectedValueOnce(new ProtocolClientError("connection_error", "token=raw-secret"));
+    await user.click(within(panel).getByRole("button", { name: "Refresh files" }));
+    const retryFilesAlert = await within(panel).findByRole("alert", { name: "Files error" });
+    await user.click(within(retryFilesAlert).getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(within(panel).queryByRole("alert", { name: "Files error" })).toBeNull());
+    expect(within(panel).getByText("cached.txt")).toBeInTheDocument();
+    filesSpy.mockRestore();
+
+    await user.click(within(panel).getByRole("tab", { name: "Git" }));
+    await within(panel).findByText("README.md");
+    const gitSpy = vi.spyOn(V070Client.prototype, "getSessionGit");
+    gitSpy.mockRejectedValueOnce(new ProtocolClientError("connection_error", "Authorization Bearer raw-secret"));
+    await user.click(within(panel).getByRole("button", { name: "Refresh Git" }));
+
+    const gitAlert = await within(panel).findByRole("alert", { name: "Git error" });
+    expect(within(panel).getByText("README.md")).toBeInTheDocument();
+    expect(within(panel).getByTitle("a1b2c3d cached commit")).toBeInTheDocument();
+    expect(gitAlert).toHaveTextContent("connection error");
+    expect(panel).not.toHaveTextContent("raw-secret");
+    await user.click(within(gitAlert).getByRole("button", { name: "Dismiss Git error" }));
+    await waitFor(() => expect(within(panel).queryByRole("alert", { name: "Git error" })).toBeNull());
+    expect(within(panel).getByText("README.md")).toBeInTheDocument();
+    gitSpy.mockRestore();
+  });
+
   it("文件 panel 可以切到 Git tab 查看未提交文件和提交图", async () => {
     const user = userEvent.setup();
     const sessionId = "00000000-0000-0000-0000-000000000415";
@@ -6359,8 +7010,31 @@ describe("termui web 工作台", () => {
     );
 
     await user.click(within(panel).getByRole("button", { name: "Stage README.md" }));
+    await waitFor(() => expect(daemon.sessionGitActions).toContainEqual({
+      session_id: sessionId,
+      worktree_path: "/home/me/project",
+      file_path: "README.md",
+      action: "stage",
+    }));
     await user.click(within(panel).getByRole("button", { name: "Unstage src/lib.rs" }));
+    await waitFor(() => expect(daemon.sessionGitActions).toContainEqual({
+      session_id: sessionId,
+      worktree_path: "/home/me/project",
+      file_path: "src/lib.rs",
+      action: "unstage",
+    }));
     await user.click(within(panel).getByRole("button", { name: "Discard README.md" }));
+    const firstDiscardPrompt = await screen.findByRole("alertdialog", { name: "Discard Git changes?" });
+    expect(within(firstDiscardPrompt).getByText("/home/me/project/README.md")).toBeInTheDocument();
+    expect(within(firstDiscardPrompt).getByText(/index and working tree/i)).toBeInTheDocument();
+    expect(within(firstDiscardPrompt).getByText(/untracked file or directory/i)).toBeInTheDocument();
+    expect(daemon.sessionGitActions.filter((action) => action.action === "discard")).toEqual([]);
+    await user.click(within(firstDiscardPrompt).getByRole("button", { name: "Cancel" }));
+    expect(daemon.sessionGitActions.filter((action) => action.action === "discard")).toEqual([]);
+
+    await user.click(within(panel).getByRole("button", { name: "Discard README.md" }));
+    const secondDiscardPrompt = await screen.findByRole("alertdialog", { name: "Discard Git changes?" });
+    await user.click(within(secondDiscardPrompt).getByRole("button", { name: "Discard changes" }));
     await waitFor(() =>
       expect(daemon.sessionGitActions).toEqual(
         expect.arrayContaining([
@@ -6404,6 +7078,80 @@ describe("termui web 工作台", () => {
 
     await user.click(within(panel).getByRole("button", { name: "Collapse Git graph" }));
     expect(panel.querySelector(".git-graph-commit")).toBeNull();
+  });
+
+  it("文件删除和 Git discard 的待确认目标在切换 session 后不会作用到新 session", async () => {
+    const user = userEvent.setup();
+    const alphaSessionId = "00000000-0000-0000-0000-0000000004d1";
+    const betaSessionId = "00000000-0000-0000-0000-0000000004d2";
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [
+        { session_id: alphaSessionId, name: "alpha", state: "running", size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 } },
+        { session_id: betaSessionId, name: "beta", state: "running", size: { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 } },
+      ],
+      sessionFiles: {
+        [alphaSessionId]: {
+          session_id: alphaSessionId,
+          path: "/home/alpha/project",
+          entries: [{ name: "notes.txt", path: "/home/alpha/project/notes.txt", kind: "file", size_bytes: 4, modified_at_ms: null }],
+        },
+        [betaSessionId]: { session_id: betaSessionId, path: "/home/beta/project", entries: [] },
+      },
+      sessionGit: {
+        [alphaSessionId]: {
+          session_id: alphaSessionId,
+          cwd: "/home/alpha/project",
+          repository_root: "/home/alpha/project",
+          worktrees: [{
+            path: "/home/alpha/project",
+            branch: "main",
+            head: "a1b2c3d",
+            is_current: true,
+            staged: [],
+            unstaged: [{ path: "README.md", status: " M" }],
+          }],
+          graph: [],
+          error: null,
+        },
+        [betaSessionId]: {
+          session_id: betaSessionId,
+          cwd: "/home/beta/project",
+          repository_root: "/home/beta/project",
+          worktrees: [],
+          graph: [],
+          error: null,
+        },
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("alpha");
+    await clickSessionCard(user, "alpha");
+    const panel = await screen.findByLabelText("session files");
+    await within(panel).findByText("notes.txt");
+
+    await user.click(within(panel).getByRole("button", { name: "Delete notes.txt" }));
+    await screen.findByRole("alertdialog", { name: "Delete file?" });
+    fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
+    await waitFor(() => expect(daemon.attachedSessions.at(-1)).toBe(betaSessionId));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    expect(daemon.sessionFileDeletes).toEqual([]);
+
+    await clickSessionCard(user, "alpha");
+    await waitFor(() => expect(daemon.attachedSessions.at(-1)).toBe(alphaSessionId));
+    await user.click(within(panel).getByRole("tab", { name: "Git" }));
+    await within(panel).findByText("README.md");
+    await user.click(within(panel).getByRole("button", { name: "Discard README.md" }));
+    await screen.findByRole("alertdialog", { name: "Discard Git changes?" });
+    fireEvent.click(screen.getByRole("button", { name: "Open beta" }));
+    await waitFor(() => expect(daemon.attachedSessions.at(-1)).toBe(betaSessionId));
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    expect(daemon.sessionGitActions.filter((action) => action.action === "discard")).toEqual([]);
   });
 
   it("旧 Git diff 迟到后不会覆盖当前 diff 弹窗", async () => {
@@ -7307,6 +8055,22 @@ describe("termui web 工作台", () => {
     expect(within(clientPanel).queryByText("198.51.100.9")).toBeNull();
     expect(within(clientPanel).queryByText("offline")).toBeNull();
 
+    const clientsTrigger = screen.getByRole("button", { name: "Clients" });
+    await user.keyboard("{Escape}");
+    expect(screen.queryByLabelText("daemon clients")).toBeNull();
+    expect(clientsTrigger).toHaveFocus();
+
+    await user.click(clientsTrigger);
+    await screen.findByLabelText("daemon clients");
+    await user.tab();
+    expect(screen.queryByLabelText("daemon clients")).toBeNull();
+    expect(screen.getByRole("button", { name: "Daemons" })).toHaveFocus();
+
+    await user.click(clientsTrigger);
+    await screen.findByLabelText("daemon clients");
+    await user.click(screen.getByRole("button", { name: "Daemons" }));
+    expect(screen.queryByLabelText("daemon clients")).toBeNull();
+
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
     const toolbarRule = Array.from(css.matchAll(/(?:^|\n)\.toolbar \{([^}]*)\}/g), (match) => match[1])
       .find((rule) => rule.includes("min-width: 0;"));
@@ -7325,6 +8089,29 @@ describe("termui web 工作台", () => {
     expect(screen.queryByRole("button", { name: "Open" })).toBeNull();
     expect(actions).toContainElement(screen.getByRole("button", { name: "Rename session" }));
     expect(actions).toContainElement(screen.getByRole("button", { name: "Close session" }));
+  });
+
+  it("关闭 session 在明确确认前和取消后都不发送 mutation", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+
+    await user.click(screen.getByRole("button", { name: "Close session" }));
+    const firstPrompt = await screen.findByRole("alertdialog", { name: "Close session?" });
+    expect(within(firstPrompt).getByText(DEFAULT_SESSION_NAME)).toBeInTheDocument();
+    expect(daemon.closedSessions).toEqual([]);
+
+    await user.click(within(firstPrompt).getByRole("button", { name: "Cancel" }));
+    expect(daemon.closedSessions).toEqual([]);
+    expect(screen.getAllByText(DEFAULT_SESSION_NAME).length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "Close session" }));
+    const secondPrompt = await screen.findByRole("alertdialog", { name: "Close session?" });
+    await user.click(within(secondPrompt).getByRole("button", { name: "Close session" }));
+
+    await waitFor(() => expect(daemon.closedSessions).toEqual([DEFAULT_SESSION_ID]));
   });
 
   it("Session 行名称在会话菜单里左对齐", async () => {
@@ -7404,6 +8191,58 @@ describe("termui web 工作台", () => {
     await user.click(screen.getByRole("button", { name: "Show files panel" }));
     expect(await screen.findByLabelText("session files")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Hide files panel" })).toBeInTheDocument();
+  });
+
+  it("跨 responsive band 应用 panel 默认值，同一 band 保留用户选择", async () => {
+    setViewportWidth(1000);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await clickSessionCard(user);
+
+    expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show files panel" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Show files panel" }));
+    expect(await screen.findByLabelText("session files")).toBeInTheDocument();
+
+    setViewportWidth(950);
+    await waitFor(() => expect(screen.getByLabelText("session files")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+
+    setViewportWidth(850);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Expand sidebar" })).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Show files panel" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    await user.click(screen.getByRole("button", { name: "Show files panel" }));
+    expect(await screen.findByLabelText("session files")).toBeInTheDocument();
+
+    setViewportWidth(800);
+    await waitFor(() => expect(screen.getByLabelText("session files")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+
+    setViewportWidth(390);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open mobile workspace menu" })).toBeInTheDocument());
+    expect(document.querySelector(".workspace-body-mobile")).not.toBeNull();
+    expect(document.querySelector(".app-shell")).not.toHaveClass("sidebar-is-collapsed");
+    expect(screen.queryByLabelText("session files")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Open mobile workspace menu" }));
+    await user.click(within(screen.getByRole("navigation", { name: "mobile workspace menu" })).getByRole("button", { name: "Sessions" }));
+    expect(await screen.findByLabelText("sessions panel")).toBeInTheDocument();
+
+    setViewportWidth(1000);
+    await waitFor(() => expect(screen.queryByLabelText("sessions panel")).toBeNull());
+    expect(screen.queryByRole("button", { name: "Open mobile workspace menu" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show files panel" })).toBeInTheDocument();
+
+    setViewportWidth(390);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open mobile workspace menu" })).toBeInTheDocument());
+    expect(screen.queryByLabelText("sessions panel")).toBeNull();
   });
 
   it("桌面文件 panel 可以通过拖拽分隔条调整宽度", async () => {
@@ -7648,6 +8487,7 @@ describe("termui web 工作台", () => {
     ]);
 
     await user.click(screen.getByRole("button", { name: "Close session" }));
+    await confirmSessionClose(user);
 
     await waitFor(() => {
       expect(screen.queryByText("work shell")).toBeNull();
@@ -7682,6 +8522,7 @@ describe("termui web 工作台", () => {
     const attachCount = daemon.attachRequests.length;
 
     await user.click(screen.getByRole("button", { name: "Close session" }));
+    await confirmSessionClose(user);
 
     expect(screen.queryByText(DEFAULT_SESSION_NAME)).toBeNull();
     expect(daemon.attachRequests).toHaveLength(attachCount);
@@ -7731,6 +8572,7 @@ describe("termui web 工作台", () => {
     expect(alphaRow).not.toBeNull();
 
     await user.click(within(alphaRow as HTMLElement).getByRole("button", { name: "Close session" }));
+    await confirmSessionClose(user);
 
     await waitFor(() => expect(visibleSessionNames()).toEqual(["beta"]));
     expect(selectedSessionName()).toBeUndefined();
@@ -7791,6 +8633,7 @@ describe("termui web 工作台", () => {
     expect(alphaRow).not.toBeNull();
 
     await user.click(within(alphaRow as HTMLElement).getByRole("button", { name: "Close session" }));
+    await confirmSessionClose(user);
 
     await waitFor(() => expect(visibleSessionNames()).toEqual(["beta"]));
     await waitFor(() => expect(daemon.closedSessions).toEqual([alphaSession.session_id]));
@@ -7860,6 +8703,7 @@ describe("termui web 工作台", () => {
       fireEvent.click(betaOpenButton);
       expect(selectedSessionName()).toBe("beta");
       fireEvent.click(alphaCloseButton);
+      fireEvent.click(within(screen.getByRole("alertdialog", { name: "Close session?" })).getByRole("button", { name: "Close session" }));
       await act(async () => {
         await vi.advanceTimersByTimeAsync(100);
       });
@@ -7889,6 +8733,7 @@ describe("termui web 工作台", () => {
     ], 40);
 
     await user.click(screen.getByRole("button", { name: "Close session" }));
+    await confirmSessionClose(user);
 
     await waitFor(() => {
       expect(screen.queryByText(DEFAULT_SESSION_NAME)).toBeNull();
@@ -7930,6 +8775,7 @@ describe("termui web 工作台", () => {
     const betaRow = betaOpenButton.closest(".session-row");
     expect(betaRow).not.toBeNull();
     await user.click(within(betaRow as HTMLElement).getByRole("button", { name: "Close session" }));
+    await confirmSessionClose(user);
 
     await waitFor(() => expect(visibleSessionNames()).toEqual(["alpha"]));
     expect(selectedSessionName()).toBeUndefined();
@@ -7951,6 +8797,7 @@ describe("termui web 工作台", () => {
     daemon.forgetSession(sessionId);
 
     await user.click(screen.getByRole("button", { name: "Close session" }));
+    await confirmSessionClose(user);
 
     await waitFor(() => expect(visibleSessionNames()).toEqual([]));
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
@@ -7983,6 +8830,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
 
     await user.click(screen.getByRole("button", { name: "Close session" }));
+    await confirmSessionClose(user);
 
     await waitFor(() => expect(visibleSessionNames()).toEqual([]));
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
@@ -8004,6 +8852,7 @@ describe("termui web 工作台", () => {
     // 用例就会从“关闭失败显示错误”漂成“真的关闭成功”。
     await waitFor(() => expect(daemon.activeConnectionCount()).toBe(0));
     await user.click(screen.getByRole("button", { name: "Close session" }));
+    await confirmSessionClose(user);
 
     await waitFor(() => expect(visibleSessionNames()).toEqual([]));
     expect(screen.queryByRole("alert", { name: "Connection error" })).toBeNull();
@@ -8053,6 +8902,7 @@ describe("termui web 工作台", () => {
       fireEvent.click(openButton);
       fireEvent.click(closeButton);
     });
+    fireEvent.click(within(screen.getByRole("alertdialog", { name: "Close session?" })).getByRole("button", { name: "Close session" }));
 
     await new Promise((resolve) => window.setTimeout(resolve, 160));
     await waitFor(() => {
@@ -8985,8 +9835,11 @@ describe("termui web 工作台", () => {
 
     expect(await screen.findByLabelText("daemon admin")).toBeVisible();
     expect(await screen.findByLabelText("WS URL")).toHaveValue(defaultWsUrlFromPage());
-    expect(screen.getByRole("button", { name: "Workspace" })).toBeDisabled();
-    expect(within(screen.getByLabelText("daemon manager")).getByText("No daemons")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Workspace" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open workspace" })).toBeNull();
+    expect(screen.queryByLabelText("selected daemon")).toBeNull();
+    expect(screen.queryByLabelText("daemon manager")).toBeNull();
+    expect(document.querySelector(".admin-grid-unpaired")).not.toBeNull();
     expect(screen.getByLabelText("Pairing token")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Scan QR" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "New session" })).toBeNull();

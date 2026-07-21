@@ -41,9 +41,11 @@ export interface FileTransferProgressState {
 }
 
 export interface FileEditorState {
+  sessionId: UUID;
   path: string;
   name: string;
-  text: string;
+  savedText: string;
+  dirty: boolean;
   loading: boolean;
   saving: boolean;
   error?: string;
@@ -233,7 +235,6 @@ export function useSessionFiles() {
     setSessionGit(undefined);
     setSessionGitError(undefined);
     setSessionGitLoading(false);
-    setFileEditor(undefined);
   }, []);
 
   return {
@@ -373,7 +374,6 @@ export function useSessionFileLoaders(
       }
       if (!silent) {
         setSessionFilesLoading(true);
-        setSessionFilesError(undefined);
       }
       try {
         const client = await authenticatedSessionClient(sessionId);
@@ -397,7 +397,6 @@ export function useSessionFileLoaders(
       } catch (caught) {
         if (!silent && requestSeq === sessionFilesRequestSeqRef.current) {
           // 文件列表是终端旁路信息；失败时只收敛到右侧 panel，不打断已 attach 的终端会话。
-          setSessionFiles(undefined);
           setSessionFilesError(toSafeError(caught));
         }
       } finally {
@@ -437,7 +436,6 @@ export function useSessionFileLoaders(
         attachedSessionRef.current === sessionId;
       if (!silent) {
         setSessionGitLoading(true);
-        setSessionGitError(undefined);
       }
       try {
         const client = await authenticatedSessionClient(sessionId);
@@ -449,7 +447,6 @@ export function useSessionFileLoaders(
         setSessionGitError(undefined);
       } catch (caught) {
         if (!silent && isCurrentRequest()) {
-          setSessionGit(undefined);
           setSessionGitError(toSafeError(caught));
         }
       } finally {
@@ -684,7 +681,6 @@ export function useSessionFilesPanelActions(
 }
 
 interface UseSessionFileEditorOptions {
-  attachedSessionId?: UUID;
   attachedSessionRef: MutableRefObject<UUID | undefined>;
   fileEditor: FileEditorState | undefined;
   setFileEditor: Dispatch<SetStateAction<FileEditorState | undefined>>;
@@ -705,7 +701,6 @@ interface OpenRemoteFileInput {
 
 export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
   const {
-    attachedSessionId,
     attachedSessionRef,
     fileEditor,
     setFileEditor,
@@ -736,12 +731,6 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
     setFileEditor(undefined);
   }, [setFileEditor]);
 
-  useEffect(() => {
-    // 中文注释：session 切换后，旧 session 的 read/save 都必须失效，
-    // 否则迟到响应会把已经切走的 editor 重新写回界面。
-    resetFileEditor();
-  }, [attachedSessionId, resetFileEditor]);
-
   const beginFileOpenRequest = useCallback((sessionId: UUID, path: string) => {
     const request = {
       requestId: fileOpenRequestSeqRef.current + 1,
@@ -758,10 +747,9 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
     return (
       active?.requestId === request.requestId &&
       active.sessionId === request.sessionId &&
-      active.path === request.path &&
-      attachedSessionRef.current === request.sessionId
+      active.path === request.path
     );
-  }, [attachedSessionRef]);
+  }, []);
 
   const beginFileSaveRequest = useCallback((sessionId: UUID, path: string) => {
     const request = {
@@ -779,10 +767,9 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
     return (
       active?.requestId === request.requestId &&
       active.sessionId === request.sessionId &&
-      active.path === request.path &&
-      attachedSessionRef.current === request.sessionId
+      active.path === request.path
     );
-  }, [attachedSessionRef]);
+  }, []);
 
   const openRemoteFile = useCallback(
     async ({ path, name, sizeBytes }: OpenRemoteFileInput) => {
@@ -793,9 +780,11 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
       const request = beginFileOpenRequest(sessionId, path);
       if (sizeBytes > textFileMaxBytes) {
         setFileEditor({
+          sessionId,
           path,
           name,
-          text: "",
+          savedText: "",
+          dirty: false,
           loading: false,
           saving: false,
           error: translateError(new ProtocolClientError("file_too_large", "file is too large to edit in browser")),
@@ -805,9 +794,11 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
 
       setSessionFilesError(undefined);
       setFileEditor({
+        sessionId,
         path,
         name,
-        text: "",
+        savedText: "",
+        dirty: false,
         loading: true,
         saving: false,
       });
@@ -819,9 +810,11 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
           return;
         }
         setFileEditor({
+          sessionId,
           path: payload.path,
           name,
-          text: new TextDecoder().decode(payload.bytes),
+          savedText: new TextDecoder().decode(payload.bytes),
+          dirty: false,
           loading: false,
           saving: false,
         });
@@ -830,9 +823,11 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
           return;
         }
         setFileEditor((current) => ({
+          sessionId,
           path: current?.path ?? path,
           name: current?.name ?? name,
-          text: current?.text ?? "",
+          savedText: current?.savedText ?? "",
+          dirty: current?.dirty ?? false,
           loading: false,
           saving: false,
           error: translateError(caught),
@@ -871,13 +866,13 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
 
   const handleSaveOpenFile = useCallback(
     async (text: string) => {
-      const sessionId = attachedSessionRef.current;
       const editor = fileEditor;
-      if (!sessionId || !editor) {
-        return;
+      const sessionId = editor?.sessionId;
+      if (!sessionId || !editor || attachedSessionRef.current !== sessionId) {
+        return false;
       }
       const request = beginFileSaveRequest(sessionId, editor.path);
-      setFileEditor({ ...editor, text, saving: true, error: undefined });
+      setFileEditor({ ...editor, dirty: text !== editor.savedText, saving: true, error: undefined });
       let sessionClient: { client: SessionFileEditorClient; ownsClient: boolean } | undefined;
       try {
         sessionClient = await resolveSessionClient(sessionId);
@@ -887,29 +882,33 @@ export function useSessionFileEditor(options: UseSessionFileEditorOptions) {
           new TextEncoder().encode(text),
         );
         if (!isActiveFileSaveRequest(request)) {
-          return;
+          return false;
         }
         setFileEditor({
+          sessionId,
           path: written.path,
           name: editor.name,
-          text,
+          savedText: text,
+          dirty: false,
           loading: false,
           saving: false,
         });
         if (attachedSessionRef.current === sessionId) {
           await refreshVisibleDirectory(sessionId);
         }
+        return true;
       } catch (caught) {
         if (!isActiveFileSaveRequest(request)) {
-          return;
+          return false;
         }
         setFileEditor({
           ...editor,
-          text,
+          dirty: text !== editor.savedText,
           loading: false,
           saving: false,
           error: translateError(caught),
         });
+        return false;
       } finally {
         if (sessionClient?.ownsClient) {
           sessionClient.client.close();

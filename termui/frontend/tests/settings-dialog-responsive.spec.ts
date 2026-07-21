@@ -1,0 +1,71 @@
+import { expect, test, type Locator, type Page } from "@playwright/test";
+
+const viewports = [
+  {
+    name: "320x480 narrow portrait",
+    viewport: { width: 320, height: 480 },
+    safeArea: { top: 24, right: 0, bottom: 20, left: 0 },
+  },
+  {
+    name: "844x390 short landscape",
+    viewport: { width: 844, height: 390 },
+    safeArea: { top: 0, right: 34, bottom: 21, left: 34 },
+  },
+] as const;
+
+async function expectActionInsideViewport(
+  page: Page,
+  action: Locator,
+  safeArea: { top: number; right: number; bottom: number; left: number },
+): Promise<void> {
+  await expect(action).toBeVisible();
+  await expect(action).toBeEnabled();
+
+  const viewport = page.viewportSize();
+  const box = await action.boundingBox();
+  expect(viewport).not.toBeNull();
+  expect(box).not.toBeNull();
+  expect(box!.x).toBeGreaterThanOrEqual(safeArea.left);
+  expect(box!.y).toBeGreaterThanOrEqual(safeArea.top);
+  expect(box!.x + box!.width).toBeLessThanOrEqual(viewport!.width - safeArea.right);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height - safeArea.bottom);
+  expect(box!.height).toBeGreaterThanOrEqual(44);
+}
+
+test.beforeEach(async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chrome", "touch layout only");
+  await page.addInitScript(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+    indexedDB.deleteDatabase("termd-termui-web");
+  });
+});
+
+for (const scenario of viewports) {
+  test(`settings actions stay reachable in ${scenario.name}`, async ({ page }) => {
+    await page.setViewportSize(scenario.viewport);
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Emulation.setSafeAreaInsetsOverride", { insets: scenario.safeArea });
+
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    await page.getByRole("button", { name: "Settings" }).click();
+
+    const dialog = page.getByRole("dialog", { name: "Settings" });
+    const textarea = dialog.getByRole("textbox", { name: "Mobile shortcuts" });
+    const cancel = dialog.getByRole("button", { name: "Cancel" });
+    const apply = dialog.getByRole("button", { name: "Apply" });
+    await expect(dialog).toBeVisible();
+
+    await textarea.fill("Pending=abc");
+    await expectActionInsideViewport(page, cancel, scenario.safeArea);
+    await expectActionInsideViewport(page, apply, scenario.safeArea);
+
+    await cancel.click();
+    await expect(textarea).toHaveValue("");
+
+    await textarea.fill("Esc=\\e");
+    await apply.click();
+    await expect(apply).toBeDisabled();
+  });
+}

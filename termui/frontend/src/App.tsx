@@ -54,6 +54,10 @@ import { ConnectionPanel } from "./components/ConnectionPanel";
 import { CollapsedSessionButton, SessionList } from "./components/SessionList";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalPane } from "./components/TerminalPane";
+import { DestructiveActionDialog } from "./components/DestructiveActionDialog";
+import { UnsavedFileDialog } from "./components/UnsavedFileDialog";
+import { useDismissiblePopover } from "./components/useDismissiblePopover";
+import { useModalFocus } from "./components/useModalFocus";
 import type { TerminalOutputItem, TerminalResyncOptions } from "./components/terminal/types";
 import {
   advanceSessionOpenProgress,
@@ -80,6 +84,7 @@ import {
 import { fallbackSessionDisplayName, sessionDisplayName } from "./session-names";
 import { createTranslator, I18nProvider, resolveLocale, translateSafeErrorMessage, useI18n, type Translate } from "./i18n";
 import { resolveTheme } from "./theme";
+import { panelDefaultsForBand, viewportBandForWidth, type ViewportBand } from "./responsive-layout";
 import type { BrowserPreferences } from "./protocol/types";
 import { recordTermdDiagnostic } from "./diagnostics";
 import { displayUrlWithoutQueryOrFragment, stripSensitiveUrlParts } from "./protocol/url";
@@ -119,11 +124,11 @@ const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
 const FILE_TRANSFER_MEMORY_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
 const TERMINAL_INPUT_BUFFER_MAX_BYTES = 1024 * 1024;
 const TERMINAL_INPUT_CHUNK_MAX_BYTES = 64 * 1024;
-const MOBILE_LAYOUT_QUERY = "(max-width: 760px)";
-const MOBILE_LAYOUT_BREAKPOINT = 760;
 const MOBILE_TITLE_PULL_START_PX = 8;
 const MOBILE_TITLE_PULL_REFRESH_PX = 52;
 const MOBILE_TITLE_PULL_MAX_PX = 72;
+const MOBILE_TITLE_PULL_VELOCITY_WINDOW_MS = 100;
+const MOBILE_TITLE_PULL_CLICK_SUPPRESSION_MS = 500;
 const CPU_HISTORY_LIMIT = 48;
 const CPU_BAR_CHART_WIDTH = 56;
 const CPU_BAR_CHART_HEIGHT = 18;
@@ -157,11 +162,42 @@ interface PendingNotificationTarget {
   sessionId: UUID;
 }
 
+type PendingFileEditorAction = () => void | Promise<void>;
+
+type PendingDestructiveAction =
+  | { kind: "session-close"; sessionId: UUID; name: string }
+  | { kind: "file-delete"; sessionId: UUID; entry: SessionFileEntryPayload }
+  | {
+      kind: "git-discard";
+      sessionId: UUID;
+      worktree: SessionGitWorktreePayload;
+      change: SessionGitFileChangePayload;
+    }
+  | { kind: "daemon-forget"; serverId: UUID; label: string; url: string };
+
 interface MobileTitlePullGesture {
   pointerId: number;
   startX: number;
   startY: number;
+  startDistance: number;
+  lastDistance: number;
+  lastTimestampMs: number;
+  velocityPxPerSecond: number;
+  samples: MobileTitlePullSample[];
   dragging: boolean;
+  refreshArmed: boolean;
+}
+
+interface MobileTitlePullSample {
+  distance: number;
+  timestampMs: number;
+}
+
+interface MobileTitlePullAnimation {
+  frameId: number;
+  lastTimestampMs: number;
+  position: number;
+  velocityPxPerSecond: number;
 }
 
 export function isExclusiveMetadataClient(
@@ -473,8 +509,13 @@ export default function App() {
     clearFileTransferProgressTimers,
     clearSessionFilesState,
   } = sessionFilesController;
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [filesPanelOpen, setFilesPanelOpen] = useState(true);
+  const viewportBand = useViewportBand();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => panelDefaultsForBand(viewportBand).sidebarCollapsed,
+  );
+  const [filesPanelOpen, setFilesPanelOpen] = useState(
+    () => panelDefaultsForBand(viewportBand).filesPanelOpen,
+  );
   const [filesPanelWidth, setFilesPanelWidth] = useState(DEFAULT_FILES_PANEL_WIDTH);
   const [isFilesPanelResizing, setIsFilesPanelResizing] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -486,6 +527,9 @@ export default function App() {
   const [renamingDaemonId, setRenamingDaemonId] = useState<UUID | undefined>();
   const [daemonRenameDraft, setDaemonRenameDraft] = useState("");
   const [activeSurface, setActiveSurface] = useState<AppSurface>("admin");
+  const [unsavedFileDialogOpen, setUnsavedFileDialogOpen] = useState(false);
+  const [pendingDestructiveAction, setPendingDestructiveAction] = useState<PendingDestructiveAction | undefined>();
+  const [destructiveActionBusy, setDestructiveActionBusy] = useState(false);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState<SafeError | undefined>();
   // 每个 workspace 固定复用一条 metadata WebSocket；当前 session 的 PTY 数据只走
@@ -539,7 +583,11 @@ export default function App() {
     attachReconnectHandlerRef,
   } = terminalAttachController;
   const mobileTitlePullGestureRef = useRef<MobileTitlePullGesture | undefined>(undefined);
+  const mobileTitlePullAnimationRef = useRef<MobileTitlePullAnimation | undefined>(undefined);
+  const mobileTitlePullDistanceRef = useRef(0);
+  const previousViewportBandRef = useRef(viewportBand);
   const suppressMobileTitleClickRef = useRef(false);
+  const suppressMobileTitleClickTimerRef = useRef<number | undefined>(undefined);
   const closingSessionIdsRef = useRef<Set<UUID>>(new Set());
   const closedSessionIdsRef = useRef<Set<UUID>>(new Set());
   const renamingSessionIdRef = useRef<UUID | undefined>(undefined);
@@ -573,7 +621,37 @@ export default function App() {
   const terminalResumeMountedRef = useRef(false);
   const pushPreferenceSyncQueueRef = useRef<Promise<void>>(Promise.resolve());
   const fileEditorResetRef = useRef<() => void>(() => {});
-  const isMobileLayout = useMobileLayout();
+  const fileEditorRef = useRef(fileEditor);
+  const fileEditorDraftRef = useRef("");
+  const pendingFileEditorActionRef = useRef<PendingFileEditorAction | undefined>(undefined);
+  const destructiveActionBusyRef = useRef(false);
+  fileEditorRef.current = fileEditor;
+
+  useEffect(() => {
+    if (!fileEditor) {
+      fileEditorDraftRef.current = "";
+    } else if (!fileEditor.dirty) {
+      fileEditorDraftRef.current = fileEditor.savedText;
+    }
+  }, [fileEditor]);
+  const isMobileLayout = viewportBand === "mobile";
+
+  useEffect(() => {
+    if (previousViewportBandRef.current === viewportBand) {
+      return;
+    }
+
+    previousViewportBandRef.current = viewportBand;
+    const defaults = panelDefaultsForBand(viewportBand);
+    setSidebarCollapsed(defaults.sidebarCollapsed);
+    setFilesPanelOpen(defaults.filesPanelOpen);
+
+    if (viewportBand !== "mobile") {
+      setMobileMenuOpen(false);
+      setMobilePanel(undefined);
+    }
+  }, [viewportBand]);
+
   const mobileTerminalInputMode = useMobileTerminalInputMode(isMobileLayout);
   const visualViewportMetrics = useVisualViewportMetrics(mobileTerminalInputMode && activeSurface === "workspace");
   const systemTheme = useSystemTheme();
@@ -586,7 +664,6 @@ export default function App() {
     .join("|");
   const visibleFileTransferProgress = visibleProgressForSession(attachedSessionId);
   const clearSessionFiles = useCallback(() => {
-    fileEditorResetRef.current();
     clearSessionFilesState();
   }, [clearSessionFilesState]);
 
@@ -886,7 +963,10 @@ export default function App() {
   const showMobileWorkspaceMenu = isMobileLayout && connectionReady;
   const showMobileSessionsPanel = showMobileWorkspaceMenu && mobilePanel === "sessions";
   const showMobileFilesPanel = showMobileWorkspaceMenu && mobilePanel === "files";
-  const mobileTitlePullReady = mobileTitlePullDistance >= MOBILE_TITLE_PULL_REFRESH_PX;
+  const mobileTitlePullReady = Boolean(
+    mobileTitlePullGestureRef.current?.refreshArmed &&
+    mobileTitlePullDistance >= MOBILE_TITLE_PULL_REFRESH_PX,
+  );
   const mobileTitlePullStyle =
     showMobileWorkspaceMenu && mobileTitlePullDistance > 0
       ? ({ "--termd-mobile-title-pull": `${mobileTitlePullDistance}px` } as CSSProperties)
@@ -908,11 +988,22 @@ export default function App() {
         "--termd-visual-viewport-keyboard-inset": `${visualViewportMetrics.keyboardInset}px`,
       } as CSSProperties)
     : undefined;
-  const canOpenWorkspace = Boolean(activeServer && state.device);
+  const canOpenWorkspace = Boolean(activeServer && state.device) && status !== "saving_url";
   const canSaveRename = Boolean(renameDraft.trim()) && renameDraft.trim() !== renameOriginalName.trim();
   const activeDaemonLabel =
     pairedServerOptions.find((item) => item.server.server_id === activeServer?.server_id)?.label ?? t("app.noDaemon");
-  const handleOpenAdmin = useCallback((options: { editConnection?: boolean } = {}) => {
+  const { triggerRef: mobileMenuTriggerRef, popoverRef: mobileMenuPopoverRef } =
+    useDismissiblePopover<HTMLButtonElement, HTMLElement>({
+      open: showMobileWorkspaceMenu && mobileMenuOpen,
+      onClose: () => setMobileMenuOpen(false),
+    });
+  const { triggerRef: clientsTriggerRef, popoverRef: clientsPopoverRef } =
+    useDismissiblePopover<HTMLButtonElement, HTMLDivElement>({
+      open: connectionReady && !isMobileLayout && clientsOpen,
+      onClose: () => setClientsOpen(false),
+      focusFirst: false,
+    });
+  const commitOpenAdmin = useCallback((options: { editConnection?: boolean } = {}) => {
     setActiveSurface("admin");
     setMobilePanel(undefined);
     setMobileMenuOpen(false);
@@ -1389,6 +1480,7 @@ export default function App() {
   }, [activeSurface, disconnectAttach]);
 
   const resetWorkspaceState = useCallback(() => {
+    fileEditorResetRef.current();
     setSessions([]);
     confirmedSessionSizesRef.current.clear();
     closingSessionIdsRef.current.clear();
@@ -1463,8 +1555,8 @@ export default function App() {
     [daemonRenameDraft, handleCancelDaemonRename, setSafeError],
   );
 
-  const handleForgetDaemon = useCallback(
-    async (serverId: UUID) => {
+  const performForgetDaemon = useCallback(
+    async (serverId: UUID): Promise<boolean> => {
       const wasActive = activeServer?.server_id === serverId;
       try {
         const targetServer = state.pairedServers.find((server) => server.server_id === serverId);
@@ -1502,8 +1594,10 @@ export default function App() {
         } else if (wasActive) {
           setStatus("idle");
         }
+        return true;
       } catch (caught) {
         setSafeError(caught);
+        return false;
       }
     },
     [
@@ -1682,6 +1776,12 @@ export default function App() {
     loadSessionGit,
     resolveDirectoryPath: resolveRemoteDirectoryPath,
   });
+  const handleDismissSessionFilesError = useCallback(() => {
+    setSessionFilesError(undefined);
+  }, [setSessionFilesError]);
+  const handleDismissSessionGitError = useCallback(() => {
+    setSessionGitError(undefined);
+  }, [setSessionGitError]);
   const { handleCloseGitDiff, handleOpenGitDiff } = useSessionGitDiffViewer({
     attachedSessionId,
     attachedSessionRef,
@@ -1713,7 +1813,6 @@ export default function App() {
     resetFileEditor,
     openRemoteFile,
   } = useSessionFileEditor({
-    attachedSessionId,
     attachedSessionRef,
     fileEditor,
     setFileEditor,
@@ -1738,6 +1837,79 @@ export default function App() {
     resolveSessionClient,
   });
   fileEditorResetRef.current = resetFileEditor;
+
+  const requestFileEditorAction = useCallback((action: PendingFileEditorAction) => {
+    const editor = fileEditorRef.current;
+    if (!editor) {
+      void action();
+      return;
+    }
+    if (editor.saving) {
+      pendingFileEditorActionRef.current = action;
+      setUnsavedFileDialogOpen(true);
+      return;
+    }
+    if (!editor.dirty) {
+      resetFileEditor();
+      void action();
+      return;
+    }
+    pendingFileEditorActionRef.current = action;
+    setUnsavedFileDialogOpen(true);
+  }, [resetFileEditor]);
+
+  const completePendingFileEditorAction = useCallback(() => {
+    const action = pendingFileEditorActionRef.current;
+    pendingFileEditorActionRef.current = undefined;
+    setUnsavedFileDialogOpen(false);
+    resetFileEditor();
+    void action?.();
+  }, [resetFileEditor]);
+
+  const handleStayWithFileDraft = useCallback(() => {
+    pendingFileEditorActionRef.current = undefined;
+    setUnsavedFileDialogOpen(false);
+  }, []);
+
+  const handleDiscardFileDraft = useCallback(() => {
+    completePendingFileEditorAction();
+  }, [completePendingFileEditorAction]);
+
+  const handleFileEditorSave = useCallback(async (draftText: string) => {
+    const saved = await handleSaveOpenFile(draftText);
+    if (saved) {
+      if (pendingFileEditorActionRef.current) {
+        completePendingFileEditorAction();
+      }
+    }
+  }, [completePendingFileEditorAction, handleSaveOpenFile]);
+
+  const handleSaveFileDraft = useCallback(async () => {
+    const editor = fileEditorRef.current;
+    if (!editor || editor.saving) {
+      return;
+    }
+    await handleFileEditorSave(fileEditorDraftRef.current);
+  }, [handleFileEditorSave]);
+
+  const handleFileEditorDraftChange = useCallback((draftText: string) => {
+    fileEditorDraftRef.current = draftText;
+    const current = fileEditorRef.current;
+    if (!current) {
+      return;
+    }
+    const dirty = draftText !== current.savedText;
+    if (current.dirty === dirty && current.error === undefined) {
+      return;
+    }
+    const next = { ...current, dirty, error: undefined };
+    fileEditorRef.current = next;
+    setFileEditor(next);
+  }, [setFileEditor]);
+
+  const handleOpenAdmin = useCallback((options: { editConnection?: boolean } = {}) => {
+    requestFileEditorAction(() => commitOpenAdmin(options));
+  }, [commitOpenAdmin, requestFileEditorAction]);
 
   const handleRefresh = useCallback(async (options: { bootstrap?: boolean } = {}) => {
     if (isPagePaused()) {
@@ -2374,7 +2546,7 @@ export default function App() {
     ],
   );
 
-  const handleAttach = useCallback(
+  const commitAttach = useCallback(
     (sessionId: UUID, options: AttachUiOptions = {}) => {
       const attachOptions: Required<AttachUiOptions> = {
         closeMobilePanel: options.closeMobilePanel ?? true,
@@ -2442,8 +2614,19 @@ export default function App() {
     [beginSessionOpenProgress, cancelScheduledAttachSwitch, clearNewOutputMark, performAttach, selectSession],
   );
 
+  const handleAttach = useCallback(
+    (sessionId: UUID, options: AttachUiOptions = {}) => {
+      if (fileEditorRef.current?.sessionId === sessionId) {
+        commitAttach(sessionId, options);
+        return;
+      }
+      requestFileEditorAction(() => commitAttach(sessionId, options));
+    },
+    [commitAttach, requestFileEditorAction],
+  );
+
   const handleOpenWorkspace = useCallback(() => {
-    if (!activeServer || !state.device) {
+    if (!activeServer || !state.device || status === "saving_url") {
       return;
     }
     setError(undefined);
@@ -2455,7 +2638,7 @@ export default function App() {
     // 可能留下 ready/attached 和非空 sessions，不能让这些状态跳过新 daemon 的 bootstrap。
     autoCheckedServerRef.current = undefined;
     setStatus("idle");
-  }, [activeServer, state.device]);
+  }, [activeServer, state.device, status]);
 
   useEffect(() => {
     const sessionId = selectedSessionId;
@@ -2485,7 +2668,7 @@ export default function App() {
     void handleAttach(sessionId, { closeMobilePanel: false });
   }, [activeSurface, connectionReady, handleAttach, hasLiveAttachedTransport, isTerminalRecoveryInProgress, selectedSessionId, status]);
 
-  const handleCreateSession = useCallback(async () => {
+  const performCreateSession = useCallback(async () => {
     userDetachedRef.current = false;
     // 中文注释：`terminal.create` 自己就会建立并接管 watched terminal stream。
     // 在它完成接管前，任何自动 attach 都属于重复链路，只会把 create stream cancel 掉。
@@ -2598,6 +2781,10 @@ export default function App() {
     startReceiveLoop,
     waitForTerminalOutputResetApplied,
   ]);
+
+  const handleCreateSession = useCallback(() => {
+    requestFileEditorAction(performCreateSession);
+  }, [performCreateSession, requestFileEditorAction]);
 
   const handleRetryConnection = useCallback(async () => {
     if (isTerminalTransportPaused()) {
@@ -2909,7 +3096,7 @@ export default function App() {
     [handleCancelRename, renameDraft, renameOriginalName, resolveSessionClient, setSafeError],
   );
 
-  const handleCloseSession = useCallback(
+  const performCloseSession = useCallback(
     async (sessionId: UUID) => {
       setError(undefined);
       closingSessionIdsRef.current.add(sessionId);
@@ -3000,6 +3187,119 @@ export default function App() {
       setSafeError,
     ],
   );
+
+  const handleCloseSession = useCallback((sessionId: UUID) => {
+    const session = sessionsRef.current.find((candidate) => candidate.session_id === sessionId);
+    if (!session) {
+      return;
+    }
+    setPendingDestructiveAction({
+      kind: "session-close",
+      sessionId,
+      name: sessionDisplayName(session),
+    });
+  }, []);
+
+  const handleDeleteFileWithConfirmation = useCallback((entry: SessionFileEntryPayload) => {
+    const sessionId = attachedSessionRef.current;
+    if (!sessionId) {
+      return;
+    }
+    setPendingDestructiveAction({ kind: "file-delete", sessionId, entry });
+  }, [attachedSessionRef]);
+
+  const handleSessionGitActionWithConfirmation = useCallback((
+    worktree: SessionGitWorktreePayload,
+    change: SessionGitFileChangePayload,
+    action: "stage" | "unstage" | "discard",
+  ) => {
+    if (action !== "discard") {
+      void handleSessionGitAction(worktree, change, action);
+      return;
+    }
+    const sessionId = attachedSessionRef.current;
+    if (!sessionId) {
+      return;
+    }
+    setPendingDestructiveAction({ kind: "git-discard", sessionId, worktree, change });
+  }, [attachedSessionRef, handleSessionGitAction]);
+
+  const handleForgetDaemon = useCallback((serverId: UUID) => {
+    const target = pairedServerOptions.find((item) => item.server.server_id === serverId);
+    if (!target) {
+      return;
+    }
+    setPendingDestructiveAction({
+      kind: "daemon-forget",
+      serverId,
+      label: target.label,
+      url: displayUrlWithoutQueryOrFragment(target.server.url),
+    });
+  }, [pairedServerOptions]);
+
+  const handleCancelDestructiveAction = useCallback(() => {
+    if (destructiveActionBusyRef.current) {
+      return;
+    }
+    setPendingDestructiveAction(undefined);
+  }, []);
+
+  const handleConfirmDestructiveAction = useCallback(async () => {
+    const pending = pendingDestructiveAction;
+    if (!pending || destructiveActionBusyRef.current) {
+      return;
+    }
+
+    if (
+      (pending.kind === "file-delete" || pending.kind === "git-discard") &&
+      attachedSessionRef.current !== pending.sessionId
+    ) {
+      setPendingDestructiveAction(undefined);
+      return;
+    }
+
+    if (pending.kind === "session-close") {
+      if (!sessionsRef.current.some((session) => session.session_id === pending.sessionId)) {
+        setPendingDestructiveAction(undefined);
+        return;
+      }
+      setPendingDestructiveAction(undefined);
+      if (fileEditorRef.current?.sessionId === pending.sessionId) {
+        requestFileEditorAction(() => performCloseSession(pending.sessionId));
+      } else {
+        void performCloseSession(pending.sessionId);
+      }
+      return;
+    }
+
+    destructiveActionBusyRef.current = true;
+    setDestructiveActionBusy(true);
+    try {
+      if (pending.kind === "file-delete") {
+        await handleDeleteFile(pending.entry);
+        setPendingDestructiveAction(undefined);
+      } else if (pending.kind === "git-discard") {
+        await handleSessionGitAction(pending.worktree, pending.change, "discard");
+        setPendingDestructiveAction(undefined);
+      } else {
+        const forgotten = await performForgetDaemon(pending.serverId);
+        if (forgotten) {
+          setPendingDestructiveAction(undefined);
+        }
+      }
+    } finally {
+      destructiveActionBusyRef.current = false;
+      setDestructiveActionBusy(false);
+    }
+  }, [
+    attachedSessionRef,
+    handleDeleteFile,
+    handleSessionGitAction,
+    pendingDestructiveAction,
+    performCloseSession,
+    performForgetDaemon,
+    requestFileEditorAction,
+  ]);
 
   const handleReorderSessions = useCallback(
     (sessionIds: UUID[]) => {
@@ -3296,8 +3596,8 @@ export default function App() {
   ]);
 
   const handleCloseFileEditor = useCallback(() => {
-    resetFileEditor();
-  }, [resetFileEditor]);
+    requestFileEditorAction(() => undefined);
+  }, [requestFileEditorAction]);
 
   const handleUploadFile = useCallback(
     async (file: File) => {
@@ -3467,28 +3767,153 @@ export default function App() {
     setMobilePanel("sessions");
   }, []);
 
-  const resetMobileTitlePull = useCallback(() => {
-    mobileTitlePullGestureRef.current = undefined;
-    setMobileTitlePullDistance(0);
+  const updateMobileTitlePullDistance = useCallback((distance: number) => {
+    mobileTitlePullDistanceRef.current = distance;
+    setMobileTitlePullDistance(distance);
   }, []);
+
+  const cancelMobileTitlePullAnimation = useCallback(() => {
+    const animation = mobileTitlePullAnimationRef.current;
+    if (!animation) {
+      return undefined;
+    }
+    window.cancelAnimationFrame(animation.frameId);
+    mobileTitlePullAnimationRef.current = undefined;
+    return {
+      position: animation.position,
+      velocityPxPerSecond: animation.velocityPxPerSecond,
+    };
+  }, []);
+
+  const clearMobileTitleClickSuppression = useCallback(() => {
+    suppressMobileTitleClickRef.current = false;
+    if (suppressMobileTitleClickTimerRef.current !== undefined) {
+      window.clearTimeout(suppressMobileTitleClickTimerRef.current);
+      suppressMobileTitleClickTimerRef.current = undefined;
+    }
+  }, []);
+
+  const suppressNextMobileTitleClick = useCallback(() => {
+    clearMobileTitleClickSuppression();
+    suppressMobileTitleClickRef.current = true;
+    // Bound suppression even when a browser omits the compatibility click. A new touch
+    // pointerdown clears it immediately, so an intentional next tap never waits on this timer.
+    suppressMobileTitleClickTimerRef.current = window.setTimeout(() => {
+      suppressMobileTitleClickRef.current = false;
+      suppressMobileTitleClickTimerRef.current = undefined;
+    }, MOBILE_TITLE_PULL_CLICK_SUPPRESSION_MS);
+  }, [clearMobileTitleClickSuppression]);
+
+  const settleMobileTitlePull = useCallback((initialVelocityPxPerSecond = 0) => {
+    cancelMobileTitlePullAnimation();
+    mobileTitlePullGestureRef.current = undefined;
+
+    if (
+      mobileTitlePullDistanceRef.current <= 0 ||
+      (typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches)
+    ) {
+      updateMobileTitlePullDistance(0);
+      return;
+    }
+
+    const animation: MobileTitlePullAnimation = {
+      frameId: 0,
+      lastTimestampMs: performance.now(),
+      position: mobileTitlePullDistanceRef.current,
+      velocityPxPerSecond: Math.max(-900, Math.min(900, initialVelocityPxPerSecond)),
+    };
+    const step = (timestampMs: number) => {
+      if (mobileTitlePullAnimationRef.current !== animation) {
+        return;
+      }
+      const elapsedSeconds = Math.min(1 / 30, Math.max(0, (timestampMs - animation.lastTimestampMs) / 1000));
+      animation.lastTimestampMs = timestampMs;
+      const stiffness = 340;
+      const damping = 2 * Math.sqrt(stiffness);
+      const acceleration = -stiffness * animation.position - damping * animation.velocityPxPerSecond;
+      animation.velocityPxPerSecond += acceleration * elapsedSeconds;
+      animation.position = Math.max(0, animation.position + animation.velocityPxPerSecond * elapsedSeconds);
+
+      if (animation.position < 0.1 && Math.abs(animation.velocityPxPerSecond) < 1) {
+        mobileTitlePullAnimationRef.current = undefined;
+        updateMobileTitlePullDistance(0);
+        return;
+      }
+
+      updateMobileTitlePullDistance(animation.position);
+      animation.frameId = window.requestAnimationFrame(step);
+    };
+    animation.frameId = window.requestAnimationFrame(step);
+    mobileTitlePullAnimationRef.current = animation;
+  }, [cancelMobileTitlePullAnimation, updateMobileTitlePullDistance]);
+
+  useEffect(() => () => {
+    cancelMobileTitlePullAnimation();
+    clearMobileTitleClickSuppression();
+  }, [cancelMobileTitlePullAnimation, clearMobileTitleClickSuppression]);
+
+  useEffect(() => {
+    if (showMobileWorkspaceMenu) {
+      return;
+    }
+    cancelMobileTitlePullAnimation();
+    clearMobileTitleClickSuppression();
+    mobileTitlePullGestureRef.current = undefined;
+    if (mobileTitlePullDistanceRef.current > 0) {
+      updateMobileTitlePullDistance(0);
+    }
+  }, [
+    cancelMobileTitlePullAnimation,
+    clearMobileTitleClickSuppression,
+    showMobileWorkspaceMenu,
+    updateMobileTitlePullDistance,
+  ]);
 
   const handleMobileTitlePointerDown = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
     if (!isMobileLayout || !connectionReady || event.pointerType !== "touch" || event.button !== 0) {
       return;
     }
+    const interruptedAnimation = cancelMobileTitlePullAnimation();
+    clearMobileTitleClickSuppression();
+    const startDistance = interruptedAnimation?.position ?? mobileTitlePullDistanceRef.current;
+    if (startDistance !== mobileTitlePullDistanceRef.current) {
+      updateMobileTitlePullDistance(startDistance);
+    }
+    const interruptingReturn = startDistance > 0;
+    const inheritedVelocity = interruptedAnimation?.velocityPxPerSecond ?? 0;
+    const inheritedSampleWindowMs = inheritedVelocity === 0 ? 0 : 32;
     mobileTitlePullGestureRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      dragging: false,
+      startDistance,
+      lastDistance: startDistance,
+      lastTimestampMs: event.timeStamp,
+      velocityPxPerSecond: inheritedVelocity,
+      samples: [
+        ...(inheritedSampleWindowMs === 0
+          ? []
+          : [{
+              distance: startDistance - inheritedVelocity * inheritedSampleWindowMs / 1000,
+              timestampMs: event.timeStamp - inheritedSampleWindowMs,
+            }]),
+        { distance: startDistance, timestampMs: event.timeStamp },
+      ],
+      dragging: interruptingReturn,
+      refreshArmed: false,
     };
-    setMobileTitlePullDistance(0);
     try {
       event.currentTarget.setPointerCapture(event.pointerId);
     } catch {
       // jsdom 和部分旧移动浏览器不支持 pointer capture；手势仍可按当前事件序列工作。
     }
-  }, [connectionReady, isMobileLayout]);
+  }, [
+    cancelMobileTitlePullAnimation,
+    clearMobileTitleClickSuppression,
+    connectionReady,
+    isMobileLayout,
+    updateMobileTitlePullDistance,
+  ]);
 
   const handleMobileTitlePointerMove = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
     const gesture = mobileTitlePullGestureRef.current;
@@ -3502,52 +3927,64 @@ export default function App() {
         return;
       }
       gesture.dragging = true;
-      suppressMobileTitleClickRef.current = true;
     }
     event.preventDefault();
     event.stopPropagation();
-    setMobileTitlePullDistance(Math.min(MOBILE_TITLE_PULL_MAX_PX, Math.max(0, dy)));
-  }, []);
+    const nextDistance = mobileTitlePullDistanceForDelta(gesture.startDistance + dy);
+    gesture.refreshArmed = mobileTitlePullDistanceForDelta(Math.max(0, dy)) >= MOBILE_TITLE_PULL_REFRESH_PX;
+    recordMobileTitlePullSample(gesture, nextDistance, event.timeStamp);
+    updateMobileTitlePullDistance(nextDistance);
+  }, [updateMobileTitlePullDistance]);
 
   const handleMobileTitlePointerUp = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
     const gesture = mobileTitlePullGestureRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) {
       return;
     }
-    const shouldRefresh = gesture.dragging && event.clientY - gesture.startY >= MOBILE_TITLE_PULL_REFRESH_PX;
     if (gesture.dragging) {
       event.preventDefault();
       event.stopPropagation();
-      suppressMobileTitleClickRef.current = true;
+      const finalDistance = mobileTitlePullDistanceForDelta(
+        gesture.startDistance + event.clientY - gesture.startY,
+      );
+      gesture.refreshArmed = mobileTitlePullDistanceForDelta(
+        Math.max(0, event.clientY - gesture.startY),
+      ) >= MOBILE_TITLE_PULL_REFRESH_PX;
+      recordMobileTitlePullSample(gesture, finalDistance, event.timeStamp);
+      updateMobileTitlePullDistance(finalDistance);
+      suppressNextMobileTitleClick();
     }
+    const shouldRefresh = gesture.dragging && gesture.refreshArmed;
+    const releaseVelocity = gesture.velocityPxPerSecond;
+    settleMobileTitlePull(releaseVelocity);
     try {
       event.currentTarget.releasePointerCapture(event.pointerId);
     } catch {
       // pointer capture 不是刷新动作的前置条件；释放失败只说明浏览器没有捕获该 pointer。
     }
-    resetMobileTitlePull();
     if (shouldRefresh) {
       void handleRefresh();
     }
-  }, [handleRefresh, resetMobileTitlePull]);
+  }, [handleRefresh, settleMobileTitlePull, suppressNextMobileTitleClick, updateMobileTitlePullDistance]);
 
   const handleMobileTitlePointerCancel = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
     const gesture = mobileTitlePullGestureRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) {
       return;
     }
-    resetMobileTitlePull();
-  }, [resetMobileTitlePull]);
+    clearMobileTitleClickSuppression();
+    settleMobileTitlePull(gesture.velocityPxPerSecond);
+  }, [clearMobileTitleClickSuppression, settleMobileTitlePull]);
 
   const handleMobileTitleClick = useCallback((event: ReactMouseEvent<HTMLButtonElement>) => {
     if (suppressMobileTitleClickRef.current) {
       event.preventDefault();
       event.stopPropagation();
-      suppressMobileTitleClickRef.current = false;
+      clearMobileTitleClickSuppression();
       return;
     }
     handleOpenMobileSessions();
-  }, [handleOpenMobileSessions]);
+  }, [clearMobileTitleClickSuppression, handleOpenMobileSessions]);
 
   const handleOpenMobileFiles = useCallback(() => {
     if (!attachedSessionId) {
@@ -3566,6 +4003,11 @@ export default function App() {
     setMobilePanel(undefined);
     requestMobileTerminalFocus();
   }, [requestMobileTerminalFocus]);
+  const mobilePanelRef = useModalFocus<HTMLDivElement>({
+    open: showMobileSessionsPanel || showMobileFilesPanel,
+    onClose: handleCloseMobilePanel,
+    restoreFocus: false,
+  });
 
   const handleFilesPanelResizePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -3593,6 +4035,55 @@ export default function App() {
     setFilesPanelWidth((current) => clampFilesPanelWidth(current + delta, window.innerWidth));
   }, []);
 
+  const destructiveActionDialogProps = pendingDestructiveAction
+    ? (() => {
+        switch (pendingDestructiveAction.kind) {
+          case "session-close":
+            return {
+              title: t("sessions.closeConfirmTitle"),
+              description: t("sessions.closeConfirmDescription"),
+              target: pendingDestructiveAction.name,
+              confirmLabel: t("sessions.close"),
+              busyLabel: t("sessions.closing"),
+            };
+          case "file-delete": {
+            const targetKind = pendingDestructiveAction.entry.kind;
+            return {
+              title: t(targetKind === "directory"
+                ? "files.deleteDirectoryTitle"
+                : targetKind === "file"
+                  ? "files.deleteFileTitle"
+                  : "files.deleteItemTitle"),
+              description: t(targetKind === "directory"
+                ? "files.deleteDirectoryDescription"
+                : targetKind === "file"
+                  ? "files.deleteFileDescription"
+                  : "files.deleteItemDescription"),
+              target: pendingDestructiveAction.entry.path,
+              confirmLabel: t("files.deleteConfirm"),
+              busyLabel: t("files.deleting"),
+            };
+          }
+          case "git-discard":
+            return {
+              title: t("git.discardTitle"),
+              description: t("git.discardDescription"),
+              target: joinRemotePath(pendingDestructiveAction.worktree.path, pendingDestructiveAction.change.path),
+              confirmLabel: t("git.discardConfirm"),
+              busyLabel: t("git.discarding"),
+            };
+          case "daemon-forget":
+            return {
+              title: t("daemons.forgetTitle"),
+              description: t("daemons.forgetDescription"),
+              target: `${pendingDestructiveAction.label}\n${pendingDestructiveAction.url}`,
+              confirmLabel: t("daemons.forgetConfirm"),
+              busyLabel: t("daemons.forgetting"),
+            };
+        }
+      })()
+    : undefined;
+
   if (activeSurface === "admin") {
     return (
       <I18nProvider locale={effectiveLocale}>
@@ -3607,24 +4098,28 @@ export default function App() {
             <button type="button" className="icon-button" aria-label={t("app.settings")} onClick={() => setSettingsOpen(true)}>
               <Settings size={16} aria-hidden="true" />
             </button>
-            <button type="button" onClick={handleOpenWorkspace} disabled={!canOpenWorkspace}>
-              <MonitorUp size={16} aria-hidden="true" />
-              {t("app.workspace")}
-            </button>
+            {hasPairedServer ? (
+              <button type="button" onClick={handleOpenWorkspace} disabled={!canOpenWorkspace}>
+                <MonitorUp size={16} aria-hidden="true" />
+                {t("app.workspace")}
+              </button>
+            ) : null}
           </div>
         </header>
         <main className="admin-main" aria-label={t("app.adminAria")}>
-          <section className="admin-summary-band" aria-label={t("app.selectedDaemonAria")}>
-            <div className="admin-summary-main">
-              <span>{t("app.selectedDaemon")}</span>
-              <strong>{activeDaemonLabel}</strong>
-              <code>{activeServer ? displayUrlWithoutQueryOrFragment(activeServer.url) : t("app.unpaired")}</code>
-            </div>
-            <button type="button" onClick={handleOpenWorkspace} disabled={!canOpenWorkspace}>
-              <MonitorUp size={16} aria-hidden="true" />
-              {t("app.openWorkspace")}
-            </button>
-          </section>
+          {hasPairedServer ? (
+            <section className="admin-summary-band" aria-label={t("app.selectedDaemonAria")}>
+              <div className="admin-summary-main">
+                <span>{t("app.selectedDaemon")}</span>
+                <strong>{activeDaemonLabel}</strong>
+                <code>{displayUrlWithoutQueryOrFragment(activeServer!.url)}</code>
+              </div>
+              <button type="button" onClick={handleOpenWorkspace} disabled={!canOpenWorkspace}>
+                <MonitorUp size={16} aria-hidden="true" />
+                {t("app.openWorkspace")}
+              </button>
+            </section>
+          ) : null}
           {error ? (
             <ProtocolErrorAlert
               error={error}
@@ -3632,7 +4127,7 @@ export default function App() {
               refreshing={status === "attaching" || status === "connecting" || status === "listing"}
             />
           ) : null}
-          <div className="admin-grid">
+          <div className={hasPairedServer ? "admin-grid" : "admin-grid admin-grid-unpaired"}>
             <ConnectionPanel
               url={url}
               token={pairingToken}
@@ -3645,20 +4140,22 @@ export default function App() {
               onSaveUrl={handleSaveConnectionUrl}
               showUrlEditor={connectionEditorOpen || !activeServer}
             />
-            <Suspense fallback={<LazyPanelFallback />}>
-              <DaemonManagerPanel
-                servers={pairedServerOptions}
-                activeServerId={activeServer?.server_id}
-                renamingServerId={renamingDaemonId}
-                renameDraft={daemonRenameDraft}
-                onSelect={(serverId) => void handleSelectServer(serverId)}
-                onStartRename={handleStartDaemonRename}
-                onRenameDraftChange={setDaemonRenameDraft}
-                onSaveRename={(serverId, nextName) => void handleSaveDaemonRename(serverId, nextName)}
-                onCancelRename={handleCancelDaemonRename}
-                onForget={(serverId) => void handleForgetDaemon(serverId)}
-              />
-            </Suspense>
+            {hasPairedServer ? (
+              <Suspense fallback={<LazyPanelFallback />}>
+                <DaemonManagerPanel
+                  servers={pairedServerOptions}
+                  activeServerId={activeServer?.server_id}
+                  renamingServerId={renamingDaemonId}
+                  renameDraft={daemonRenameDraft}
+                  onSelect={(serverId) => void handleSelectServer(serverId)}
+                  onStartRename={handleStartDaemonRename}
+                  onRenameDraftChange={setDaemonRenameDraft}
+                  onSaveRename={(serverId, nextName) => void handleSaveDaemonRename(serverId, nextName)}
+                  onCancelRename={handleCancelDaemonRename}
+                  onForget={(serverId) => void handleForgetDaemon(serverId)}
+                />
+              </Suspense>
+            ) : null}
           </div>
           {qrScannerOpen ? (
             <Suspense fallback={<LazyModalFallback className="qr-scanner-dialog" />}>
@@ -3680,6 +4177,16 @@ export default function App() {
               />
             </Suspense>
           ) : null}
+          {destructiveActionDialogProps ? (
+            <DestructiveActionDialog
+              open
+              {...destructiveActionDialogProps}
+              cancelLabel={t("destructive.cancel")}
+              busy={destructiveActionBusy}
+              onCancel={handleCancelDestructiveAction}
+              onConfirm={() => void handleConfirmDestructiveAction()}
+            />
+          ) : null}
         </main>
         <StatusBar status={status} error={error} sessionId={attachedSessionId ?? selectedSessionId} />
       </div>
@@ -3693,7 +4200,7 @@ export default function App() {
       className={[
         "app-shell",
         "workspace-surface",
-        sidebarCollapsed ? "sidebar-is-collapsed" : "",
+        !isMobileLayout && sidebarCollapsed ? "sidebar-is-collapsed" : "",
         connectionReady ? "connection-ready" : "",
         isFilesPanelResizing ? "files-panel-resizing" : "",
         mobileTerminalInputMode ? "mobile-terminal-input" : "",
@@ -3812,6 +4319,7 @@ export default function App() {
         <div className="toolbar">
           {showMobileWorkspaceMenu ? (
             <button
+              ref={mobileMenuTriggerRef}
               type="button"
               className="icon-button mobile-menu-toggle"
               aria-label={t("app.openMobileMenu")}
@@ -3837,20 +4345,33 @@ export default function App() {
               onPointerMove={handleMobileTitlePointerMove}
               onPointerUp={handleMobileTitlePointerUp}
               onPointerCancel={handleMobileTitlePointerCancel}
+              onLostPointerCapture={handleMobileTitlePointerCancel}
               onClick={handleMobileTitleClick}
             >
               <MonitorUp size={16} aria-hidden="true" />
-              <span>{toolbarSessionName}</span>
-              {toolbarSessionSize ? <small>{toolbarSessionSize}</small> : null}
-              {toolbarLatency && toolbarLatencyLevel ? (
+              <span className="toolbar-session-name">{toolbarSessionName}</span>
+              {isMobileLayout && error ? (
                 <small
-                  className={`toolbar-latency ${toolbarLatencyLevel}`}
-                  aria-label={`RTT ${toolbarLatency}`}
-                  title={`RTT ${toolbarLatency}`}
+                  className="toolbar-connection-anomaly"
+                  aria-label={`${t("protocolError.title")}: ${translateSafeErrorMessage(error, t)}`}
+                  title={`${t("protocolError.title")}: ${translateSafeErrorMessage(error, t)}`}
                 >
-                  {toolbarLatency}
+                  {t("protocolError.title")}
                 </small>
-              ) : null}
+              ) : (
+                <>
+                  {toolbarLatency && toolbarLatencyLevel ? (
+                    <small
+                      className={`toolbar-latency ${toolbarLatencyLevel}`}
+                      aria-label={`RTT ${toolbarLatency}`}
+                      title={`RTT ${toolbarLatency}`}
+                    >
+                      {toolbarLatency}
+                    </small>
+                  ) : null}
+                  {toolbarSessionSize ? <small className="toolbar-session-size">{toolbarSessionSize}</small> : null}
+                </>
+              )}
               <span className="toolbar-title-pull-indicator" aria-hidden="true">
                 <RefreshCcw size={13} />
               </span>
@@ -3858,17 +4379,29 @@ export default function App() {
           ) : (
             <div className="toolbar-title">
               <MonitorUp size={16} aria-hidden="true" />
-              <span>{toolbarSessionName}</span>
-              {toolbarSessionSize ? <small>{toolbarSessionSize}</small> : null}
-              {toolbarLatency && toolbarLatencyLevel ? (
+              <span className="toolbar-session-name">{toolbarSessionName}</span>
+              {isMobileLayout && error ? (
                 <small
-                  className={`toolbar-latency ${toolbarLatencyLevel}`}
-                  aria-label={`RTT ${toolbarLatency}`}
-                  title={`RTT ${toolbarLatency}`}
+                  className="toolbar-connection-anomaly"
+                  aria-label={`${t("protocolError.title")}: ${translateSafeErrorMessage(error, t)}`}
+                  title={`${t("protocolError.title")}: ${translateSafeErrorMessage(error, t)}`}
                 >
-                  {toolbarLatency}
+                  {t("protocolError.title")}
                 </small>
-              ) : null}
+              ) : (
+                <>
+                  {toolbarLatency && toolbarLatencyLevel ? (
+                    <small
+                      className={`toolbar-latency ${toolbarLatencyLevel}`}
+                      aria-label={`RTT ${toolbarLatency}`}
+                      title={`RTT ${toolbarLatency}`}
+                    >
+                      {toolbarLatency}
+                    </small>
+                  ) : null}
+                  {toolbarSessionSize ? <small className="toolbar-session-size">{toolbarSessionSize}</small> : null}
+                </>
+              )}
             </div>
           )}
           {connectionReady && attachedSessionId && !isMobileLayout ? (
@@ -3880,6 +4413,7 @@ export default function App() {
           {connectionReady && !isMobileLayout ? (
             <div className="toolbar-actions">
               <button
+                ref={clientsTriggerRef}
                 type="button"
                 className="toolbar-clients-button"
                 aria-label={t("app.clients")}
@@ -3891,7 +4425,7 @@ export default function App() {
                 {t("app.clients")}
               </button>
               {clientsOpen ? (
-                <div className="clients-popover toolbar-clients-popover" id="daemon-clients-popover">
+                <div ref={clientsPopoverRef} className="clients-popover toolbar-clients-popover" id="daemon-clients-popover">
                   <Suspense fallback={<LazyPanelFallback className="daemon-clients" />}>
                     <DaemonClientsPanel
                       clients={daemonClients}
@@ -3977,14 +4511,16 @@ export default function App() {
                       onOpenFile={handleOpenFile}
                       onOpenGitFile={handleOpenGitFile}
                       onOpenGitDiff={handleOpenGitDiff}
-                      onGitAction={handleSessionGitAction}
+                      onGitAction={handleSessionGitActionWithConfirmation}
                       onGoToPath={handleGoToFilePath}
                       onRefresh={handleRefreshSessionFiles}
                       onRefreshGit={handleRefreshSessionGit}
+                      onDismissError={handleDismissSessionFilesError}
+                      onDismissGitError={handleDismissSessionGitError}
                       onFollowTerminalCwdChange={handleSessionFilesFollowTerminalCwdChange}
                       onUpload={handleUploadFile}
                       onDownload={handleDownloadFile}
-                      onDelete={handleDeleteFile}
+                      onDelete={handleDeleteFileWithConfirmation}
                       onHide={handleHideFiles}
                       onResizePointerDown={handleFilesPanelResizePointerDown}
                       onResizeKeyDown={handleFilesPanelResizeKeyDown}
@@ -4006,7 +4542,7 @@ export default function App() {
           )}
         </div>
         {showMobileWorkspaceMenu && mobileMenuOpen ? (
-          <nav className="mobile-menu-popover" aria-label={t("app.mobileWorkspaceMenu")}>
+          <nav ref={mobileMenuPopoverRef} className="mobile-menu-popover" aria-label={t("app.mobileWorkspaceMenu")}>
             <button type="button" onClick={() => handleOpenAdmin()}>
               <Server size={16} aria-hidden="true" />
               {t("app.daemons")}
@@ -4030,7 +4566,13 @@ export default function App() {
           </nav>
         ) : null}
         {showMobileSessionsPanel ? (
-          <section className="mobile-panel mobile-sessions-panel" aria-label={t("app.sessionsPanel")}>
+          <div
+            ref={mobilePanelRef}
+            className="mobile-panel mobile-sessions-panel"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t("app.sessionsPanel")}
+          >
             <header className="mobile-panel-header">
               <div className="mobile-panel-title">
                 <MonitorUp size={15} aria-hidden="true" />
@@ -4071,10 +4613,16 @@ export default function App() {
                 onReorder={handleReorderSessions}
               />
             </div>
-          </section>
+          </div>
         ) : null}
         {showMobileFilesPanel ? (
-          <div className="mobile-panel mobile-files-panel">
+          <div
+            ref={mobilePanelRef}
+            className="mobile-panel mobile-files-panel"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t("app.files")}
+          >
             <Suspense fallback={<LazyPanelFallback className="files-panel" />}>
               <SessionFilesPanel
                 attachedSessionId={attachedSessionId}
@@ -4093,14 +4641,16 @@ export default function App() {
                 onOpenFile={handleOpenFile}
                 onOpenGitFile={handleOpenGitFile}
                 onOpenGitDiff={handleOpenGitDiff}
-                onGitAction={handleSessionGitAction}
+                onGitAction={handleSessionGitActionWithConfirmation}
                 onGoToPath={handleGoToFilePath}
                 onRefresh={handleRefreshSessionFiles}
                 onRefreshGit={handleRefreshSessionGit}
+                onDismissError={handleDismissSessionFilesError}
+                onDismissGitError={handleDismissSessionGitError}
                 onFollowTerminalCwdChange={handleSessionFilesFollowTerminalCwdChange}
                 onUpload={handleUploadFile}
                 onDownload={handleDownloadFile}
-                onDelete={handleDeleteFile}
+                onDelete={handleDeleteFileWithConfirmation}
                 onHide={handleHideFiles}
               />
             </Suspense>
@@ -4112,16 +4662,44 @@ export default function App() {
               open
               path={fileEditor.path}
               name={fileEditor.name}
-              initialText={fileEditor.text}
+              initialText={fileEditor.savedText}
               loading={fileEditor.loading}
               saving={fileEditor.saving}
               error={fileEditor.error}
               language={languageForPath(fileEditor.path)}
               theme={effectiveTheme}
-              onSave={handleSaveOpenFile}
+              onSave={(text) => void handleFileEditorSave(text)}
+              onDraftChange={handleFileEditorDraftChange}
               onClose={handleCloseFileEditor}
             />
           </Suspense>
+        ) : null}
+        {fileEditor && unsavedFileDialogOpen ? (
+          <UnsavedFileDialog
+            open
+            path={fileEditor.path}
+            saving={fileEditor.saving}
+            error={fileEditor.error}
+            title={t("editor.unsavedTitle", { name: fileEditor.name })}
+            description={t("editor.unsavedDescription", { path: fileEditor.path })}
+            saveLabel={t("editor.save")}
+            savingLabel={t("editor.savingButton")}
+            discardLabel={t("editor.discard")}
+            stayLabel={t("editor.stay")}
+            onSave={() => void handleSaveFileDraft()}
+            onDiscard={handleDiscardFileDraft}
+            onStay={handleStayWithFileDraft}
+          />
+        ) : null}
+        {destructiveActionDialogProps ? (
+          <DestructiveActionDialog
+            open
+            {...destructiveActionDialogProps}
+            cancelLabel={t("destructive.cancel")}
+            busy={destructiveActionBusy}
+            onCancel={handleCancelDestructiveAction}
+            onConfirm={() => void handleConfirmDestructiveAction()}
+          />
         ) : null}
         {diffViewer ? (
           <Suspense fallback={<LazyModalFallback className="file-editor-dialog" />}>
@@ -4346,45 +4924,23 @@ function Metric(props: { label: string; value: string; className?: string }) {
   );
 }
 
-function useMobileLayout(): boolean {
-  const getSnapshot = () => {
-    if (typeof window === "undefined") {
-      return false;
-    }
-    if (typeof window.matchMedia === "function") {
-      return window.matchMedia(MOBILE_LAYOUT_QUERY).matches;
-    }
-    return window.innerWidth <= MOBILE_LAYOUT_BREAKPOINT;
-  };
-
-  const [isMobileLayout, setIsMobileLayout] = useState(getSnapshot);
+function useViewportBand(): ViewportBand {
+  const [viewportBand, setViewportBand] = useState<ViewportBand>(() =>
+    typeof window === "undefined" ? "wide" : viewportBandForWidth(window.innerWidth)
+  );
 
   useEffect(() => {
     if (typeof window === "undefined") {
       return undefined;
     }
 
-    if (typeof window.matchMedia !== "function") {
-      const handleResize = () => setIsMobileLayout(window.innerWidth <= MOBILE_LAYOUT_BREAKPOINT);
-      handleResize();
-      window.addEventListener("resize", handleResize);
-      return () => window.removeEventListener("resize", handleResize);
-    }
-
-    const mediaQuery = window.matchMedia(MOBILE_LAYOUT_QUERY);
-    const handleChange = () => setIsMobileLayout(mediaQuery.matches);
-    handleChange();
-
-    if (typeof mediaQuery.addEventListener === "function") {
-      mediaQuery.addEventListener("change", handleChange);
-      return () => mediaQuery.removeEventListener("change", handleChange);
-    }
-
-    mediaQuery.addListener(handleChange);
-    return () => mediaQuery.removeListener(handleChange);
+    const handleResize = () => setViewportBand(viewportBandForWidth(window.innerWidth));
+    handleResize();
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
   }, []);
 
-  return isMobileLayout;
+  return viewportBand;
 }
 
 function useMobileTerminalInputMode(isMobileLayout: boolean): boolean {
@@ -4814,6 +5370,45 @@ export function latencyLevelClass(latencyMs?: number): "latency-good" | "latency
     return "latency-warning";
   }
   return "latency-danger";
+}
+
+export function mobileTitlePullDistanceForDelta(deltaPx: number): number {
+  const distance = Math.max(0, deltaPx);
+  if (distance <= MOBILE_TITLE_PULL_MAX_PX) {
+    return distance;
+  }
+  const overshoot = distance - MOBILE_TITLE_PULL_MAX_PX;
+  return MOBILE_TITLE_PULL_MAX_PX + (
+    overshoot * MOBILE_TITLE_PULL_MAX_PX * 0.42
+  ) / (
+    MOBILE_TITLE_PULL_MAX_PX + 0.42 * overshoot
+  );
+}
+
+function recordMobileTitlePullSample(
+  gesture: MobileTitlePullGesture,
+  distance: number,
+  timestampMs: number,
+): void {
+  if (timestampMs - gesture.lastTimestampMs > MOBILE_TITLE_PULL_VELOCITY_WINDOW_MS) {
+    gesture.samples = [];
+    gesture.velocityPxPerSecond = 0;
+  }
+  gesture.samples.push({ distance, timestampMs });
+  const cutoffMs = timestampMs - MOBILE_TITLE_PULL_VELOCITY_WINDOW_MS;
+  while (gesture.samples.length > 2 && gesture.samples[1].timestampMs < cutoffMs) {
+    gesture.samples.shift();
+  }
+  const first = gesture.samples[0];
+  const last = gesture.samples.at(-1);
+  if (first && last && last.timestampMs > first.timestampMs) {
+    gesture.velocityPxPerSecond = Math.max(
+      -900,
+      Math.min(900, ((last.distance - first.distance) / (last.timestampMs - first.timestampMs)) * 1000),
+    );
+  }
+  gesture.lastDistance = distance;
+  gesture.lastTimestampMs = timestampMs;
 }
 
 function formatBytesPerSecond(bytesPerSecond: number): string {

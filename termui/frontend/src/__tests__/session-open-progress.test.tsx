@@ -123,6 +123,27 @@ describe("SessionOpenProgressControl", () => {
     expect(screen.queryByRole("button", { name: "Search terminal" })).toBeNull();
   });
 
+  it("closes on Escape or outside pointer input and restores the trigger focus", () => {
+    const opening = startSessionOpenProgress({
+      attemptId: 12,
+      sessionId: SESSION_ID,
+      sessionName: "alpha",
+      nowMs: 10_000,
+    });
+    render(<SessionOpenProgressControl progress={opening} />);
+
+    const button = screen.getByRole("button", { name: "Opening progress for alpha" });
+    expect(screen.getByTestId("terminal-open-progress")).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByTestId("terminal-open-progress")).toBeNull();
+    expect(button).toHaveFocus();
+
+    fireEvent.click(button);
+    expect(screen.getByTestId("terminal-open-progress")).toBeInTheDocument();
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByTestId("terminal-open-progress")).toBeNull();
+  });
+
   it("formats sub-second, second, and minute durations without layout-dependent units", () => {
     expect(formatSessionOpenDuration(245)).toBe("245 ms");
     expect(formatSessionOpenDuration(2_450)).toBe("2.5 s");

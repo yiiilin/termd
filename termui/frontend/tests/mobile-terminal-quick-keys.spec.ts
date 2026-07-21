@@ -79,11 +79,14 @@ async function quickKeysGeometry(page: Page) {
     const paneRect = pane.getBoundingClientRect();
     const scrollportRect = scrollport.getBoundingClientRect();
     const quickKeysRect = quickKeys.getBoundingClientRect();
+    const quickKeysStyle = getComputedStyle(quickKeys);
     const visualBottom = (window.visualViewport?.offsetTop ?? 0) + (window.visualViewport?.height ?? window.innerHeight);
     return {
       paneBottom: paneRect.bottom,
       visualBottom,
       quickKeysHeight: quickKeysRect.height,
+      quickKeysContentHeight: quickKeysStyle.getPropertyValue("--terminal-mobile-shortcuts-content-height").trim(),
+      quickKeysSafeArea: quickKeysStyle.getPropertyValue("--terminal-mobile-shortcuts-safe-area").trim(),
       quickKeysBottom: quickKeysRect.bottom,
       terminalBottom: scrollportRect.bottom,
       terminalEndsAtQuickKeys: Math.abs(scrollportRect.bottom - quickKeysRect.top) <= 2,
@@ -97,13 +100,14 @@ async function compactQuickKeysGeometry(quickKeys: Locator) {
   return quickKeys.locator(".terminal-quick-keys-main").evaluate((main) => {
     const mainRect = main.getBoundingClientRect();
     const requiredButtons = Array.from(main.querySelectorAll<HTMLElement>("button")).slice(0, 10);
+    const firstRect = requiredButtons.at(0)?.getBoundingClientRect();
+    const lastRect = requiredButtons.at(-1)?.getBoundingClientRect();
     return {
       clientWidth: main.clientWidth,
       scrollWidth: main.scrollWidth,
-      requiredButtonsInside: requiredButtons.every((button) => {
-        const rect = button.getBoundingClientRect();
-        return rect.left >= mainRect.left - 1 && rect.right <= mainRect.right + 1;
-      }),
+      canScrollHorizontally: main.scrollWidth > main.clientWidth + 1,
+      firstButtonInside: Boolean(firstRect && firstRect.left >= mainRect.left - 1 && firstRect.right <= mainRect.right + 1),
+      lastButtonInside: Boolean(lastRect && lastRect.left >= mainRect.left - 1 && lastRect.right <= mainRect.right + 1),
       buttonContentFits: requiredButtons.every((button) => (
         button.scrollWidth <= button.clientWidth &&
         button.scrollHeight <= button.clientHeight
@@ -186,17 +190,24 @@ test("mobile terminal quick keys follow keyboard viewport in portrait and landsc
       terminalEndsAtQuickKeys: true,
       quickKeysEndsAtViewport: true,
       insidePane: true,
-      quickKeysHeight: 42,
+      quickKeysHeight: 44,
+      quickKeysContentHeight: "44px",
+      quickKeysSafeArea: "0px",
     });
 
     const compactLabels = await quickKeys.locator(".terminal-quick-keys-main button").evaluateAll((buttons) =>
       buttons.map((button) => button.textContent?.trim()).filter(Boolean).slice(0, 9),
     );
     expect(compactLabels).toEqual(["ESC", "TAB", "CTRL", "ALT", "SHIFT", "←", "↑", "↓", "→"]);
-    const compactGeometry = await compactQuickKeysGeometry(quickKeys);
-    expect(compactGeometry.scrollWidth).toBeLessThanOrEqual(compactGeometry.clientWidth + 1);
-    expect(compactGeometry.requiredButtonsInside).toBe(true);
-    expect(compactGeometry.buttonContentFits).toBe(true);
+    await expect.poll(() => compactQuickKeysGeometry(quickKeys)).toMatchObject({
+      canScrollHorizontally: true,
+      firstButtonInside: true,
+      buttonContentFits: true,
+    });
+    await quickKeys.locator(".terminal-quick-keys-main").evaluate((main) => {
+      main.scrollLeft = main.scrollWidth;
+    });
+    await expect.poll(() => compactQuickKeysGeometry(quickKeys)).toMatchObject({ lastButtonInside: true });
 
     await page.setViewportSize({ width: 320, height: initialViewport.height });
     await setVisualViewport(page, {
@@ -204,12 +215,18 @@ test("mobile terminal quick keys follow keyboard viewport in portrait and landsc
       visualHeight: Math.min(500, initialViewport.height - 220),
       offsetTop: 12,
     });
+    await quickKeys.locator(".terminal-quick-keys-main").evaluate((main) => {
+      main.scrollLeft = 0;
+    });
     await expect.poll(() => compactQuickKeysGeometry(quickKeys)).toMatchObject({
-      requiredButtonsInside: true,
+      canScrollHorizontally: true,
+      firstButtonInside: true,
       buttonContentFits: true,
     });
-    const narrowCompactGeometry = await compactQuickKeysGeometry(quickKeys);
-    expect(narrowCompactGeometry.scrollWidth).toBeLessThanOrEqual(narrowCompactGeometry.clientWidth + 1);
+    await quickKeys.locator(".terminal-quick-keys-main").evaluate((main) => {
+      main.scrollLeft = main.scrollWidth;
+    });
+    await expect.poll(() => compactQuickKeysGeometry(quickKeys)).toMatchObject({ lastButtonInside: true });
 
     await page.setViewportSize(initialViewport);
     await setVisualViewport(page, {
@@ -236,7 +253,9 @@ test("mobile terminal quick keys follow keyboard viewport in portrait and landsc
       terminalEndsAtQuickKeys: true,
       quickKeysEndsAtViewport: true,
       insidePane: true,
-      quickKeysHeight: 120,
+      quickKeysHeight: 132,
+      quickKeysContentHeight: "132px",
+      quickKeysSafeArea: "0px",
     });
     await pressTouch(page.getByRole("tab", { name: "Ctrl combinations" }), 104);
     await pressTouch(page.getByRole("button", { name: "^C" }), 105);
@@ -292,7 +311,9 @@ test("mobile terminal quick keys follow keyboard viewport in portrait and landsc
       terminalEndsAtQuickKeys: true,
       quickKeysEndsAtViewport: true,
       insidePane: true,
-      quickKeysHeight: 106,
+      quickKeysHeight: 132,
+      quickKeysContentHeight: "132px",
+      quickKeysSafeArea: "0px",
     });
 
     await setVisualViewport(page, {

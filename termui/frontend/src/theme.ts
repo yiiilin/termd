@@ -5,6 +5,7 @@ export interface TerminalThemeColors {
   foreground: string;
   cursor: string;
   selectionBackground: string;
+  selectionForeground: string;
 }
 
 export function resolveTheme(preference: BrowserThemePreference, systemTheme: EffectiveTheme): EffectiveTheme {
@@ -18,9 +19,10 @@ export function terminalTheme(theme: EffectiveTheme): TerminalThemeColors {
   if (theme === "light") {
     return {
       background: "#eae4ca",
-      foreground: "#5c6a72",
-      cursor: "#8da101",
+      foreground: "#536169",
+      cursor: "#596900",
       selectionBackground: "#d3c6aa",
+      selectionForeground: "#293136",
     };
   }
   return {
@@ -28,6 +30,7 @@ export function terminalTheme(theme: EffectiveTheme): TerminalThemeColors {
     foreground: "#d3c6aa",
     cursor: "#a7c080",
     selectionBackground: "#5d6b66",
+    selectionForeground: "#f5ead0",
   };
 }
 

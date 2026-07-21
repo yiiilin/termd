@@ -89,7 +89,7 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
 
       const reopenedMenu = await openMobileMenu(page);
       await reopenedMenu.getByRole("button", { name: "Sessions" }).click();
-      await expect(page.getByRole("region", { name: "sessions panel" })).toBeVisible();
+      await expect(page.getByRole("dialog", { name: "sessions panel" })).toBeVisible();
       await activateButton(page, "Refresh sessions");
 
       // 移动端刷新后，顶部入口仍然必须保持在左侧，不允许被布局规则顶到右边。
@@ -1750,11 +1750,20 @@ async function closeCreatedSessions(page: Page, names: string[]): Promise<void> 
         if ((await openButton.count()) === 0) {
           break;
         }
-        // 中文注释：关闭一个 session 会重绘整个列表；每次短重试都从当前 DOM 重新定位 row。
-        const row = openButton.locator(
-          "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' session-row ')][1]",
-        );
-        await row.getByRole("button", { name: "Close session" }).click({ timeout: 500 });
+        const closeDialog = page.getByRole("alertdialog", { name: "Close session?" });
+        if (!(await closeDialog.isVisible())) {
+          // 中文注释：关闭一个 session 会重绘整个列表；每次短重试都从当前 DOM 重新定位 row。
+          const row = openButton.locator(
+            "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' session-row ')][1]",
+          );
+          await row.getByRole("button", { name: "Close session" }).click({ timeout: 500 });
+        }
+        const confirmButton = closeDialog.getByRole("button", { name: "Close session", exact: true });
+        if (await confirmButton.isVisible()) {
+          await confirmButton.click({ timeout: 1_000 });
+        } else {
+          await page.waitForTimeout(50);
+        }
       } catch (caught) {
         if (isPageGoneError(caught)) {
           return;

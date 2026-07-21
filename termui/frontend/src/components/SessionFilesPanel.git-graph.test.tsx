@@ -42,6 +42,8 @@ function renderGitGraph(graph: string[], unstaged: SessionGitFileChangePayload[]
       onGoToPath={vi.fn()}
       onRefresh={vi.fn()}
       onRefreshGit={vi.fn()}
+      onDismissError={vi.fn()}
+      onDismissGitError={vi.fn()}
       onFollowTerminalCwdChange={vi.fn()}
       onUpload={vi.fn()}
       onDownload={vi.fn()}
