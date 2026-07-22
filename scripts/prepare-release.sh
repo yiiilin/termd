@@ -13,6 +13,7 @@ TEMP_ROOT=
 RELEASE_WORKTREE=
 WORKTREE_ADDED=0
 BASE_OID=
+REMOTE_MAIN_OID=
 HEAD_REF=
 RELEASE_COMMIT=
 TAG_OBJECT=
@@ -345,7 +346,19 @@ HEAD_REF="$(git symbolic-ref -q HEAD)" || die "release must be prepared from a b
 BASE_OID="$(git rev-parse --verify "${HEAD_REF}^{commit}")" ||
   die "failed to capture the main commit"
 
-git fetch --tags --quiet || die "failed to fetch tags"
+git fetch --tags --quiet origin \
+  '+refs/heads/main:refs/remotes/origin/main' ||
+  die "failed to fetch origin/main and tags"
+REMOTE_MAIN_OID="$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')" ||
+  die "failed to capture origin/main"
+if git merge-base --is-ancestor "$REMOTE_MAIN_OID" "$BASE_OID"; then
+  :
+else
+  ancestor_status=$?
+  [[ "$ancestor_status" -eq 1 ]] ||
+    die "failed to compare origin/main with local main"
+  die "remote origin/main is not an ancestor of local main; reconcile origin/main before release"
+fi
 if ref_exists "refs/tags/${version}"; then
   die "tag ${version} already exists"
 else
@@ -539,7 +552,7 @@ if [[ "$PUSH" -eq 1 ]]; then
   [[ "$(git rev-parse --verify "$HEAD_REF")" == "$BASE_OID" ]] ||
     die "local main changed before push; release was not pushed"
 
-  if git push --atomic --force-with-lease="refs/heads/main:${BASE_OID}" origin \
+  if git push --atomic --force-with-lease="refs/heads/main:${REMOTE_MAIN_OID}" origin \
     "${RELEASE_COMMIT}:refs/heads/main" \
     "${TAG_OBJECT}:refs/tags/${version}"; then
     :
@@ -552,5 +565,5 @@ if [[ "$PUSH" -eq 1 ]]; then
     "$version" "$BASE_OID"
 else
   printf '[prepare-release] not pushed. Run: git push --atomic --force-with-lease=refs/heads/main:%s origin %s:refs/heads/main %s:refs/tags/%s\n' \
-    "$BASE_OID" "$RELEASE_COMMIT" "$TAG_OBJECT" "$version"
+    "$REMOTE_MAIN_OID" "$RELEASE_COMMIT" "$TAG_OBJECT" "$version"
 fi

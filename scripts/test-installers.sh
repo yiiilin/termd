@@ -3059,10 +3059,14 @@ test_prepare_release_success_isolated_and_exact() (
 test_prepare_release_clean_success_leaves_caller_read_only() (
   prepare_release_fixture_setup
   trap prepare_release_fixture_teardown EXIT
-  local base commit status_before status_after
+  local base commit remote_before status_before status_after
   prepare_release_paths 9.9.13
   write_prepare_release_fixture_notes 9.9.13 "clean caller 只读回归。"
+  printf 'local main ahead of origin\n' >"${PREPARE_REPO}/local-ahead.txt"
+  git -C "$PREPARE_REPO" add -- local-ahead.txt
+  git -C "$PREPARE_REPO" commit -m "Advance local main" >/dev/null
   base="$(git -C "$PREPARE_REPO" rev-parse HEAD)"
+  remote_before="$(git --git-dir="$PREPARE_REMOTE" rev-parse refs/heads/main)"
   status_before="$(git -C "$PREPARE_REPO" status --porcelain=v1 --untracked-files=all)"
 
   run_prepare_release_fixture 9.9.13 --skip-verify
@@ -3080,6 +3084,7 @@ test_prepare_release_clean_success_leaves_caller_read_only() (
   [[ "$status_after" == "$status_before" ]]
   assert_ref_missing "$PREPARE_REPO" refs/termd/release-candidates/9.9.13
   [[ "$PREPARE_OUTPUT" == *"local main remains at ${base}"* ]]
+  [[ "$PREPARE_OUTPUT" == *"--force-with-lease=refs/heads/main:${remote_before}"* ]]
   run_reported_local_completion "$PREPARE_REPO" "$PREPARE_OUTPUT" \
     docs/releases/9.9.13.md "$commit"
   [[ "$(git -C "$PREPARE_REPO" rev-parse refs/heads/main)" == "$commit" ]]
@@ -3437,14 +3442,19 @@ test_prepare_release_atomic_push_failure_has_no_remote_partial_update() (
 test_prepare_release_atomic_push_success() (
   prepare_release_fixture_setup
   trap prepare_release_fixture_teardown EXIT
-  local base remote_commit remote_tag_commit status_before status_after
+  local base remote_before remote_commit remote_tag_commit status_before status_after
   prepare_release_paths 9.9.12
   write_prepare_release_fixture_notes 9.9.12 "atomic push success 回归。"
+  printf 'local main ahead of origin\n' >"${PREPARE_REPO}/local-ahead.txt"
+  git -C "$PREPARE_REPO" add -- local-ahead.txt
+  git -C "$PREPARE_REPO" commit -m "Advance local main" >/dev/null
   printf 'staged dirty push edit\n' >>"${PREPARE_REPO}/README.md"
   git -C "$PREPARE_REPO" add -- README.md
   printf 'unstaged dirty push edit\n' >>"${PREPARE_REPO}/README.md"
   printf 'untracked dirty push edit\n' >"${PREPARE_REPO}/scratch-untracked.txt"
   base="$(git -C "$PREPARE_REPO" rev-parse HEAD)"
+  remote_before="$(git --git-dir="$PREPARE_REMOTE" rev-parse refs/heads/main)"
+  git -C "$PREPARE_REPO" merge-base --is-ancestor "$remote_before" "$base"
   status_before="$(git -C "$PREPARE_REPO" status --porcelain=v1 --untracked-files=all)"
 
   run_prepare_release_fixture 9.9.12 --allow-dirty --push --skip-verify
@@ -3455,6 +3465,7 @@ test_prepare_release_atomic_push_success() (
   remote_commit="$(git --git-dir="$PREPARE_REMOTE" rev-parse refs/heads/main)"
   remote_tag_commit="$(git --git-dir="$PREPARE_REMOTE" rev-parse 'refs/tags/9.9.12^{commit}')"
   [[ "$remote_tag_commit" == "$remote_commit" ]]
+  [[ "$(git -C "$PREPARE_REPO" rev-parse "${remote_commit}^")" == "$base" ]]
   [[ "$(git -C "$PREPARE_REPO" rev-parse refs/heads/main)" == "$base" ]]
   [[ "$(git -C "$PREPARE_REPO" rev-parse 'refs/tags/9.9.12^{commit}')" == "$remote_commit" ]]
   assert_ref_missing "$PREPARE_REPO" refs/termd/release-candidates/9.9.12
@@ -3462,6 +3473,37 @@ test_prepare_release_atomic_push_success() (
   [[ "$status_after" == "$status_before" ]]
   [[ "$PREPARE_OUTPUT" == *"local main remains at ${base}"* ]]
   [[ "$PREPARE_OUTPUT" == *"git merge --ff-only ${remote_commit}"* ]]
+)
+
+test_prepare_release_rejects_remote_main_not_ancestor_before_qa() (
+  prepare_release_fixture_setup
+  trap prepare_release_fixture_teardown EXIT
+  local base remote_before remote_commit status_before status_after tree
+  prepare_release_paths 9.9.18
+  write_prepare_release_fixture_notes 9.9.18 "远端 main 分叉早失败回归。"
+  base="$(git -C "$PREPARE_REPO" rev-parse refs/heads/main)"
+  tree="$(git -C "$PREPARE_REPO" rev-parse "${base}^{tree}")"
+  remote_commit="$(printf 'Advance remote main\n' | \
+    git -C "$PREPARE_REPO" commit-tree "$tree" -p "$base")"
+  git -C "$PREPARE_REPO" push origin \
+    "${remote_commit}:refs/heads/main" >/dev/null 2>/dev/null
+  remote_before="$(git --git-dir="$PREPARE_REMOTE" rev-parse refs/heads/main)"
+  [[ "$remote_before" == "$remote_commit" ]]
+  status_before="$(git -C "$PREPARE_REPO" status --porcelain=v1 --untracked-files=all)"
+
+  export PREPARE_RELEASE_FIXTURE_QA_MODE=fail-status-42
+  run_prepare_release_fixture 9.9.18
+  unset PREPARE_RELEASE_FIXTURE_QA_MODE
+  [[ "$PREPARE_STATUS" -eq 1 ]]
+  [[ "$PREPARE_OUTPUT" == *"remote origin/main is not an ancestor of local main"* ]]
+  [[ "$PREPARE_OUTPUT" != *"fixture QA failure with status 42"* ]]
+  [[ "$(git --git-dir="$PREPARE_REMOTE" rev-parse refs/heads/main)" == "$remote_before" ]]
+  assert_ref_missing "$PREPARE_REMOTE" refs/tags/9.9.18
+  assert_ref_missing "$PREPARE_REPO" refs/tags/9.9.18
+  assert_ref_missing "$PREPARE_REPO" refs/termd/release-candidates/9.9.18
+  [[ "$(git -C "$PREPARE_REPO" rev-parse refs/heads/main)" == "$base" ]]
+  status_after="$(git -C "$PREPARE_REPO" status --porcelain=v1 --untracked-files=all)"
+  [[ "$status_after" == "$status_before" ]]
 )
 
 test_termd_install_transaction_rolls_back_every_failure_boundary() (
@@ -3946,5 +3988,6 @@ run_test test_prepare_release_publication_partial_success_is_consistent
 run_test test_prepare_release_cleanup_failure_preserves_primary_status
 run_test test_prepare_release_atomic_push_failure_has_no_remote_partial_update
 run_test test_prepare_release_atomic_push_success
+run_test test_prepare_release_rejects_remote_main_not_ancestor_before_qa
 
 printf 'installer tests passed\n'
