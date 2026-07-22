@@ -113,7 +113,7 @@
   /* RTT 已移到 session 标题栏，状态栏网络列只需要容纳上下行速率。 */
   --daemon-status-network-width: 154px;
   --daemon-status-disk-width: 150px;
-  --daemon-status-load-width: 112px;
+  --daemon-status-load-width: 160px;
   --daemon-status-uptime-width: 112px;
 }
 
@@ -1934,7 +1934,7 @@ label {
   flex-wrap: nowrap;
   gap: 0;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
   overflow: hidden;
 }
 
@@ -2009,6 +2009,10 @@ label {
 
 .daemon-status-strip .daemon-status-load {
   flex-basis: var(--daemon-status-load-width);
+}
+
+.daemon-status-strip .daemon-status-load strong {
+  font-variant-numeric: tabular-nums;
 }
 
 .daemon-status-strip .daemon-status-uptime {
@@ -4322,7 +4326,7 @@ label {
     --daemon-status-memory-width: 178px;
     --daemon-status-network-width: 164px;
     --daemon-status-disk-width: 178px;
-    --daemon-status-load-width: 136px;
+    --daemon-status-load-width: 160px;
   }
 
   .daemon-status-strip .daemon-status-metric {
