@@ -1962,6 +1962,11 @@ label {
   padding: 0 8px;
 }
 
+.daemon-status-strip .daemon-status-metric > span {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .daemon-status-network {
   min-width: 0;
 }

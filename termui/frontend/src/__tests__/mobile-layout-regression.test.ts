@@ -128,6 +128,14 @@ describe("mobile layout regressions", () => {
     });
   });
 
+  it("keeps daemon status labels on one line when their values need to shrink", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const metricLabelRule = css.match(/\.daemon-status-strip \.daemon-status-metric > span \{[^}]+\}/)?.[0] ?? "";
+
+    expect(metricLabelRule).toContain("flex: 0 0 auto;");
+    expect(metricLabelRule).toContain("white-space: nowrap;");
+  });
+
   it("honors contrast, transparency, motion, and immediate press preferences", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
