@@ -750,7 +750,7 @@ export default function App() {
     document.documentElement.style.colorScheme = effectiveTheme;
     document.querySelector('meta[name="theme-color"]')?.setAttribute(
       "content",
-      effectiveTheme === "light" ? "#e8ebe7" : "#15191c",
+      effectiveTheme === "light" ? "#e8ecea" : "#111416",
     );
   }, [effectiveLocale, effectiveTheme]);
 

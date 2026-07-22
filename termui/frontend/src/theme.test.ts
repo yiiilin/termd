@@ -10,6 +10,12 @@ describe("terminal theme contrast", () => {
     expect(contrastRatio(colors.foreground, colors.background)).toBeGreaterThanOrEqual(4.5);
     expect(contrastRatio(colors.cursor, colors.background)).toBeGreaterThanOrEqual(3);
     expect(contrastRatio(colors.selectionForeground, colors.selectionBackground)).toBeGreaterThanOrEqual(4.5);
+    const selector = theme === "light" ? ':root[data-theme="light"]' : ":root";
+    const cssColors = cssCustomProperties(selector);
+    expect(
+      contrastRatio(requiredColor(cssColors, "--color-terminal-muted"), colors.background),
+      `${theme} terminal muted text`,
+    ).toBeGreaterThanOrEqual(4.5);
   });
 
   it.each([
@@ -76,6 +82,11 @@ describe("terminal theme contrast", () => {
     expect(cssRule('.files-tab[aria-selected="true"]')).toContain("color: var(--color-accent-text);");
     expect(cssRule(".git-worktree-current")).toContain("color: var(--color-info-text);");
     expect(cssRule(".git-change-status")).toContain("color: var(--color-info-text);");
+    expect(cssRule(".terminal-mobile-shortcut-button")).toContain("color: var(--color-text-strong);");
+    expect(cssRule(".terminal-copy-toast")).toContain("color: var(--color-text-strong);");
+    expect(cssRule(".file-editor-shell")).toContain("background: var(--color-editor-bg);");
+    expect(cssRule(".file-editor-shell textarea")).toContain("background: var(--color-editor-bg);");
+    expect(cssRule(".file-editor-shell textarea")).toContain("color: var(--color-text);");
   });
 
   it.each(["light", "dark"] as const)("keeps %s CSS terminal colors aligned with xterm", (theme) => {

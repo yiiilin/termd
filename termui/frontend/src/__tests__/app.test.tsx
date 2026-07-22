@@ -2084,27 +2084,27 @@ describe("termui web 工作台", () => {
     expect(css).toContain("justify-content: start;");
   });
 
-  it("浅色主题使用冷银 chrome 与暖色终端，避免面板和终端大面积纯白", () => {
+  it("浅色主题使用冷银 chrome 框住深色终端画布", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
-    expect(css).toContain("--color-bg-page: #e8ebe7;");
-    expect(css).toContain("--color-surface: #f3f5f1;");
-    expect(css).toContain("--color-terminal-bg: #eff1ec;");
-    expect(css).toContain("--color-text: #344046;");
+    expect(css).toContain("--color-bg-page: #e8ecea;");
+    expect(css).toContain("--color-surface: #f5f7f6;");
+    expect(css).toContain("--color-terminal-bg: #0e1214;");
+    expect(css).toContain("--color-text: #34413a;");
     expect(css).not.toContain("--color-surface: #ffffff;");
     expect(css).not.toContain("--color-toast-bg: rgba(255, 255, 255");
   });
 
-  it("暗色主题使用 graphite chrome 与暖色终端，避免霓虹高对比黑绿", () => {
+  it("暗色主题使用 graphite chrome 与低反光终端画布", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
     const html = readFileSync(resolve(process.cwd(), "index.html"), "utf8");
 
-    expect(css).toContain("--color-bg-page: #15191c;");
-    expect(css).toContain("--color-surface: #22282d;");
-    expect(css).toContain("--color-terminal-bg: #181c1f;");
+    expect(css).toContain("--color-bg-page: #111416;");
+    expect(css).toContain("--color-surface: #202529;");
+    expect(css).toContain("--color-terminal-bg: #0b0e10;");
     expect(css).toContain("--color-text: #d8dedb;");
-    expect(css).toContain("--color-accent: #a7c080;");
-    expect(html).toContain('<meta name="theme-color" content="#15191c" />');
+    expect(css).toContain("--color-accent: #6fbd87;");
+    expect(html).toContain('<meta name="theme-color" content="#111416" />');
     expect(css).not.toContain("--color-accent: #d6ff5f;");
   });
 

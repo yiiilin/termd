@@ -132,10 +132,14 @@ describe("mobile layout regressions", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
     expect(css).toContain("button:not(.mobile-backdrop):not(.toolbar-title-button):not(.session-open-button):active:not(:disabled) {");
+    expect(css).toContain("button:not(.mobile-backdrop):not(.toolbar-title-button):not(.session-open-button):not(.files-tab):hover:not(:disabled) {");
     expect(css).toContain("transform: scale(0.97);");
     expect(css).toContain("transition: transform 100ms ease-out;");
     expect(css).toContain(".toolbar-title-button:active:not(:disabled) {");
     expect(css).toContain(".session-open-button:active:not(:disabled) {");
+    const mobileCopyBlock = css.match(/\.terminal-mobile-selection-copy-button \{[^}]+\}/)?.[0] ?? "";
+    expect(mobileCopyBlock).toContain("min-height: 32px;");
+    expect(mobileCopyBlock).toContain("color: var(--color-text-strong);");
     expect(css).toContain("touch-action: none;");
     const contrastBlock = cssPreferenceBlock(css, "prefers-contrast: more");
     expect(contrastBlock).toContain(".destructive-action-dialog,");
@@ -143,8 +147,8 @@ describe("mobile layout regressions", () => {
     expect(contrastBlock).toContain(".clients-popover .panel,");
     expect(contrastBlock).not.toContain(".destructive-dialog,");
     const transparencyBlock = cssPreferenceBlock(css, "prefers-reduced-transparency: reduce");
-    expect(transparencyBlock).toContain("--color-bg-shell: #1b2024;");
-    expect(transparencyBlock).toContain("--color-floating-gradient: linear-gradient(90deg, #1b2024, #343d43 16px);");
+    expect(transparencyBlock).toContain("--color-bg-shell: #191d20;");
+    expect(transparencyBlock).toContain("--color-floating-gradient: linear-gradient(90deg, #191e21, #30383d 16px);");
     expect(transparencyBlock).toContain(".toolbar,\n  .mobile-menu-popover,\n  .terminal-direction-pad {\n    backdrop-filter: none;");
     expect(transparencyBlock).toContain(".terminal-direction-pad {\n    backdrop-filter: none;");
     const motionBlock = cssPreferenceBlock(css, "prefers-reduced-motion: reduce");
