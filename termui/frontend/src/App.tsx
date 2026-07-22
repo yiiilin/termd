@@ -750,7 +750,7 @@ export default function App() {
     document.documentElement.style.colorScheme = effectiveTheme;
     document.querySelector('meta[name="theme-color"]')?.setAttribute(
       "content",
-      effectiveTheme === "light" ? "#e5dfc5" : "#293136",
+      effectiveTheme === "light" ? "#e8ebe7" : "#15191c",
     );
   }, [effectiveLocale, effectiveTheme]);
 
@@ -4415,14 +4415,15 @@ export default function App() {
               <button
                 ref={clientsTriggerRef}
                 type="button"
-                className="toolbar-clients-button"
+                className="icon-button toolbar-clients-button"
                 aria-label={t("app.clients")}
+                title={t("app.clients")}
                 aria-controls="daemon-clients-popover"
                 aria-expanded={clientsOpen}
                 onClick={() => setClientsOpen((open) => !open)}
               >
                 <UsersRound size={16} aria-hidden="true" />
-                {t("app.clients")}
+                <span className="toolbar-action-label">{t("app.clients")}</span>
               </button>
               {clientsOpen ? (
                 <div ref={clientsPopoverRef} className="clients-popover toolbar-clients-popover" id="daemon-clients-popover">
@@ -4435,11 +4436,23 @@ export default function App() {
                   </Suspense>
                 </div>
               ) : null}
-              <button type="button" className="toolbar-admin-button" onClick={() => handleOpenAdmin()}>
+              <button
+                type="button"
+                className="icon-button toolbar-admin-button"
+                aria-label={t("app.daemons")}
+                title={t("app.daemons")}
+                onClick={() => handleOpenAdmin()}
+              >
                 <Server size={16} aria-hidden="true" />
-                {t("app.daemons")}
+                <span className="toolbar-action-label">{t("app.daemons")}</span>
               </button>
-              <button type="button" className="icon-button toolbar-settings-button" aria-label={t("app.settings")} onClick={() => setSettingsOpen(true)}>
+              <button
+                type="button"
+                className="icon-button toolbar-settings-button"
+                aria-label={t("app.settings")}
+                title={t("app.settings")}
+                onClick={() => setSettingsOpen(true)}
+              >
                 <Settings size={16} aria-hidden="true" />
               </button>
             </div>
@@ -4781,27 +4794,26 @@ function SessionOperatorsBar(props: {
   currentDeviceId?: UUID;
 }) {
   const { t } = useI18n();
+  if (props.operators.length === 0) {
+    return null;
+  }
   return (
     <div className="session-operators" aria-label={t("operators.aria")}>
       <div className="session-operators-title">
         <UsersRound size={15} aria-hidden="true" />
         <span>{props.operators.length}</span>
       </div>
-      {props.operators.length === 0 ? (
-        <span className="session-operator muted">{t("operators.empty")}</span>
-      ) : (
-        props.operators.map((client) => {
-          const isCurrentDevice = client.device_id === props.currentDeviceId;
-          const label = client.name?.trim() || client.peer_ip || t("operators.client");
-          return (
-            <span className="session-operator" key={client.client_id} title={label}>
-              <span className="status-dot online" aria-hidden="true" />
-              <span>{label}</span>
-              {isCurrentDevice ? <span>{t("operators.you")}</span> : null}
-            </span>
-          );
-        })
-      )}
+      {props.operators.map((client) => {
+        const isCurrentDevice = client.device_id === props.currentDeviceId;
+        const label = client.name?.trim() || client.peer_ip || t("operators.client");
+        return (
+          <span className="session-operator" key={client.client_id} title={label}>
+            <span className="status-dot online" aria-hidden="true" />
+            <span>{label}</span>
+            {isCurrentDevice ? <span>{t("operators.you")}</span> : null}
+          </span>
+        );
+      })}
     </div>
   );
 }
@@ -4834,14 +4846,12 @@ function DaemonStatusPanel(props: {
       aria-label={t("daemonStatus.aria")}
       role="contentinfo"
     >
-      {props.compact ? null : (
-        <header className="daemon-status-header">
-          <div className="daemon-status-title">
-            <Server size={13} aria-hidden="true" />
-            <span>{props.status?.host_name ?? t("daemonStatus.fallbackHost")}</span>
-          </div>
-        </header>
-      )}
+      <header className={props.compact ? "daemon-status-header compact" : "daemon-status-header"}>
+        <div className="daemon-status-title">
+          <Server size={13} aria-hidden="true" />
+          <span>{props.status?.host_name ?? t("daemonStatus.fallbackHost")}</span>
+        </div>
+      </header>
       {!props.compact && props.error ? (
         <div className="daemon-status-error">
           <code>{props.error.code}</code>

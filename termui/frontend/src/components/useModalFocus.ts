@@ -129,6 +129,36 @@ export function useModalFocus<T extends HTMLElement = HTMLElement>({
     syncModalStack(document);
     focusFirstTarget(dialog);
 
+    const restoreFocusIfNeeded = () => {
+      if (topModalEntry()?.dialog !== dialog) {
+        return;
+      }
+
+      const activeElement = document.activeElement;
+      if (
+        activeElement === dialog ||
+        (activeElement instanceof HTMLElement &&
+          dialog.contains(activeElement) &&
+          activeElement.matches(focusableSelector))
+      ) {
+        return;
+      }
+
+      focusFirstTarget(dialog);
+    };
+
+    const focusTargetObserver = new MutationObserver(restoreFocusIfNeeded);
+    focusTargetObserver.observe(dialog, {
+      attributes: true,
+      attributeFilter: ["disabled"],
+      childList: true,
+      subtree: true,
+    });
+
+    const handleFocusOut = () => {
+      queueMicrotask(restoreFocusIfNeeded);
+    };
+
     const handleKeyDown = (event: KeyboardEvent) => {
       if (topModalEntry()?.dialog !== dialog) {
         return;
@@ -165,9 +195,22 @@ export function useModalFocus<T extends HTMLElement = HTMLElement>({
       }
     };
 
+    const handleDocumentKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof Node && dialog.contains(target)) {
+        return;
+      }
+      handleKeyDown(event);
+    };
+
+    dialog.addEventListener("focusout", handleFocusOut);
     dialog.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("keydown", handleDocumentKeyDown);
     return () => {
+      focusTargetObserver.disconnect();
+      dialog.removeEventListener("focusout", handleFocusOut);
       dialog.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("keydown", handleDocumentKeyDown);
       const stackIndex = modalFocusStack.indexOf(stackEntry);
       if (stackIndex >= 0) {
         modalFocusStack.splice(stackIndex, 1);

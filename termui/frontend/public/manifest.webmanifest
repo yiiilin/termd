@@ -5,8 +5,8 @@
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
-  "background_color": "#0c1210",
-  "theme_color": "#0c1210",
+  "background_color": "#15191c",
+  "theme_color": "#15191c",
   "icons": [
     {
       "src": "./icons/termd.svg",

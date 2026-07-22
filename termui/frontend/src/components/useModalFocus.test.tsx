@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it } from "vitest";
@@ -30,6 +30,48 @@ function DeferredDialog({ ready }: { ready: boolean }) {
     <section ref={dialogRef} role="dialog" aria-label="Deferred dialog">
       {ready ? <button type="button">Deferred action</button> : <span>Loading</span>}
     </section>
+  );
+}
+
+function InvalidatingActionDialog() {
+  const [open, setOpen] = useState(false);
+  const [applied, setApplied] = useState(false);
+  const [removed, setRemoved] = useState(false);
+  const dialogRef = useModalFocus({ open, onClose: () => setOpen(false) });
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => {
+          setApplied(false);
+          setRemoved(false);
+          setOpen(true);
+        }}
+      >
+        Open invalidating dialog
+      </button>
+      {open ? (
+        <section ref={dialogRef} role="dialog" aria-label="Invalidating dialog">
+          <button type="button">Fallback action</button>
+          <button
+            type="button"
+            disabled={applied}
+            onClick={(event) => {
+              setApplied(true);
+              event.currentTarget.blur();
+            }}
+          >
+            Apply
+          </button>
+          {removed ? null : (
+            <button type="button" onClick={() => setRemoved(true)}>
+              Remove action
+            </button>
+          )}
+        </section>
+      ) : null}
+    </>
   );
 }
 
@@ -124,6 +166,38 @@ describe("useModalFocus", () => {
     expect(screen.getByRole("button", { name: "Deferred action" })).toHaveFocus();
   });
 
+  it("pulls focus back into the dialog when a control blurs to the document body", async () => {
+    const user = userEvent.setup();
+    render(<TestDialog />);
+
+    await user.click(screen.getByRole("button", { name: "Open dialog" }));
+    const firstAction = screen.getByRole("button", { name: "First action" });
+    firstAction.blur();
+    expect(document.body).toHaveFocus();
+
+    await waitFor(() => expect(firstAction).toHaveFocus());
+  });
+
+  it("restores focus inside the dialog when the focused control becomes disabled", async () => {
+    const user = userEvent.setup();
+    render(<InvalidatingActionDialog />);
+
+    await user.click(screen.getByRole("button", { name: "Open invalidating dialog" }));
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Fallback action" })).toHaveFocus());
+  });
+
+  it("restores focus inside the dialog when the focused control is removed", async () => {
+    const user = userEvent.setup();
+    render(<InvalidatingActionDialog />);
+
+    await user.click(screen.getByRole("button", { name: "Open invalidating dialog" }));
+    await user.click(screen.getByRole("button", { name: "Remove action" }));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Fallback action" })).toHaveFocus());
+  });
+
   it("makes every branch below the top modal inert and pulls escaped focus back", async () => {
     const user = userEvent.setup();
     render(<StackedDialogs />);
@@ -140,6 +214,23 @@ describe("useModalFocus", () => {
 
     await user.click(screen.getByRole("button", { name: "Close top dialog" }));
     expect(screen.getByTestId("lower-layer")).not.toHaveAttribute("inert");
+    expect(screen.getByTestId("background-action")).toHaveAttribute("inert");
+  });
+
+  it("closes only the top dialog on Escape when focus has fallen back to the document body", async () => {
+    const user = userEvent.setup();
+    render(<StackedDialogs />);
+
+    const topTrigger = screen.getByRole("button", { name: "Open top dialog" });
+    await user.click(topTrigger);
+    screen.getByTestId("top-action").blur();
+    expect(document.body).toHaveFocus();
+
+    fireEvent.keyDown(document.body, { key: "Escape" });
+
+    expect(screen.queryByRole("alertdialog", { name: "Top dialog" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Lower dialog" })).toBeInTheDocument();
+    expect(topTrigger).toHaveFocus();
     expect(screen.getByTestId("background-action")).toHaveAttribute("inert");
   });
 });

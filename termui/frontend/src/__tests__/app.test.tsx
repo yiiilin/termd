@@ -2070,12 +2070,12 @@ describe("termui web 工作台", () => {
 
     expect(css).toContain('font-family: "HarmonyOS Sans SC";');
     expect(css).toContain('--font-ui: "HarmonyOS Sans SC", "HarmonyOS Sans", "Aptos", "Segoe UI", sans-serif;');
-    expect(css).toContain("--daemon-status-cpu-width: 148px;");
-    expect(css).toContain("--daemon-status-memory-width: 188px;");
-    expect(css).toContain("--daemon-status-network-width: 184px;");
-    expect(css).toContain("--daemon-status-disk-width: 188px;");
-    expect(css).toContain("--daemon-status-load-width: 142px;");
-    expect(css).toContain("--daemon-status-uptime-width: 132px;");
+    expect(css).toContain("--daemon-status-cpu-width: 108px;");
+    expect(css).toContain("--daemon-status-memory-width: 150px;");
+    expect(css).toContain("--daemon-status-network-width: 154px;");
+    expect(css).toContain("--daemon-status-disk-width: 150px;");
+    expect(css).toContain("--daemon-status-load-width: 112px;");
+    expect(css).toContain("--daemon-status-uptime-width: 112px;");
     expect(css).toContain("grid-template-columns: max-content minmax(0, 1fr);");
     expect(css).toContain("flex: 0 0 var(--daemon-status-memory-width);");
     expect(css).toContain("flex-basis: var(--daemon-status-cpu-width);");
@@ -2084,27 +2084,27 @@ describe("termui web 工作台", () => {
     expect(css).toContain("justify-content: start;");
   });
 
-  it("浅色主题使用 Everforest soft light 底色，避免面板和终端大面积纯白", () => {
+  it("浅色主题使用冷银 chrome 与暖色终端，避免面板和终端大面积纯白", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
-    expect(css).toContain("--color-bg-page: #e5dfc5;");
-    expect(css).toContain("--color-surface: #f3ead3;");
-    expect(css).toContain("--color-terminal-bg: #eae4ca;");
-    expect(css).toContain("--color-text: #505d64;");
+    expect(css).toContain("--color-bg-page: #e8ebe7;");
+    expect(css).toContain("--color-surface: #f3f5f1;");
+    expect(css).toContain("--color-terminal-bg: #eff1ec;");
+    expect(css).toContain("--color-text: #344046;");
     expect(css).not.toContain("--color-surface: #ffffff;");
     expect(css).not.toContain("--color-toast-bg: rgba(255, 255, 255");
   });
 
-  it("暗色主题使用 Everforest soft dark 底色，避免霓虹高对比黑绿", () => {
+  it("暗色主题使用 graphite chrome 与暖色终端，避免霓虹高对比黑绿", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
     const html = readFileSync(resolve(process.cwd(), "index.html"), "utf8");
 
-    expect(css).toContain("--color-bg-page: #293136;");
-    expect(css).toContain("--color-surface: #333c43;");
-    expect(css).toContain("--color-terminal-bg: #293136;");
-    expect(css).toContain("--color-text: #d3c6aa;");
+    expect(css).toContain("--color-bg-page: #15191c;");
+    expect(css).toContain("--color-surface: #22282d;");
+    expect(css).toContain("--color-terminal-bg: #181c1f;");
+    expect(css).toContain("--color-text: #d8dedb;");
     expect(css).toContain("--color-accent: #a7c080;");
-    expect(html).toContain('<meta name="theme-color" content="#293136" />');
+    expect(html).toContain('<meta name="theme-color" content="#15191c" />');
     expect(css).not.toContain("--color-accent: #d6ff5f;");
   });
 
@@ -2116,9 +2116,9 @@ describe("termui web 工作台", () => {
     expect(css).toContain("height: var(--termd-layout-viewport-height, var(--termd-visual-viewport-height, 100dvh));");
     expect(css).toContain("max-width: none;");
     expect(css).toContain(".daemon-status-strip {\n    width: 100%;");
-    expect(css).toContain(".daemon-status-strip .daemon-status-grid {\n    width: 100%;");
-    expect(css).toContain("display: grid;\n    grid-template-columns:\n      minmax(58px, 0.6fr)");
-    expect(css).toContain("minmax(124px, 1.25fr);");
+    expect(css).toContain(".daemon-status-strip .daemon-status-grid {\n    width: clamp(128px, 44vw, 176px);");
+    expect(css).toContain("grid-template-columns: minmax(0, 1fr) auto;");
+    expect(css).toContain(".daemon-status-strip .daemon-status-cpu,\n  .daemon-status-strip .daemon-status-memory,\n  .daemon-status-strip .daemon-status-disk {\n    display: none;");
     const mobileShortcutsBlock = css.match(/\.terminal-mobile-shortcuts \{[^}]+\}/)?.[0] ?? "";
     expect(mobileShortcutsBlock).toContain("position: absolute;");
     expect(mobileShortcutsBlock).toContain("bottom: 0;");
@@ -8155,8 +8155,8 @@ describe("termui web 工作台", () => {
     expect(sessionList.closest(".sidebar-scroll-region")).toBe(sidebar!.querySelector(".sidebar-scroll-region"));
     expect(css).toContain(".sidebar {\n  ");
     expect(css).toContain("overflow: hidden;");
-    expect(css).toContain(".sidebar-fixed-header {\n  min-width: 0;\n  display: grid;\n  gap: 12px;\n}");
-    expect(css).toContain(".sidebar-scroll-region {\n  min-height: 0;\n  overflow: hidden;\n  display: grid;\n}");
+    expect(css).toContain(".sidebar-fixed-header {\n  min-width: 0;\n  display: grid;\n  gap: 8px;\n  padding-bottom: 6px;\n}");
+    expect(css).toContain(".sidebar-scroll-region {\n  min-height: 0;\n  overflow: hidden;\n  display: grid;\n  padding-top: 2px;\n}");
     expect(css).toContain(".session-list {\n  min-height: 0;\n  height: 100%;\n  overflow-y: auto;");
     expect(screen.queryByRole("button", { name: "Refresh" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Disconnect" })).toBeNull();

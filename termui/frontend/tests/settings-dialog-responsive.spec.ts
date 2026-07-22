@@ -49,13 +49,39 @@ for (const scenario of viewports) {
 
     await page.goto("/");
     await page.waitForLoadState("networkidle");
-    await page.getByRole("button", { name: "Settings" }).click();
+    const settingsTrigger = page.getByRole("button", { name: "Settings" });
+    await settingsTrigger.click();
 
     const dialog = page.getByRole("dialog", { name: "Settings" });
     const textarea = dialog.getByRole("textbox", { name: "Mobile shortcuts" });
     const cancel = dialog.getByRole("button", { name: "Cancel" });
     const apply = dialog.getByRole("button", { name: "Apply" });
     await expect(dialog).toBeVisible();
+
+    if (scenario.viewport.width === 320) {
+      const notificationGroup = dialog.getByRole("radiogroup", { name: "Notifications" });
+      const notificationLabels = notificationGroup.locator("label");
+      await expect(notificationLabels).toHaveCount(3);
+      await expect(notificationLabels).toHaveText(["Off", "Needs attention", "All AI activity"]);
+      const labelGeometry = await notificationLabels.evaluateAll((labels) =>
+        labels.map((label) => {
+          const text = label.querySelector("span");
+          const rect = label.getBoundingClientRect();
+          return {
+            left: rect.left,
+            right: rect.right,
+            height: rect.height,
+            textFits: text
+              ? text.scrollWidth <= text.clientWidth && text.scrollHeight <= text.clientHeight
+              : false,
+          };
+        }),
+      );
+      expect(labelGeometry.every(({ height, textFits }) => height >= 44 && textFits)).toBe(true);
+      for (let index = 1; index < labelGeometry.length; index += 1) {
+        expect(labelGeometry[index - 1].right).toBeLessThanOrEqual(labelGeometry[index].left);
+      }
+    }
 
     await textarea.fill("Pending=abc");
     await expectActionInsideViewport(page, cancel, scenario.safeArea);
@@ -67,5 +93,10 @@ for (const scenario of viewports) {
     await textarea.fill("Esc=\\e");
     await apply.click();
     await expect(apply).toBeDisabled();
+    await expect.poll(() => dialog.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await expect(settingsTrigger).toBeFocused();
   });
 }

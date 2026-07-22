@@ -69,8 +69,10 @@ describe("mobile layout regressions", () => {
     expect(css).not.toContain(".terminal-host,\n  .terminal-host canvas");
     expect(css).toContain('.terminal-host textarea[aria-label="Terminal input"]');
     expect(css).toContain(".daemon-cpu-bar-chart {\n    display: none;");
-    expect(css).toContain("minmax(124px, 1.25fr);");
-    expect(css).toContain(".daemon-status-strip .daemon-status-network strong {\n    min-width: max-content;");
+    expect(css).toContain("grid-template-columns: minmax(0, 1fr) auto;");
+    expect(css).toContain(".daemon-status-strip .daemon-status-cpu,\n  .daemon-status-strip .daemon-status-memory,\n  .daemon-status-strip .daemon-status-disk {\n    display: none;");
+    expect(css).toContain("width: clamp(128px, 44vw, 176px);");
+    expect(css).toContain(".daemon-status-strip .daemon-status-network strong {\n    min-width: 0;\n    font-variant-numeric: tabular-nums;");
     const helperTextareaBlock =
       css.match(/\.terminal-host textarea\[aria-label="Terminal input"\] \{[^}]+\}/)?.[0] ?? "";
     expect(helperTextareaBlock).toContain("helper textarea 需要保留 focus/paste/IME 能力");
@@ -103,6 +105,29 @@ describe("mobile layout regressions", () => {
     expect(buttonBlock).not.toContain("align-items: flex-end;");
   });
 
+  it("keeps narrow settings labels readable and short touch workspaces within their rows", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const narrowRules = cssPreferenceBlock(css, "max-width: 360px");
+    const coarseRules = cssPreferenceBlock(css, "hover: none), (pointer: coarse");
+    const shortWorkspaceRules = cssPreferenceBlock(css, "min-width: 761px) and (max-height: 490px");
+
+    expect(cssDeclarations(narrowRules, ".settings-segmented span")).toMatchObject({
+      "min-height": "44px",
+      "padding-inline": "4px",
+      "line-height": "1.2",
+      "white-space": "normal",
+    });
+    expect(cssDeclarations(coarseRules, ":root")).toMatchObject({
+      "--deck-toolbar-height": "44px",
+    });
+    expect(cssDeclarations(coarseRules, ".settings-segmented label,\n  .settings-segmented span")).toMatchObject({
+      "min-height": "44px",
+    });
+    expect(cssDeclarations(shortWorkspaceRules, ".workspace")).toMatchObject({
+      "grid-template-rows": "var(--deck-toolbar-height) minmax(0, 1fr) var(--deck-status-height)",
+    });
+  });
+
   it("honors contrast, transparency, motion, and immediate press preferences", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
@@ -118,8 +143,9 @@ describe("mobile layout regressions", () => {
     expect(contrastBlock).toContain(".clients-popover .panel,");
     expect(contrastBlock).not.toContain(".destructive-dialog,");
     const transparencyBlock = cssPreferenceBlock(css, "prefers-reduced-transparency: reduce");
-    expect(transparencyBlock).toContain("--color-bg-shell: #293136;");
-    expect(transparencyBlock).toContain("--color-floating-gradient: linear-gradient(90deg, #293136, #434f55 16px);");
+    expect(transparencyBlock).toContain("--color-bg-shell: #1b2024;");
+    expect(transparencyBlock).toContain("--color-floating-gradient: linear-gradient(90deg, #1b2024, #343d43 16px);");
+    expect(transparencyBlock).toContain(".toolbar,\n  .mobile-menu-popover,\n  .terminal-direction-pad {\n    backdrop-filter: none;");
     expect(transparencyBlock).toContain(".terminal-direction-pad {\n    backdrop-filter: none;");
     const motionBlock = cssPreferenceBlock(css, "prefers-reduced-motion: reduce");
     expect(motionBlock).toContain("transition-duration: 0.01ms !important;");
@@ -151,4 +177,20 @@ function cssPreferenceBlock(css: string, query: string): string {
   }
   expect(blocks.length, query).toBeGreaterThan(0);
   return blocks.join("\n");
+}
+
+function cssDeclarations(css: string, selector: string): Record<string, string> {
+  const marker = `${selector} {`;
+  const start = css.indexOf(marker);
+  expect(start, selector).toBeGreaterThanOrEqual(0);
+  const openBrace = css.indexOf("{", start + selector.length);
+  const closeBrace = css.indexOf("}", openBrace + 1);
+  expect(closeBrace, selector).toBeGreaterThan(openBrace);
+
+  return Object.fromEntries(
+    [...css.slice(openBrace + 1, closeBrace).matchAll(/([\w-]+)\s*:\s*([^;]+);/g)].map((match) => [
+      match[1],
+      match[2].trim(),
+    ]),
+  );
 }

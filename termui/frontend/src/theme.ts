@@ -18,19 +18,19 @@ export function resolveTheme(preference: BrowserThemePreference, systemTheme: Ef
 export function terminalTheme(theme: EffectiveTheme): TerminalThemeColors {
   if (theme === "light") {
     return {
-      background: "#eae4ca",
-      foreground: "#536169",
-      cursor: "#596900",
-      selectionBackground: "#d3c6aa",
-      selectionForeground: "#293136",
+      background: "#eff1ec",
+      foreground: "#384044",
+      cursor: "#536b32",
+      selectionBackground: "#cbd6c5",
+      selectionForeground: "#20282c",
     };
   }
   return {
-    background: "#293136",
-    foreground: "#d3c6aa",
+    background: "#181c1f",
+    foreground: "#d8cfb9",
     cursor: "#a7c080",
-    selectionBackground: "#5d6b66",
-    selectionForeground: "#f5ead0",
+    selectionBackground: "#48564f",
+    selectionForeground: "#f6f7f2",
   };
 }
 

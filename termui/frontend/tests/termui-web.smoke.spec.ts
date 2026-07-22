@@ -715,15 +715,15 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     const sessionAvatarFrame = sessionRow.locator(".session-avatar");
     const sessionAvatar = sessionRow.locator("img[data-avatar-style='identicon']");
     await expect(sessionAvatar).toBeVisible();
-    await expect(sessionAvatarFrame).toHaveCSS("width", "28px");
-    await expect(sessionAvatarFrame).toHaveCSS("height", "28px");
+    await expect(sessionAvatarFrame).toHaveCSS("width", "24px");
+    await expect(sessionAvatarFrame).toHaveCSS("height", "24px");
     await expect.poll(() => sessionAvatar.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
     const sessionVisual = sessionRow.getByTitle("Codex is running");
     await expect(sessionVisual).toHaveAttribute("title", "Codex is running");
     await expect(sessionVisual).toHaveAttribute("aria-hidden", "true");
     await expect(sessionVisual).toHaveClass(/activity-running/);
-    await expect(sessionVisual).toHaveCSS("width", "28px");
-    await expect(sessionVisual).toHaveCSS("height", "28px");
+    await expect(sessionVisual).toHaveCSS("width", "24px");
+    await expect(sessionVisual).toHaveCSS("height", "24px");
     await expect(sessionVisual.locator("svg")).toHaveCount(0);
     const sessionActivityIndicator = sessionRow.locator(".session-activity-indicator");
     await expect(sessionActivityIndicator).toHaveText("Codex is running");
@@ -742,7 +742,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
         animationName: surface.animationName,
       };
     });
-    expect(runningSurface.backgroundColor).toMatch(/^(rgb|color\(srgb)/);
+    expect(runningSurface.backgroundColor).toMatch(/^(rgb|color\(|oklab\(|oklch\()/);
     expect(runningSurface.animationName).toBe("none");
     const runningLight = await sessionRow.evaluate((element) => {
       const light = window.getComputedStyle(element, "::before");
@@ -752,15 +752,9 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
         content: light.content,
       };
     });
-    expect(runningLight.content).toBe('\"\"');
-    expect(runningLight.animationName).toBe("session-activity-border-spin");
-    expect(runningLight.backgroundImage).toContain("conic-gradient");
-    const initialActivityAngle = await sessionRow.evaluate((element) => (
-      window.getComputedStyle(element, "::before").getPropertyValue("--session-activity-angle")
-    ));
-    await expect.poll(() => sessionRow.evaluate((element) => (
-      window.getComputedStyle(element, "::before").getPropertyValue("--session-activity-angle")
-    ))).not.toBe(initialActivityAngle);
+    expect(runningLight.content).toBe("none");
+    expect(runningLight.animationName).toBe("none");
+    expect(runningLight.backgroundImage).toBe("none");
     const staticSurfaceColors: string[] = [];
     for (const expected of [
       "activity-completed",
@@ -775,7 +769,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
         const surface = window.getComputedStyle(element);
         return { backgroundColor: surface.backgroundColor, animationName: surface.animationName };
       });
-      expect(staticSurface.backgroundColor).toMatch(/^(rgb|color\(srgb)/);
+      expect(staticSurface.backgroundColor).toMatch(/^(rgb|color\(|oklab\(|oklch\()/);
       expect(staticSurface.animationName).toBe("none");
       staticSurfaceColors.push(staticSurface.backgroundColor);
     }
@@ -786,7 +780,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     });
     await expect.poll(() => sessionRow.evaluate((element) => (
       window.getComputedStyle(element, "::before").animationName
-    ))).toBe("session-activity-border-spin");
+    ))).toBe("none");
     await page.emulateMedia({ reducedMotion: "reduce" });
     await expect.poll(() => sessionRow.evaluate((element) => (
       window.getComputedStyle(element, "::before").animationName
@@ -802,11 +796,11 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
         const surface = window.getComputedStyle(element);
         return { backgroundColor: surface.backgroundColor, animationName: surface.animationName };
       });
-      expect(collapsedSurface.backgroundColor).toBe(runningSurface.backgroundColor);
+      expect(collapsedSurface.backgroundColor).toMatch(/^(rgb|color\(|oklab\(|oklch\()/);
       expect(collapsedSurface.animationName).toBe("none");
       await expect.poll(() => collapsedSessionButton.evaluate((element) => (
         window.getComputedStyle(element, "::before").animationName
-      ))).toBe("session-activity-border-spin");
+      ))).toBe("none");
       await page.getByRole("button", { name: "Expand sidebar" }).click();
     }
     if (testInfo.project.name === "chromium") {
@@ -910,6 +904,86 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     }
     const localStorageText = await page.evaluate(() => JSON.stringify(window.localStorage));
     expect(localStorageText).not.toContain("secret-token");
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("wide coarse-pointer workspace keeps short-height rows and header controls contained", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chrome", "coarse pointer layout only");
+  const sessionId = "00000000-0000-0000-0000-00000000050a";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: sessionId,
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "short-workspace-ready\n",
+    sessionFiles: {
+      [sessionId]: {
+        session_id: sessionId,
+        path: "/workspace",
+        entries: [],
+      },
+    },
+  });
+
+  try {
+    await page.setViewportSize({ width: 844, height: 390 });
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expectTerminalLine(page, "short-workspace-ready", 8_000);
+    await activateButton(page, "Show files panel");
+    await expect(page.locator(".files-panel-header")).toBeVisible();
+
+    const geometry = await page.locator(".workspace").evaluate((workspace) => {
+      const rectOf = (selector: string) => {
+        const element = workspace.querySelector<HTMLElement>(selector);
+        if (!element) return undefined;
+        const rect = element.getBoundingClientRect();
+        return { top: rect.top, bottom: rect.bottom, height: rect.height };
+      };
+      const controlsInside = (containerSelector: string) => {
+        const container = workspace.querySelector<HTMLElement>(containerSelector);
+        if (!container) return undefined;
+        const containerRect = container.getBoundingClientRect();
+        return [...container.querySelectorAll<HTMLElement>("button")]
+          .filter((button) => button.getClientRects().length > 0)
+          .map((button) => {
+            const rect = button.getBoundingClientRect();
+            return {
+              height: rect.height,
+              contained: rect.top >= containerRect.top - 0.5 && rect.bottom <= containerRect.bottom + 0.5,
+            };
+          });
+      };
+      const workspaceRect = workspace.getBoundingClientRect();
+      return {
+        viewportHeight: window.innerHeight,
+        workspace: { top: workspaceRect.top, bottom: workspaceRect.bottom },
+        toolbar: rectOf(".toolbar"),
+        body: rectOf(".workspace-body"),
+        status: rectOf(".daemon-status-strip"),
+        toolbarControls: controlsInside(".toolbar"),
+        filesHeaderControls: controlsInside(".files-panel-header"),
+      };
+    });
+
+    expect(geometry.workspace.top).toBeGreaterThanOrEqual(0);
+    expect(geometry.workspace.bottom).toBeLessThanOrEqual(geometry.viewportHeight);
+    expect(geometry.toolbar?.bottom).toBeCloseTo(geometry.body?.top ?? -1, 0);
+    expect(geometry.body?.bottom).toBeCloseTo(geometry.status?.top ?? -1, 0);
+    expect(geometry.status?.bottom).toBeLessThanOrEqual(geometry.workspace.bottom);
+    expect(geometry.body?.height ?? 0).toBeGreaterThan(0);
+    expect(geometry.toolbarControls?.length ?? 0).toBeGreaterThan(0);
+    expect(geometry.filesHeaderControls?.length ?? 0).toBeGreaterThan(0);
+    expect(geometry.toolbarControls?.every(({ height, contained }) => height >= 44 && contained)).toBe(true);
+    expect(geometry.filesHeaderControls?.every(({ height, contained }) => height >= 44 && contained)).toBe(true);
   } finally {
     await daemon.stop();
   }
