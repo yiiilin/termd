@@ -2022,7 +2022,7 @@ label {
 .daemon-cpu-bar-chart {
   flex: 0 0 30px;
   width: 30px;
-  height: 14px;
+  height: 20px;
   min-width: 28px;
   color: var(--color-info);
 }

@@ -4901,6 +4901,7 @@ function CpuBarChart(props: { samples: number[] }) {
     <svg
       className="daemon-cpu-bar-chart"
       viewBox={`0 0 ${CPU_BAR_CHART_WIDTH} ${CPU_BAR_CHART_HEIGHT}`}
+      preserveAspectRatio="none"
       role="img"
       aria-label={t("daemonStatus.cpuBars")}
     >

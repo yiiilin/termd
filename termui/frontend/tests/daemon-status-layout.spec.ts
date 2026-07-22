@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { MockDaemon } from "../src/test/mock-daemon";
 
-test("desktop CPU status keeps the maximum percentage fully visible", async ({ page }, testInfo) => {
+test("desktop CPU status keeps the maximum percentage and chart fully visible", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium", "desktop layout only needs the Chromium project");
 
   const daemon = await MockDaemon.start({
@@ -45,6 +45,29 @@ test("desktop CPU status keeps the maximum percentage fully visible", async ({ p
     }));
 
     expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth);
+
+    const chartLayout = await page.locator(".daemon-cpu-bar-chart").evaluate((chart) => {
+      const status = chart.closest(".daemon-status-strip");
+      const frame = chart.querySelector(".daemon-cpu-bar-frame");
+      if (!status || !frame) {
+        throw new Error("CPU chart must remain inside the daemon status strip with a frame");
+      }
+      const statusRect = status.getBoundingClientRect();
+      const chartRect = chart.getBoundingClientRect();
+      const frameRect = frame.getBoundingClientRect();
+      return {
+        statusHeight: statusRect.height,
+        chartHeight: chartRect.height,
+        frameHeight: frameRect.height,
+        topInset: chartRect.top - statusRect.top,
+        bottomInset: statusRect.bottom - chartRect.bottom,
+      };
+    });
+
+    expect(chartLayout.statusHeight).toBe(26);
+    expect(chartLayout.chartHeight).toBe(20);
+    expect(chartLayout.frameHeight).toBeGreaterThanOrEqual(18);
+    expect(Math.abs(chartLayout.topInset - chartLayout.bottomInset)).toBeLessThanOrEqual(1);
   } finally {
     await daemon.stop();
   }
