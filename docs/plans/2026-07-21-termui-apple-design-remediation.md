@@ -25,9 +25,9 @@
 
 ## Responsive Contract
 
-- `> 1100px`：sidebar、terminal、files 三栏可完整显示。
-- `901px - 1100px`：files 默认收成 rail，terminal 保持主导。
-- `761px - 900px`：sidebar 与 files 默认收成 rail。
+- `>= 1280px`：sidebar、terminal、files 三栏可完整显示；从受限桌面扩宽时保留用户当前 panel 状态，不自动挤压 terminal。
+- `901px - 1279px`：sidebar 与 files 默认收起，terminal 保持主导，两个 panel 仍可按需展开。
+- `761px - 900px`：sidebar 与 files 默认收起为 rail。
 - `<= 760px`：Sessions 和 Files 使用覆盖面板，terminal 保持全宽。
 - 移动 toolbar 优先级：session 名、连接异常、RTT、终端行列数。
 
