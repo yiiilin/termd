@@ -127,6 +127,16 @@ with socket.socket() as sock:
 PY
 }
 
+pick_free_web_port() {
+  python3 - <<'PY'
+import socket
+with socket.socket() as sock:
+    # 预览服务器只监听 loopback；先用 wildcard 检查，避免选到其他网卡已使用的端口。
+    sock.bind(("0.0.0.0", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
 cargo_run_in_temp_dir() (
   local temp_dir="$1"
   shift
@@ -503,10 +513,11 @@ section "termui-web" "npm run test -- --run"
 section "termui-web" "npm run build"
 (cd termui/frontend && npm run build)
 
-section "termui-web" "npm run test:e2e"
+e2e_web_port="$(pick_free_web_port)"
+section "termui-web" "npm run test:e2e (TERMD_E2E_WEB_PORT=${e2e_web_port})"
 # 中文注释：release QA 会同时拉起真实 termd/termrelay、浏览器和 Vite preview。
 # 在 CI 小机器上并发跑这些重型 E2E 容易触发本机端口/网络状态抖动，发布验收优先要稳定可复现。
-(cd termui/frontend && npm run test:e2e -- --workers=1)
+(cd termui/frontend && TERMD_E2E_WEB_PORT="$e2e_web_port" npm run test:e2e -- --workers=1)
 
 section "termui-web" "npm audit --audit-level=high"
 # npm audit 需要 registry advisory 数据；空缓存下的 --offline 会无条件漏报。

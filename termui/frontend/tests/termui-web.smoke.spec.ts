@@ -604,6 +604,14 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     }
     await openProgressButton.click();
     await expect(openProgressPopover).toBeHidden();
+    if (testInfo.project.name === "chromium") {
+      // 窄桌面收起状态会在宽屏保留；后续断言需要显式恢复会话栏。
+      await page.getByRole("button", { name: "Expand sidebar" }).click();
+      await expect(page.getByRole("region", { name: "sessions" })).toBeVisible();
+      // 文件面板同样保留收起状态；后续会验证其 resizer，先按用户路径打开。
+      await page.getByRole("button", { name: "Show files panel" }).click();
+      await expect(page.getByRole("separator", { name: "Resize files panel" })).toBeVisible();
+    }
 
     if (testInfo.project.name === "mobile-chrome") {
       await expect(page.getByRole("navigation", { name: "mobile workspace actions" })).toHaveCount(0);
@@ -715,15 +723,15 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     const sessionAvatarFrame = sessionRow.locator(".session-avatar");
     const sessionAvatar = sessionRow.locator("img[data-avatar-style='identicon']");
     await expect(sessionAvatar).toBeVisible();
-    await expect(sessionAvatarFrame).toHaveCSS("width", "24px");
-    await expect(sessionAvatarFrame).toHaveCSS("height", "24px");
+    await expect(sessionAvatarFrame).toHaveCSS("width", "26px");
+    await expect(sessionAvatarFrame).toHaveCSS("height", "26px");
     await expect.poll(() => sessionAvatar.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
     const sessionVisual = sessionRow.getByTitle("Codex is running");
     await expect(sessionVisual).toHaveAttribute("title", "Codex is running");
     await expect(sessionVisual).toHaveAttribute("aria-hidden", "true");
     await expect(sessionVisual).toHaveClass(/activity-running/);
-    await expect(sessionVisual).toHaveCSS("width", "24px");
-    await expect(sessionVisual).toHaveCSS("height", "24px");
+    await expect(sessionVisual).toHaveCSS("width", "26px");
+    await expect(sessionVisual).toHaveCSS("height", "26px");
     await expect(sessionVisual.locator("svg")).toHaveCount(0);
     const sessionActivityIndicator = sessionRow.locator(".session-activity-indicator");
     await expect(sessionActivityIndicator).toHaveText("Codex is running");
@@ -761,9 +769,13 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       "activity-attention",
       "activity-error",
     ]) {
-      await sessionRow.evaluate((element, className) => {
+      await sessionRow.evaluate(async (element, className) => {
         element.classList.remove("activity-running", "activity-completed", "activity-attention", "activity-error");
         element.classList.add(className);
+        // Force the new style to resolve, then wait for the row's background transition.
+        window.getComputedStyle(element).backgroundColor;
+        await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+        await Promise.all(element.getAnimations().map((animation) => animation.finished.catch(() => undefined)));
       }, expected);
       const staticSurface = await sessionRow.evaluate((element) => {
         const surface = window.getComputedStyle(element);
@@ -805,6 +817,11 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     }
     if (testInfo.project.name === "chromium") {
       await page.screenshot({ path: "test-results/session-activity-row-desktop.png", fullPage: true });
+      await sessionRow.getByRole("button", { name: "Close session" }).click();
+      const closeSessionDialog = page.getByRole("alertdialog", { name: "Close session?" });
+      await expect(closeSessionDialog).toBeVisible();
+      await closeSessionDialog.getByRole("button", { name: "Cancel" }).click();
+      await expect(closeSessionDialog).toBeHidden();
     }
 
     await openSessionButton.click();

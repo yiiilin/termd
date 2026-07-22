@@ -56,7 +56,7 @@ Progress must be tracked in this file only:
 - [x] 修正移动命中区、用户缩放、safe-area、modal/menu 键盘路径
 - [x] 修正 light/dark 语义颜色 token、terminal 光标/前景对比和高对比模式
 - [x] 增加通用 pressed 反馈、可中断 pull 回弹，并补齐 reduced motion/transparency 偏好
-- [x] 运行 frontend 全量验证与受影响 viewport 的 Chromium/WebKit 视觉 QA
+- [x] 运行 frontend 全量验证与受影响 viewport 的 Chromium 桌面/移动视觉 QA
 - [x] 确认未提交、未打 tag、未发版，并清理本轮临时测试产物
 
 ## Stop Conditions

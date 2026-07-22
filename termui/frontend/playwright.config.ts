@@ -1,5 +1,12 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const webPortRaw = process.env.TERMD_E2E_WEB_PORT ?? "4173";
+const webPort = Number(webPortRaw);
+if (!Number.isInteger(webPort) || webPort < 1 || webPort > 65_535) {
+  throw new Error(`TERMD_E2E_WEB_PORT must be an integer between 1 and 65535, got ${webPortRaw}`);
+}
+const webBaseUrl = `http://127.0.0.1:${webPort}`;
+
 export default defineConfig({
   testDir: "./tests",
   timeout: 30000,
@@ -7,7 +14,7 @@ export default defineConfig({
     timeout: 8000,
   },
   use: {
-    baseURL: "http://127.0.0.1:4173",
+    baseURL: webBaseUrl,
     trace: "retain-on-failure",
   },
   projects: [
@@ -31,8 +38,8 @@ export default defineConfig({
     command:
       "VITE_TERMD_E2E_DEBUG_BUFFER=1 npm run build && " +
       "cargo build --locked --manifest-path ../../Cargo.toml -p termd -p termrelay && " +
-      "npm run preview",
-    url: "http://127.0.0.1:4173",
+      `npx vite preview --host 127.0.0.1 --port ${webPort} --strictPort`,
+    url: webBaseUrl,
     reuseExistingServer: false,
     // 中文注释：当前生产构建包含 Monaco worker 与 xterm 资源，冷构建可能超过 2 分钟。
     // E2E 不应该在页面尚未启动前就被 Playwright 判成失败。
