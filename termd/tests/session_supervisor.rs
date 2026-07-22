@@ -343,7 +343,7 @@ fn wait_until_linux_process_is_reaped(pid: u32) {
     while Instant::now() < deadline {
         match linux_process_state(pid) {
             None => return,
-            Some('Z') => panic!("supervisor pid {pid} became a zombie after close"),
+            // Exit precedes waitpid, so a short-lived zombie is expected under load.
             Some(_) => std::thread::sleep(Duration::from_millis(20)),
         }
     }
