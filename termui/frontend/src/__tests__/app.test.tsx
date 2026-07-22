@@ -2067,11 +2067,15 @@ describe("termui web 工作台", () => {
 
   it("底部状态栏使用固定列宽并从左侧稳定扫描", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const rootRule = css.match(/:root \{[^}]+\}/)?.[0] ?? "";
     const statusGridRule = css.match(/\.daemon-status-strip \.daemon-status-grid \{[^}]+\}/)?.[0] ?? "";
+    const cpuChartRule = css.match(/\.daemon-cpu-bar-chart \{[^}]+\}/)?.[0] ?? "";
     const loadValueRule = css.match(/\.daemon-status-strip \.daemon-status-load strong \{[^}]+\}/)?.[0] ?? "";
 
     expect(css).toContain('font-family: "HarmonyOS Sans SC";');
     expect(css).toContain('--font-ui: "HarmonyOS Sans SC", "HarmonyOS Sans", "Aptos", "Segoe UI", sans-serif;');
+    expect(rootRule).toContain("--daemon-status-cpu-width: 148px;");
+    expect(css).toContain("@media (min-width: 1181px) and (max-width: 1279px)");
     expect(css).toContain("--daemon-status-cpu-width: 120px;");
     expect(css).toContain("--daemon-status-memory-width: 150px;");
     expect(css).toContain("--daemon-status-network-width: 154px;");
@@ -2084,6 +2088,8 @@ describe("termui web 工作台", () => {
     expect(css).toContain("flex-basis: var(--daemon-status-disk-width);");
     expect(css).toContain(".daemon-status-strip .daemon-status-load {\n    display: none;");
     expect(statusGridRule).toContain("justify-content: flex-start;");
+    expect(cpuChartRule).toContain("flex: 0 0 56px;");
+    expect(cpuChartRule).toContain("width: 56px;");
     expect(loadValueRule).toContain("font-variant-numeric: tabular-nums;");
   });
 

@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { MockDaemon } from "../src/test/mock-daemon";
 
-test("desktop CPU status keeps the maximum percentage and chart fully visible", async ({ page }, testInfo) => {
+test("desktop CPU chart expands only when the full status row has room", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium", "desktop layout only needs the Chromium project");
 
   const daemon = await MockDaemon.start({
@@ -39,35 +39,52 @@ test("desktop CPU status keeps the maximum percentage and chart fully visible", 
 
     const cpuValue = page.locator(".daemon-status-cpu strong");
     await expect(cpuValue).toHaveText("100.0%");
-    const dimensions = await cpuValue.evaluate((element) => ({
-      clientWidth: element.clientWidth,
-      scrollWidth: element.scrollWidth,
-    }));
+    for (const [viewportWidth, expectedChartWidth] of [
+      [1181, 30],
+      [1279, 30],
+      [1280, 56],
+      [1440, 56],
+    ] as const) {
+      await page.setViewportSize({ width: viewportWidth, height: 800 });
+      const chart = page.locator(".daemon-cpu-bar-chart");
+      await expect.poll(() => chart.evaluate((element) => element.getBoundingClientRect().width)).toBe(expectedChartWidth);
 
-    expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth);
+      const layout = await chart.evaluate((element) => {
+        const status = element.closest(".daemon-status-strip");
+        const grid = element.closest(".daemon-status-grid");
+        const frame = element.querySelector(".daemon-cpu-bar-frame");
+        if (!status || !grid || !frame) {
+          throw new Error("CPU chart must remain inside the daemon status grid with a frame");
+        }
+        const statusRect = status.getBoundingClientRect();
+        const chartRect = element.getBoundingClientRect();
+        const frameRect = frame.getBoundingClientRect();
+        const values = [...grid.querySelectorAll<HTMLElement>(".daemon-status-metric")]
+          .filter((metric) => getComputedStyle(metric).display !== "none")
+          .map((metric) => {
+            const value = metric.querySelector<HTMLElement>("strong");
+            return value ? { clientWidth: value.clientWidth, scrollWidth: value.scrollWidth } : null;
+          })
+          .filter((value): value is { clientWidth: number; scrollWidth: number } => value !== null);
+        return {
+          statusHeight: statusRect.height,
+          chartHeight: chartRect.height,
+          frameHeight: frameRect.height,
+          topInset: chartRect.top - statusRect.top,
+          bottomInset: statusRect.bottom - chartRect.bottom,
+          gridClientWidth: grid.clientWidth,
+          gridScrollWidth: grid.scrollWidth,
+          values,
+        };
+      });
 
-    const chartLayout = await page.locator(".daemon-cpu-bar-chart").evaluate((chart) => {
-      const status = chart.closest(".daemon-status-strip");
-      const frame = chart.querySelector(".daemon-cpu-bar-frame");
-      if (!status || !frame) {
-        throw new Error("CPU chart must remain inside the daemon status strip with a frame");
-      }
-      const statusRect = status.getBoundingClientRect();
-      const chartRect = chart.getBoundingClientRect();
-      const frameRect = frame.getBoundingClientRect();
-      return {
-        statusHeight: statusRect.height,
-        chartHeight: chartRect.height,
-        frameHeight: frameRect.height,
-        topInset: chartRect.top - statusRect.top,
-        bottomInset: statusRect.bottom - chartRect.bottom,
-      };
-    });
-
-    expect(chartLayout.statusHeight).toBe(26);
-    expect(chartLayout.chartHeight).toBe(20);
-    expect(chartLayout.frameHeight).toBeGreaterThanOrEqual(18);
-    expect(Math.abs(chartLayout.topInset - chartLayout.bottomInset)).toBeLessThanOrEqual(1);
+      expect(layout.statusHeight).toBe(26);
+      expect(layout.chartHeight).toBe(20);
+      expect(layout.frameHeight).toBeGreaterThanOrEqual(18);
+      expect(Math.abs(layout.topInset - layout.bottomInset)).toBeLessThanOrEqual(1);
+      expect(layout.gridScrollWidth).toBeLessThanOrEqual(layout.gridClientWidth);
+      expect(layout.values.every((value) => value.scrollWidth <= value.clientWidth)).toBe(true);
+    }
   } finally {
     await daemon.stop();
   }
