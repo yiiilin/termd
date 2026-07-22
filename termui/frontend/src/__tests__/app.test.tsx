@@ -9035,7 +9035,7 @@ describe("termui web 工作台", () => {
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await waitForWorkspaceSession();
+    await waitForWorkspaceReady();
     await screen.findByText(/termd-e2e-ready/);
 
     const shell = document.querySelector<HTMLElement>(".app-shell");
