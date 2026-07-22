@@ -8193,24 +8193,33 @@ describe("termui web 工作台", () => {
     expect(screen.getByRole("button", { name: "Hide files panel" })).toBeInTheDocument();
   });
 
-  it("跨 responsive band 应用 panel 默认值，同一 band 保留用户选择", async () => {
+  it("受限桌面优先保留终端宽度，放大到宽屏时保留用户的 panel 选择", async () => {
     setViewportWidth(1000);
     const user = userEvent.setup();
     render(<App />);
 
     await pairWithInvite(user, daemon);
-    await waitForWorkspaceSession();
-    await clickSessionCard(user);
+    await waitForWorkspaceReady();
+    await screen.findByText(/termd-e2e-ready/);
 
-    expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Expand sidebar" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Show files panel" })).toBeInTheDocument();
 
+    await user.click(screen.getByRole("button", { name: "Expand sidebar" }));
     await user.click(screen.getByRole("button", { name: "Show files panel" }));
     expect(await screen.findByLabelText("session files")).toBeInTheDocument();
 
     setViewportWidth(950);
     await waitFor(() => expect(screen.getByLabelText("session files")).toBeInTheDocument());
     expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+
+    setViewportWidth(1280);
+    await waitFor(() => expect(screen.getByLabelText("session files")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+
+    setViewportWidth(1279);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Expand sidebar" })).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Show files panel" })).toBeInTheDocument();
 
     setViewportWidth(850);
     await waitFor(() => expect(screen.getByRole("button", { name: "Expand sidebar" })).toBeInTheDocument());
@@ -8237,7 +8246,7 @@ describe("termui web 工作台", () => {
     setViewportWidth(1000);
     await waitFor(() => expect(screen.queryByLabelText("sessions panel")).toBeNull());
     expect(screen.queryByRole("button", { name: "Open mobile workspace menu" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Expand sidebar" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Show files panel" })).toBeInTheDocument();
 
     setViewportWidth(390);

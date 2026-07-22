@@ -637,14 +637,18 @@ export default function App() {
   const isMobileLayout = viewportBand === "mobile";
 
   useEffect(() => {
-    if (previousViewportBandRef.current === viewportBand) {
+    const previousViewportBand = previousViewportBandRef.current;
+    if (previousViewportBand === viewportBand) {
       return;
     }
 
     previousViewportBandRef.current = viewportBand;
-    const defaults = panelDefaultsForBand(viewportBand);
-    setSidebarCollapsed(defaults.sidebarCollapsed);
-    setFilesPanelOpen(defaults.filesPanelOpen);
+    // 宽度增加时保留已有工作区，避免刚获得几个像素就自动挤压终端。
+    if (viewportBand !== "wide" || previousViewportBand === "mobile") {
+      const defaults = panelDefaultsForBand(viewportBand);
+      setSidebarCollapsed(defaults.sidebarCollapsed);
+      setFilesPanelOpen(defaults.filesPanelOpen);
+    }
 
     if (viewportBand !== "mobile") {
       setMobileMenuOpen(false);
