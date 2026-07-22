@@ -108,7 +108,7 @@
   --mobile-status-height: calc(30px + env(safe-area-inset-bottom, 0px));
   --terminal-mobile-shortcuts-content-height: 44px;
   --terminal-mobile-shortcuts-safe-area: env(safe-area-inset-bottom, 0px);
-  --daemon-status-cpu-width: 108px;
+  --daemon-status-cpu-width: 120px;
   --daemon-status-memory-width: 150px;
   /* RTT 已移到 session 标题栏，状态栏网络列只需要容纳上下行速率。 */
   --daemon-status-network-width: 154px;

@@ -2072,7 +2072,7 @@ describe("termui web 工作台", () => {
 
     expect(css).toContain('font-family: "HarmonyOS Sans SC";');
     expect(css).toContain('--font-ui: "HarmonyOS Sans SC", "HarmonyOS Sans", "Aptos", "Segoe UI", sans-serif;');
-    expect(css).toContain("--daemon-status-cpu-width: 108px;");
+    expect(css).toContain("--daemon-status-cpu-width: 120px;");
     expect(css).toContain("--daemon-status-memory-width: 150px;");
     expect(css).toContain("--daemon-status-network-width: 154px;");
     expect(css).toContain("--daemon-status-disk-width: 150px;");
