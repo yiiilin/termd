@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type {
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
@@ -15,6 +16,7 @@ import {
   Folder,
   GitBranch,
   Link2,
+  MoreHorizontal,
   Minus,
   PanelRightClose,
   Plus,
@@ -35,6 +37,7 @@ import type {
   UUID,
 } from "../protocol/types";
 import { translateSafeErrorMessage, useI18n, type Translate } from "../i18n";
+import { useDismissiblePopover } from "./useDismissiblePopover";
 
 const GIT_SPLIT_MIN_PANE_HEIGHT = 24;
 const GIT_SPLIT_FALLBACK_PANEL_HEIGHT = 360;
@@ -296,17 +299,19 @@ export function SessionFilesPanel({
               daemon 返回新目录后会用新的 session_files_result 覆盖这里的缓存。
             */}
             {attachedSessionId && hasCachedFiles && entries.length > 0
-              ? entries.map((entry) => (
-                  <SessionFileRow
-                    key={entry.path}
-                    entry={entry}
-                    onOpenDirectory={onOpenDirectory}
-                    onOpenFile={onOpenFile}
-                    onDownload={onDownload}
-                    onDelete={onDelete}
-                    t={t}
-                  />
-                ))
+              ? <div className="file-list-entries" role="list">
+                  {entries.map((entry) => (
+                    <SessionFileRow
+                      key={entry.path}
+                      entry={entry}
+                      onOpenDirectory={onOpenDirectory}
+                      onOpenFile={onOpenFile}
+                      onDownload={onDownload}
+                      onDelete={onDelete}
+                      t={t}
+                    />
+                  ))}
+                </div>
               : null}
           </div>
           {transferProgress ? (
@@ -953,9 +958,142 @@ function SessionFileRow({
   t: Translate;
 }) {
   const isDirectory = entry.kind === "directory";
+  const canOpen = isDirectory || entry.kind === "file";
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPosition, setMenuPosition] = useState({ x: 8, y: 8 });
+  const { triggerRef: rowRef, popoverRef: menuRef } = useDismissiblePopover<HTMLDivElement, HTMLDivElement>({
+    open: menuOpen,
+    onClose: () => setMenuOpen(false),
+  });
+
+  const openEntry = () => {
+    if (isDirectory) {
+      onOpenDirectory(entry.path);
+      return;
+    }
+    if (entry.kind === "file") {
+      onOpenFile(entry);
+    }
+  };
+
+  const openMenuAt = (x: number, y: number) => {
+    setMenuPosition({ x, y });
+    setMenuOpen(true);
+  };
+
+  const openMenuFromRow = () => {
+    const rect = rowRef.current?.getBoundingClientRect();
+    openMenuAt(rect ? rect.right - 184 : 8, rect ? rect.bottom + 4 : 8);
+  };
+
+  const actions = isDirectory
+    ? [
+        {
+          key: "open",
+          label: t("files.open", { name: entry.name }),
+          icon: <Folder size={14} aria-hidden="true" />,
+          onSelect: openEntry,
+          danger: false,
+        },
+        {
+          key: "delete",
+          label: t("files.delete", { name: entry.name }),
+          icon: <Trash2 size={14} aria-hidden="true" />,
+          onSelect: () => onDelete(entry),
+          danger: true,
+        },
+      ]
+    : [
+        ...(entry.kind === "file"
+          ? [{
+              key: "edit",
+              label: t("files.edit", { name: entry.name }),
+              icon: <FilePenLine size={14} aria-hidden="true" />,
+              onSelect: openEntry,
+              danger: false,
+            }]
+          : []),
+        {
+          key: "download",
+          label: t("files.download", { name: entry.name }),
+          icon: <Download size={14} aria-hidden="true" />,
+          onSelect: () => onDownload(entry),
+          danger: false,
+        },
+        {
+          key: "delete",
+          label: t("files.delete", { name: entry.name }),
+          icon: <Trash2 size={14} aria-hidden="true" />,
+          onSelect: () => onDelete(entry),
+          danger: true,
+        },
+      ];
+
+  const menuStyle = {
+    left: `clamp(8px, ${menuPosition.x}px, calc(100vw - 196px))`,
+    top: `clamp(8px, ${menuPosition.y}px, calc(100vh - 168px))`,
+  } satisfies CSSProperties;
+  const menuPortalTarget = rowRef.current?.closest<HTMLElement>(".files-panel");
+
+  const handleMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      setMenuOpen(false);
+      rowRef.current?.focus();
+      return;
+    }
+    if (!(["ArrowDown", "ArrowUp", "Home", "End"] as const).includes(event.key as "ArrowDown" | "ArrowUp" | "Home" | "End")) {
+      return;
+    }
+    const menuItems = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)'));
+    if (menuItems.length === 0) {
+      return;
+    }
+
+    event.preventDefault();
+    const currentIndex = menuItems.indexOf(document.activeElement as HTMLButtonElement);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? menuItems.length - 1
+        : event.key === "ArrowUp"
+          ? (currentIndex <= 0 ? menuItems.length : currentIndex) - 1
+          : (currentIndex + 1) % menuItems.length;
+    menuItems[nextIndex]?.focus();
+  };
 
   return (
-    <div className="file-row">
+    <div
+      ref={rowRef}
+      className={`file-row${menuOpen ? " file-row-menu-open" : ""}`}
+      role="listitem"
+      tabIndex={0}
+      onDoubleClick={(event) => {
+        if (event.target instanceof Element && event.target.closest("button")) {
+          return;
+        }
+        openEntry();
+      }}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        openMenuAt(event.clientX, event.clientY);
+      }}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) {
+          return;
+        }
+        if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+          event.preventDefault();
+          openMenuFromRow();
+          return;
+        }
+        if (canOpen && (event.key === "Enter" || event.key === " ")) {
+          event.preventDefault();
+          openEntry();
+        }
+      }}
+    >
       <span className={`file-icon ${entry.kind}`} aria-hidden="true">
         {entry.kind === "directory" ? <Folder size={15} /> : null}
         {entry.kind === "symlink" ? <Link2 size={15} /> : null}
@@ -964,31 +1102,73 @@ function SessionFileRow({
       <span className="file-name" title={entry.path}>
         {entry.name}
       </span>
-      <span className="file-size">{formatBytes(entry.size_bytes)}</span>
+      {!isDirectory ? <span className="file-size">{formatBytes(entry.size_bytes)}</span> : null}
       <span className="file-actions">
-        {isDirectory ? (
-          <button type="button" className="icon-button" aria-label={t("files.open", { name: entry.name })} onClick={() => onOpenDirectory(entry.path)}>
-            <Folder size={14} aria-hidden="true" />
+        {actions.map((action) => (
+          <button
+            key={action.key}
+            type="button"
+            className={`icon-button file-row-action${action.danger ? " danger" : ""}`}
+            aria-label={action.label}
+            title={action.label}
+            onClick={() => {
+              setMenuOpen(false);
+              action.onSelect();
+            }}
+          >
+            {action.icon}
           </button>
-        ) : (
-          <>
-            <button type="button" className="icon-button" aria-label={t("files.edit", { name: entry.name })} onClick={() => onOpenFile(entry)}>
-              <FilePenLine size={14} aria-hidden="true" />
-            </button>
-            <button type="button" className="icon-button" aria-label={t("files.download", { name: entry.name })} onClick={() => onDownload(entry)}>
-              <Download size={14} aria-hidden="true" />
-            </button>
-          </>
-        )}
+        ))}
         <button
           type="button"
-          className="icon-button danger"
-          aria-label={t("files.delete", { name: entry.name })}
-          onClick={() => onDelete(entry)}
+          className="icon-button file-actions-menu-button"
+          aria-label={t("files.actions", { name: entry.name })}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          title={t("files.actions", { name: entry.name })}
+          onClick={(event) => {
+            const rect = event.currentTarget.getBoundingClientRect();
+            if (menuOpen) {
+              setMenuOpen(false);
+              return;
+            }
+            openMenuAt(rect.right - 184, rect.bottom + 4);
+          }}
         >
-          <Trash2 size={14} aria-hidden="true" />
+          <MoreHorizontal size={16} aria-hidden="true" />
         </button>
       </span>
+      {menuOpen && menuPortalTarget
+        ? createPortal(
+            <div
+              ref={menuRef}
+              className="file-context-menu"
+              role="menu"
+              aria-label={t("files.actions", { name: entry.name })}
+              style={menuStyle}
+              onContextMenu={(event) => event.preventDefault()}
+              onKeyDown={handleMenuKeyDown}
+            >
+              {actions.map((action, index) => (
+                <button
+                  key={action.key}
+                  type="button"
+                  role="menuitem"
+                  tabIndex={index === 0 ? 0 : -1}
+                  className={action.danger ? "danger" : undefined}
+                  onClick={() => {
+                    setMenuOpen(false);
+                    action.onSelect();
+                  }}
+                >
+                  {action.icon}
+                  <span>{action.label}</span>
+                </button>
+              ))}
+            </div>,
+            menuPortalTarget,
+          )
+        : null}
     </div>
   );
 }

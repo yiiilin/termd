@@ -2849,11 +2849,19 @@ label {
   gap: 4px;
 }
 
+.file-list-entries {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+}
+
 .file-row {
+  position: relative;
   min-width: 0;
   min-height: 32px;
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) auto auto;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
   align-items: center;
   gap: 7px;
   border-radius: 5px;
@@ -2863,6 +2871,11 @@ label {
 
 .file-row:hover {
   background: var(--color-surface-hover);
+}
+
+.file-row:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--color-accent);
 }
 
 .file-icon {
@@ -2895,23 +2908,34 @@ label {
 }
 
 .file-size {
+  grid-column: 3;
+  justify-self: end;
   color: var(--color-text-subtle);
+  text-align: right;
   white-space: nowrap;
 }
 
 .file-actions {
+  position: absolute;
+  top: 50%;
+  right: 6px;
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  padding-left: 18px;
+  background: var(--color-floating-gradient);
   opacity: 0;
   pointer-events: none;
-  transition: opacity 120ms ease;
+  transform: translateY(-50%) translateX(3px);
+  transition: opacity 120ms ease, transform 120ms ease;
 }
 
 .file-row:hover .file-actions,
-.file-row:focus-within .file-actions {
+.file-row:focus-within .file-actions,
+.file-row-menu-open .file-actions {
   opacity: 1;
   pointer-events: auto;
+  transform: translateY(-50%);
 }
 
 .file-actions .icon-button {
@@ -2919,6 +2943,62 @@ label {
   min-height: 28px;
   border-color: transparent;
   background: transparent;
+}
+
+/* Desktop has direct hover actions and a native context menu; keep the more-actions trigger for touch. */
+.file-actions .file-actions-menu-button {
+  display: none;
+}
+
+.file-context-menu {
+  position: fixed;
+  z-index: 90;
+  width: 188px;
+  max-width: calc(100vw - 16px);
+  display: grid;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid var(--color-border-control);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--color-surface-soft) 94%, transparent);
+  box-shadow: 0 12px 30px var(--color-popover-shadow);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  transform-origin: top left;
+  animation: popover-materialize 160ms var(--ease-out-ui) both;
+}
+
+.file-context-menu button {
+  width: 100%;
+  min-height: 30px;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text);
+  font-size: 12px;
+  text-align: left;
+}
+
+.file-context-menu button:hover,
+.file-context-menu button:focus-visible {
+  outline: none;
+  background: var(--color-surface-hover);
+}
+
+.file-context-menu button.danger {
+  color: var(--color-danger-text);
+}
+
+.file-context-menu button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .files-empty {
@@ -5006,7 +5086,22 @@ label {
   .file-actions {
     opacity: 1;
     pointer-events: auto;
-    transform: none;
+  }
+
+  .file-actions {
+    transform: translateY(-50%);
+  }
+
+  .file-actions .file-row-action {
+    display: none;
+  }
+
+  .file-actions .file-actions-menu-button {
+    display: inline-flex;
+  }
+
+  .file-size {
+    margin-right: 48px;
   }
 
   .git-change-actions .icon-button,
