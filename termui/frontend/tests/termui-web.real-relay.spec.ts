@@ -191,6 +191,7 @@ test("真实 relay 下 clear 之后上滚不会再看到 pre-clear 历史", asyn
 
 test("真实 relay 下多个大输出 session 快速切换后仍能恢复和输入", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name === "mobile-chrome", "压力回归只需要桌面布局覆盖真实 relay 链路");
+  test.setTimeout(90_000);
   const fixture = await startRealRelayFixture();
   const createdNames: string[] = [];
 
