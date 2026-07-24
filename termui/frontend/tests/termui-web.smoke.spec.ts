@@ -11,7 +11,10 @@ async function activateButton(page: Page, name: string): Promise<void> {
 }
 
 async function openMobileMenu(page: Page) {
-  await activateButton(page, "Open mobile workspace menu");
+  const button = page.getByRole("button", { name: "Open mobile workspace menu" });
+  await expect(button).toBeVisible();
+  await expect(button).toBeEnabled();
+  await button.tap();
   const menu = page.getByRole("navigation", { name: "mobile workspace menu" });
   await expect(menu).toBeVisible();
   return menu;
@@ -89,6 +92,212 @@ async function resetBrowserState(page: Page): Promise<void> {
 
 test.beforeEach(async ({ page }) => {
   await resetBrowserState(page);
+});
+
+test("narrow mobile workspace menu stays compact and touch-operable", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chrome", "该回归只需要移动端项目覆盖");
+  await page.setViewportSize({ width: 320, height: 568 });
+
+  const sessionId = "00000000-0000-0000-0000-0000000005f4";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: sessionId,
+        name: "production-long-running-session-with-a-name-that-must-not-cover-the-menu",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "mobile-menu-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expect.poll(() => daemon.attachedSessions).toEqual([sessionId]);
+
+    const titleIdentityCenter = () => page.locator(".toolbar-title-button").evaluate((title) => {
+      const icon = title.querySelector("svg");
+      const name = title.querySelector<HTMLElement>(".toolbar-session-name");
+      if (!icon || !name) {
+        throw new Error("mobile title identity is incomplete");
+      }
+      const iconRect = icon.getBoundingClientRect();
+      const nameRect = name.getBoundingClientRect();
+      return (iconRect.left + nameRect.right) / 2;
+    });
+    const viewportCenter = await page.evaluate(() => window.innerWidth / 2);
+    const initialTitleCenter = await titleIdentityCenter();
+    expect(Math.abs(initialTitleCenter - viewportCenter)).toBeLessThanOrEqual(1);
+
+    const latency = page.locator(".toolbar-title-button .toolbar-latency");
+    await expect(latency).toBeVisible();
+    const originalLatency = await latency.textContent();
+    await latency.evaluate((element) => {
+      element.textContent = "999999ms";
+    });
+    const expandedLatencyTitleCenter = await titleIdentityCenter();
+    expect(Math.abs(expandedLatencyTitleCenter - viewportCenter)).toBeLessThanOrEqual(1);
+    expect(Math.abs(expandedLatencyTitleCenter - initialTitleCenter)).toBeLessThanOrEqual(0.5);
+    const titleAndMetadata = await page.locator(".toolbar-title-button").evaluate((title) => {
+      const name = title.querySelector<HTMLElement>(".toolbar-session-name");
+      const metadata = title.querySelector<HTMLElement>(".toolbar-latency");
+      if (!name || !metadata) {
+        throw new Error("mobile title metadata is incomplete");
+      }
+      return {
+        titleRight: name.getBoundingClientRect().right,
+        metadataLeft: metadata.getBoundingClientRect().left,
+      };
+    });
+    expect(titleAndMetadata.titleRight).toBeLessThanOrEqual(titleAndMetadata.metadataLeft);
+    const pullIndicatorGeometry = await page.locator(".toolbar").evaluate((toolbar) => {
+      const indicator = toolbar.querySelector<HTMLElement>(".toolbar-title-pull-indicator");
+      if (!indicator) {
+        throw new Error("mobile title pull indicator is missing");
+      }
+      return {
+        indicatorTop: indicator.getBoundingClientRect().top,
+        toolbarTop: toolbar.getBoundingClientRect().top,
+      };
+    });
+    expect(pullIndicatorGeometry.indicatorTop).toBeGreaterThanOrEqual(pullIndicatorGeometry.toolbarTop);
+    await latency.evaluate((element, text) => {
+      element.textContent = text;
+    }, originalLatency);
+
+    const menuToggle = page.getByRole("button", { name: "Open mobile workspace menu" });
+    await expect(menuToggle).toBeVisible();
+    const toggleBox = await menuToggle.boundingBox();
+    expect(toggleBox).not.toBeNull();
+    expect(toggleBox!.width).toBeLessThanOrEqual(36.1);
+    expect(toggleBox!.height).toBeLessThanOrEqual(36.1);
+    const hitSlopTargetsMenu = await page.evaluate(({ x, y }) =>
+      Boolean(document.elementFromPoint(x, y)?.closest(".mobile-menu-toggle")), {
+      x: toggleBox!.x - 3,
+      y: toggleBox!.y + toggleBox!.height / 2,
+    });
+    expect(hitSlopTargetsMenu).toBe(true);
+
+    const menu = await openMobileMenu(page);
+    const menuButtons = menu.getByRole("button");
+    const buttonBoxes = await menuButtons.evaluateAll((buttons) =>
+      buttons.map((button) => {
+        const box = button.getBoundingClientRect();
+        return { width: box.width, height: box.height };
+      }),
+    );
+    for (const box of buttonBoxes) {
+      expect(box.height).toBeLessThanOrEqual(44);
+    }
+
+    await menu.getByRole("button", { name: "Sessions" }).tap();
+    const sessionsPanel = page.getByRole("dialog", { name: "sessions panel" });
+    const workspaceBody = page.locator(".workspace-body");
+    await expect(sessionsPanel).toBeVisible();
+    await expect(workspaceBody).toHaveAttribute("inert", "");
+    await sessionsPanel.focus();
+    await page.keyboard.press("Shift+Tab");
+    expect(await page.evaluate(() => document.activeElement?.closest(".workspace-body") === null)).toBe(true);
+    await page.getByRole("button", { name: "Close sessions panel" }).tap();
+    await expect(workspaceBody).not.toHaveAttribute("inert", "");
+
+    const reopenedMenu = await openMobileMenu(page);
+    await reopenedMenu.getByRole("button", { name: "Files" }).tap();
+    await expect(page.getByLabel("session files")).toBeVisible();
+    await expect(workspaceBody).toHaveAttribute("inert", "");
+    const compactFileButtons = page.locator(
+      ".mobile-files-panel .files-toolbar button, .mobile-files-panel .files-hide-button",
+    );
+    await expect(compactFileButtons).toHaveCount(5);
+    const compactFileButtonBoxes = await compactFileButtons.evaluateAll((buttons) =>
+      buttons.map((button) => button.getBoundingClientRect().height),
+    );
+    expect(Math.max(...compactFileButtonBoxes)).toBeLessThanOrEqual(36.1);
+    await expect(page.locator(".toolbar")).not.toHaveAttribute("inert", "");
+    const menuFromFilesPanel = await openMobileMenu(page);
+    await menuFromFilesPanel.getByRole("button", { name: "Sessions" }).tap();
+    await expect(page.getByRole("dialog", { name: "sessions panel" })).toBeVisible();
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("narrow mobile status starts at the left and exposes every compact metric", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chrome", "该回归只需要移动端项目覆盖");
+  await page.setViewportSize({ width: 320, height: 568 });
+
+  const sessionId = "00000000-0000-0000-0000-0000000005f5";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: sessionId,
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expect.poll(() => daemon.attachedSessions).toEqual([sessionId]);
+
+    const status = page.getByRole("contentinfo", { name: "daemon server status" });
+    await expect(status).toBeVisible();
+    for (const label of ["CPU", "Mem", "Disk", "Net"]) {
+      await expect(status.getByText(label, { exact: true })).toBeVisible();
+    }
+
+    const layout = await status.evaluate((footer) => {
+      const grid = footer.querySelector<HTMLElement>(".daemon-status-grid")!;
+      const header = footer.querySelector<HTMLElement>(".daemon-status-header")!;
+      const cpu = footer.querySelector<HTMLElement>(".daemon-status-cpu")!;
+      const network = footer.querySelector<HTMLElement>(".daemon-status-network")!;
+      const footerRect = footer.getBoundingClientRect();
+      return {
+        footerLeft: footerRect.left,
+        gridLeft: grid.getBoundingClientRect().left,
+        gridDisplay: getComputedStyle(grid).display,
+        gridOverflowX: getComputedStyle(grid).overflowX,
+        headerDisplay: getComputedStyle(header).display,
+        scrollLeft: grid.scrollLeft,
+        scrollWidth: grid.scrollWidth,
+        clientWidth: grid.clientWidth,
+        cpuLeft: cpu.getBoundingClientRect().left,
+        networkLeft: network.getBoundingClientRect().left,
+      };
+    });
+
+    expect(layout).toMatchObject({
+      gridDisplay: "grid",
+      gridOverflowX: "auto",
+      headerDisplay: "none",
+      scrollLeft: 0,
+    });
+    expect(Math.abs(layout.gridLeft - layout.footerLeft)).toBeLessThanOrEqual(1);
+    expect(layout.cpuLeft).toBeLessThan(layout.networkLeft);
+    expect(layout.scrollWidth).toBeGreaterThan(layout.clientWidth);
+
+    const networkAtEnd = await status.evaluate((footer) => {
+      const grid = footer.querySelector<HTMLElement>(".daemon-status-grid")!;
+      const network = footer.querySelector<HTMLElement>(".daemon-status-network")!;
+      grid.scrollLeft = grid.scrollWidth;
+      return {
+        gridRight: grid.getBoundingClientRect().right,
+        networkRight: network.getBoundingClientRect().right,
+      };
+    });
+    expect(networkAtEnd.networkRight).toBeLessThanOrEqual(networkAtEnd.gridRight + 1);
+  } finally {
+    await daemon.stop();
+  }
 });
 
 test("mobile visibility resume replaces a half-open terminal connection once", async ({ page }, testInfo: TestInfo) => {
@@ -669,6 +878,8 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       const mobileMenuButton = page.getByRole("button", { name: "Open mobile workspace menu" });
       const menuBox = await mobileMenuButton.boundingBox();
       expect(menuBox?.x ?? 0).toBeLessThan(48);
+      expect(menuBox?.width ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(36.1);
+      expect(menuBox?.height ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(36.1);
     } else {
       const daemonStatus = page.getByRole("contentinfo", { name: "daemon server status" });
       await expect(daemonStatus).toBeVisible();

@@ -4576,6 +4576,7 @@ label {
   }
 
   .toolbar {
+    position: relative;
     min-height: var(--mobile-toolbar-height);
     padding:
       env(safe-area-inset-top, 0px)
@@ -4594,6 +4595,58 @@ label {
     flex: 1 1 auto;
     max-width: none;
     overflow: hidden;
+  }
+
+  .toolbar-title-button {
+    position: static;
+    justify-content: flex-end;
+  }
+
+  .toolbar-title .toolbar-session-identity {
+    position: absolute;
+    top: env(safe-area-inset-top, 0px);
+    left: 50%;
+    display: flex;
+    align-items: center;
+    width: max-content;
+    max-width: min(42vw, calc(100% - 208px));
+    height: 44px;
+    gap: 8px;
+    overflow: hidden;
+    pointer-events: none;
+    transform: translateX(-50%);
+  }
+
+  .toolbar-title .toolbar-session-identity .toolbar-session-name {
+    min-width: 0;
+    text-align: center;
+  }
+
+  .toolbar-title .toolbar-latency {
+    width: 52px;
+    min-width: 52px;
+    max-width: 52px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .toolbar-title .toolbar-session-size {
+    width: 42px;
+    min-width: 42px;
+    max-width: 42px;
+    overflow: hidden;
+    text-align: center;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .toolbar-title .toolbar-connection-anomaly {
+    max-width: 28vw;
+  }
+
+  .toolbar-title .toolbar-title-pull-indicator {
+    top: env(safe-area-inset-top, 0px);
   }
 
   .toolbar-title .toolbar-session-name {
@@ -4833,7 +4886,7 @@ label {
     width: 100%;
     max-width: 100%;
     min-height: var(--mobile-status-height);
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr);
     gap: 0;
     padding:
       0
@@ -4842,12 +4895,22 @@ label {
       env(safe-area-inset-left, 0px);
   }
 
+  .daemon-status-strip .daemon-status-header {
+    display: none;
+  }
+
   .daemon-status-strip .daemon-status-grid {
-    width: clamp(128px, 44vw, 176px);
+    width: 100%;
     max-width: 100%;
-    display: flex;
-    justify-content: flex-end;
-    overflow: hidden;
+    display: grid;
+    grid-template-columns:
+      minmax(58px, 0.6fr)
+      minmax(86px, 0.9fr)
+      minmax(92px, 0.95fr)
+      minmax(124px, 1.25fr);
+    justify-content: stretch;
+    overflow-x: auto;
+    scrollbar-width: none;
   }
 
   .daemon-status-strip .daemon-status-grid::-webkit-scrollbar {
@@ -4857,7 +4920,7 @@ label {
   .daemon-status-strip .daemon-status-metric {
     min-height: 30px;
     width: auto;
-    justify-content: flex-end;
+    justify-content: center;
     gap: 4px;
     padding: 0 4px;
   }
@@ -4866,14 +4929,8 @@ label {
     min-width: 0;
   }
 
-  .daemon-status-strip .daemon-status-cpu,
-  .daemon-status-strip .daemon-status-memory,
-  .daemon-status-strip .daemon-status-disk {
-    display: none;
-  }
-
   .daemon-status-strip .daemon-status-network strong {
-    min-width: 0;
+    min-width: max-content;
     font-variant-numeric: tabular-nums;
   }
 
@@ -5111,6 +5168,56 @@ label {
   .files-rail .icon-button {
     width: 44px;
     min-height: 44px;
+  }
+
+  button.mobile-menu-toggle,
+  .mobile-panel-actions .icon-button,
+  .mobile-files-panel .files-toolbar .icon-button,
+  .mobile-files-panel .files-go-button,
+  .mobile-files-panel .files-hide-button,
+  .file-actions .file-actions-menu-button {
+    position: relative;
+    width: 36px;
+    min-width: 36px;
+    min-height: 36px;
+    min-block-size: 36px;
+  }
+
+  button.mobile-menu-toggle::after,
+  .mobile-panel-actions .icon-button::after,
+  .mobile-files-panel .files-toolbar .icon-button::after,
+  .mobile-files-panel .files-go-button::after,
+  .mobile-files-panel .files-hide-button::after,
+  .file-actions .file-actions-menu-button::after {
+    content: "";
+    position: absolute;
+    inset: -4px;
+  }
+
+  .mobile-files-panel .files-panel-header {
+    min-height: 44px;
+  }
+
+  .mobile-files-panel .files-toolbar {
+    grid-template-columns: 44px minmax(0, 1fr) 44px 44px 44px;
+    gap: 2px;
+    padding: 4px 6px;
+  }
+
+  .mobile-files-panel .files-toolbar button {
+    justify-self: center;
+  }
+
+  .mobile-panel-actions {
+    gap: 8px;
+  }
+
+  .mobile-files-panel .file-row {
+    min-height: 48px;
+  }
+
+  .mobile-files-panel .file-size {
+    margin-right: 44px;
   }
 
   .terminal-mobile-selection-copy-button {

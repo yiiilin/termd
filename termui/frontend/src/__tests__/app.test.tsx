@@ -2125,9 +2125,11 @@ describe("termui web 工作台", () => {
     expect(css).toContain("height: var(--termd-layout-viewport-height, var(--termd-visual-viewport-height, 100dvh));");
     expect(css).toContain("max-width: none;");
     expect(css).toContain(".daemon-status-strip {\n    width: 100%;");
-    expect(css).toContain(".daemon-status-strip .daemon-status-grid {\n    width: clamp(128px, 44vw, 176px);");
-    expect(css).toContain("grid-template-columns: minmax(0, 1fr) auto;");
-    expect(css).toContain(".daemon-status-strip .daemon-status-cpu,\n  .daemon-status-strip .daemon-status-memory,\n  .daemon-status-strip .daemon-status-disk {\n    display: none;");
+    expect(css).toContain(".daemon-status-strip .daemon-status-grid {\n    width: 100%;");
+    expect(css).toContain("grid-template-columns: minmax(0, 1fr);");
+    expect(css).toContain("grid-template-columns:\n      minmax(58px, 0.6fr)");
+    expect(css).toContain("overflow-x: auto;");
+    expect(css).not.toContain(".daemon-status-strip .daemon-status-cpu,\n  .daemon-status-strip .daemon-status-memory,\n  .daemon-status-strip .daemon-status-disk {\n    display: none;");
     const mobileShortcutsBlock = css.match(/\.terminal-mobile-shortcuts \{[^}]+\}/)?.[0] ?? "";
     expect(mobileShortcutsBlock).toContain("position: absolute;");
     expect(mobileShortcutsBlock).toContain("bottom: 0;");
@@ -2189,15 +2191,17 @@ describe("termui web 工作台", () => {
       expect(element?.querySelector(".toolbar-latency")).not.toBeNull();
       return element!;
     });
-    const name = title.querySelector(".toolbar-session-name");
+    const name = title.querySelector<HTMLElement>(".toolbar-session-name");
     const latency = title.querySelector(".toolbar-latency");
     const size = title.querySelector(".toolbar-session-size");
+    const identity = title.querySelector<HTMLElement>(".toolbar-session-identity");
     const children = Array.from(title.children);
 
     expect(name).not.toBeNull();
     expect(latency).not.toBeNull();
     expect(size).not.toBeNull();
-    expect(children.indexOf(name!)).toBeLessThan(children.indexOf(latency!));
+    expect(identity).toContainElement(name);
+    expect(children.indexOf(identity!)).toBeLessThan(children.indexOf(latency!));
     expect(children.indexOf(latency!)).toBeLessThan(children.indexOf(size!));
     expect(title.querySelector(".toolbar-connection-anomaly")).toBeNull();
   });
@@ -3248,8 +3252,15 @@ describe("termui web 工作台", () => {
     await within(secondMenu).getByRole("button", { name: "Files" }).click();
     const filesPanel = await screen.findByLabelText("session files");
     await expect(filesPanel).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Hide files panel" }));
-    await expect(screen.queryByLabelText("session files")).toBeNull();
+    const mobileMenuTrigger = screen.getByRole("button", { name: "Open mobile workspace menu" });
+    expect(mobileMenuTrigger.closest(".toolbar")).not.toHaveAttribute("inert");
+
+    await user.click(mobileMenuTrigger);
+    const panelSwitchMenu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
+    await user.click(within(panelSwitchMenu).getByRole("button", { name: "Sessions" }));
+    const switchedSessionsPanel = await screen.findByLabelText("sessions panel");
+    await user.click(within(switchedSessionsPanel).getByRole("button", { name: "Close sessions panel" }));
+    await expect(screen.queryByLabelText("sessions panel")).toBeNull();
   });
 
   it("移动菜单支持首焦点、Escape、Tab 离开和外部点击关闭", async () => {
@@ -3281,7 +3292,7 @@ describe("termui web 工作台", () => {
     expect(screen.queryByRole("navigation", { name: "mobile workspace menu" })).toBeNull();
   });
 
-  it("移动 Sessions 和 Files 覆盖面板约束焦点并用 Escape 回到终端", async () => {
+  it("移动 Sessions 和 Files 面板保持工具栏可用，隔离被遮挡的工作区并用 Escape 回到终端", async () => {
     setViewportWidth(390);
     const user = userEvent.setup();
     render(<App />);
@@ -3298,11 +3309,10 @@ describe("termui web 工作台", () => {
 
     await user.click(screen.getByRole("button", { name: "Open session list from title" }));
     const sessionsDialog = await screen.findByRole("dialog", { name: "sessions panel" });
-    expect(within(sessionsDialog).getByRole("button", { name: "Refresh sessions" })).toHaveFocus();
-    expect(toolbar).toHaveAttribute("inert");
+    expect(sessionsDialog).toHaveFocus();
+    expect(sessionsDialog).not.toHaveAttribute("aria-modal");
+    expect(toolbar).not.toHaveAttribute("inert");
     expect(workspaceBody).toHaveAttribute("inert");
-    await user.tab({ shift: true });
-    expect(document.activeElement).toBe(within(sessionsDialog).getAllByRole("button").at(-1));
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog", { name: "sessions panel" })).toBeNull();
     await waitFor(() => expect(terminalInput).toHaveFocus());
@@ -3313,8 +3323,10 @@ describe("termui web 工作台", () => {
     const menu = await screen.findByRole("navigation", { name: "mobile workspace menu" });
     await user.click(within(menu).getByRole("button", { name: "Files" }));
     const filesDialog = await screen.findByRole("dialog", { name: "Files" });
-    expect(filesDialog).toHaveAttribute("aria-modal", "true");
-    expect(filesDialog.contains(document.activeElement)).toBe(true);
+    expect(filesDialog).toHaveFocus();
+    expect(filesDialog).not.toHaveAttribute("aria-modal");
+    expect(toolbar).not.toHaveAttribute("inert");
+    expect(workspaceBody).toHaveAttribute("inert");
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog", { name: "Files" })).toBeNull();
     await waitFor(() => expect(terminalInput).toHaveFocus());

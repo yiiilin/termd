@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import packageMetadata from "../package.json";
 import {
   Cable,
@@ -57,7 +57,6 @@ import { TerminalPane } from "./components/TerminalPane";
 import { DestructiveActionDialog } from "./components/DestructiveActionDialog";
 import { UnsavedFileDialog } from "./components/UnsavedFileDialog";
 import { useDismissiblePopover } from "./components/useDismissiblePopover";
-import { useModalFocus } from "./components/useModalFocus";
 import type { TerminalOutputItem, TerminalResyncOptions } from "./components/terminal/types";
 import {
   advanceSessionOpenProgress,
@@ -4007,11 +4006,20 @@ export default function App() {
     setMobilePanel(undefined);
     requestMobileTerminalFocus();
   }, [requestMobileTerminalFocus]);
-  const mobilePanelRef = useModalFocus<HTMLDivElement>({
-    open: showMobileSessionsPanel || showMobileFilesPanel,
-    onClose: handleCloseMobilePanel,
-    restoreFocus: false,
-  });
+  const mobilePanelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (showMobileSessionsPanel || showMobileFilesPanel) {
+      mobilePanelRef.current?.focus({ preventScroll: true });
+    }
+  }, [showMobileFilesPanel, showMobileSessionsPanel]);
+  const handleMobilePanelKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Escape") {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    handleCloseMobilePanel();
+  }, [handleCloseMobilePanel]);
 
   const handleFilesPanelResizePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -4352,8 +4360,10 @@ export default function App() {
               onLostPointerCapture={handleMobileTitlePointerCancel}
               onClick={handleMobileTitleClick}
             >
-              <MonitorUp size={16} aria-hidden="true" />
-              <span className="toolbar-session-name">{toolbarSessionName}</span>
+              <span className="toolbar-session-identity">
+                <MonitorUp size={16} aria-hidden="true" />
+                <span className="toolbar-session-name">{toolbarSessionName}</span>
+              </span>
               {isMobileLayout && error ? (
                 <small
                   className="toolbar-connection-anomaly"
@@ -4476,6 +4486,7 @@ export default function App() {
               .join(" ")
           }
           style={desktopWorkspaceStyle}
+          inert={showMobileSessionsPanel || showMobileFilesPanel}
         >
           {error ? (
             <ProtocolErrorAlert
@@ -4587,8 +4598,9 @@ export default function App() {
             ref={mobilePanelRef}
             className="mobile-panel mobile-sessions-panel"
             role="dialog"
-            aria-modal="true"
             aria-label={t("app.sessionsPanel")}
+            tabIndex={-1}
+            onKeyDown={handleMobilePanelKeyDown}
           >
             <header className="mobile-panel-header">
               <div className="mobile-panel-title">
@@ -4637,8 +4649,9 @@ export default function App() {
             ref={mobilePanelRef}
             className="mobile-panel mobile-files-panel"
             role="dialog"
-            aria-modal="true"
             aria-label={t("app.files")}
+            tabIndex={-1}
+            onKeyDown={handleMobilePanelKeyDown}
           >
             <Suspense fallback={<LazyPanelFallback className="files-panel" />}>
               <SessionFilesPanel

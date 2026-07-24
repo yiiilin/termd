@@ -52,6 +52,10 @@ describe("mobile layout regressions", () => {
     expect(css).toContain("@media (hover: none), (pointer: coarse) {");
     expect(css).toContain("button:not(.mobile-backdrop),\n  input:not(.sr-only),");
     expect(css).toContain("min-block-size: 44px;");
+    expect(css).toContain("button.mobile-menu-toggle,\n  .mobile-panel-actions .icon-button,");
+    expect(css).toContain("min-block-size: 36px;");
+    expect(css).toContain("button.mobile-menu-toggle::after,\n  .mobile-panel-actions .icon-button::after,");
+    expect(css).toContain("inset: -4px;");
     expect(css).toContain("inset: var(--mobile-toolbar-height) 0 var(--mobile-status-height) 0;");
     expect(css).toContain("bottom: calc(12px + env(safe-area-inset-bottom, 0px));");
     expect(css).toContain(".terminal-host {\n    min-width: 0;\n    overflow: hidden;\n    max-width: 100%;");
@@ -69,10 +73,11 @@ describe("mobile layout regressions", () => {
     expect(css).not.toContain(".terminal-host,\n  .terminal-host canvas");
     expect(css).toContain('.terminal-host textarea[aria-label="Terminal input"]');
     expect(css).toContain(".daemon-cpu-bar-chart {\n    display: none;");
-    expect(css).toContain("grid-template-columns: minmax(0, 1fr) auto;");
-    expect(css).toContain(".daemon-status-strip .daemon-status-cpu,\n  .daemon-status-strip .daemon-status-memory,\n  .daemon-status-strip .daemon-status-disk {\n    display: none;");
-    expect(css).toContain("width: clamp(128px, 44vw, 176px);");
-    expect(css).toContain(".daemon-status-strip .daemon-status-network strong {\n    min-width: 0;\n    font-variant-numeric: tabular-nums;");
+    expect(css).toContain("grid-template-columns: minmax(0, 1fr);");
+    expect(css).toContain(".daemon-status-strip .daemon-status-header {\n    display: none;");
+    expect(css).not.toContain(".daemon-status-strip .daemon-status-cpu,\n  .daemon-status-strip .daemon-status-memory,\n  .daemon-status-strip .daemon-status-disk {\n    display: none;");
+    expect(css).toContain("grid-template-columns:\n      minmax(58px, 0.6fr)");
+    expect(css).toContain(".daemon-status-strip .daemon-status-network strong {\n    min-width: max-content;\n    font-variant-numeric: tabular-nums;");
     const helperTextareaBlock =
       css.match(/\.terminal-host textarea\[aria-label="Terminal input"\] \{[^}]+\}/)?.[0] ?? "";
     expect(helperTextareaBlock).toContain("helper textarea 需要保留 focus/paste/IME 能力");
