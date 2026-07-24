@@ -3,7 +3,7 @@ members = ["proto", "termd", "termctl", "terminstall", "termrelay", "termweb"]
 resolver = "3"
 
 [workspace.package]
-version = "0.8.18"
+version = "0.8.19"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/yiiilin/termd"
