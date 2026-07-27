@@ -78,7 +78,7 @@ test("浏览器通过真实 relay 连接 daemon 完成 pairing 和 session list"
       await expect(menu.getByRole("button", { name: "Daemons" })).toBeVisible();
       await expect(menu.getByRole("button", { name: "Sessions" })).toBeVisible();
       await expect(menu.getByRole("button", { name: "Files" })).toBeVisible();
-      await expect(menu.getByRole("button", { name: "New" })).toBeVisible();
+      await expect(menu.getByRole("button", { name: "New", exact: true })).toBeVisible();
       await menu.getByRole("button", { name: "Daemons" }).click();
       await expect(page.getByRole("main", { name: "daemon admin" })).toBeVisible();
       await expect(page.getByRole("region", { name: "connection" })).toBeVisible();
@@ -325,7 +325,7 @@ test("relay Web 在双客户端慢链路下快速切换仍稳定", async ({ page
     // 中文注释：桌面侧边栏已去掉手动刷新按钮；测试双客户端链路时让第二客户端
     // 在 session 已存在后接入，避免测试依赖已移除的手动刷新入口。
     await secondPage.goto("/");
-    await expect(secondPage.getByRole("button", { name: "New session" })).toBeVisible();
+    await expect(secondPage.getByRole("button", { name: "New session", exact: true })).toBeVisible();
     await expect.poll(async () => sessionNames(secondPage), { timeout: 10_000 }).toHaveLength(createdNames.length);
 
     for (let round = 0; round < 8; round += 1) {
@@ -404,7 +404,7 @@ test("relay Web 在双客户端抖动低带宽链路下仍能恢复", async ({ p
     // 中文注释：第二客户端在 session 已存在后接入，覆盖慢链路同步和后续 attach，
     // 不再依赖已移除的桌面刷新按钮。
     await secondPage.goto("/");
-    await expect(secondPage.getByRole("button", { name: "New session" })).toBeVisible();
+    await expect(secondPage.getByRole("button", { name: "New session", exact: true })).toBeVisible();
     await expect.poll(async () => sessionNames(secondPage), { timeout: 20_000 }).toHaveLength(createdNames.length);
 
     for (let round = 0; round < 6; round += 1) {
@@ -1551,7 +1551,7 @@ async function waitForTerminalCanvasStable(page: Page): Promise<void> {
 }
 
 async function createShellSession(page: Page, existingNames: string[]): Promise<string> {
-  await page.getByRole("button", { name: "New session" }).click();
+  await page.getByRole("button", { name: "New session", exact: true }).click();
   await expect(page.getByRole("textbox", { name: "Terminal input" })).toBeAttached({ timeout: 8_000 });
   await expect
     .poll(async () => sessionNames(page), { timeout: 8_000 })

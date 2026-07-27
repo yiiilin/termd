@@ -861,7 +861,7 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
       await expect(menu.getByRole("button", { name: "Daemons" })).toBeVisible();
       await expect(menu.getByRole("button", { name: "Sessions" })).toBeVisible();
       await expect(menu.getByRole("button", { name: "Files" })).toBeVisible();
-      await expect(menu.getByRole("button", { name: "New" })).toBeVisible();
+      await expect(menu.getByRole("button", { name: "New", exact: true })).toBeVisible();
       await expect(menu.getByRole("button", { name: /Refresh/ })).toHaveCount(0);
       await menu.getByRole("button", { name: "Daemons" }).click();
       await expect(page.getByRole("main", { name: "daemon admin" })).toBeVisible();
@@ -2286,7 +2286,7 @@ async function openSession(page: Page, name: string): Promise<void> {
 }
 
 async function createShellSession(page: Page, existingNames: string[]): Promise<string> {
-  await page.getByRole("button", { name: "New session" }).click();
+  await page.getByRole("button", { name: "New session", exact: true }).click();
   await expect(page.getByRole("textbox", { name: "Terminal input" })).toBeAttached({ timeout: 8_000 });
   await expect
     .poll(async () => sessionNames(page), { timeout: 8_000 })
