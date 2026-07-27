@@ -57,9 +57,21 @@ impl PinnedWorkingDirectory {
                 return None;
             }
             let path = self.command_path()?.canonicalize().ok()?;
-            let after = self.handle.metadata().ok()?;
-            (after.is_dir() && after.nlink() > 0).then_some(path)
+            self.validate_linked_path(path)
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_linked_path(&self, path: PathBuf) -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+
+        let pinned = self.handle.metadata().ok()?;
+        if !pinned.is_dir() || pinned.nlink() == 0 {
+            return None;
+        }
+        let linked = path.metadata().ok()?;
+        (linked.is_dir() && linked.dev() == pinned.dev() && linked.ino() == pinned.ino())
+            .then_some(path)
     }
 }
 
@@ -892,6 +904,37 @@ mod tests {
 
         assert_eq!(resolved, expected);
         assert_eq!(spawned_pwd, expected);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pinned_working_directory_rejects_path_replaced_after_capture() {
+        let root = std::env::temp_dir().join(format!(
+            "termd-pinned-cwd-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let original = root.join("original");
+        let moved = root.join("moved");
+        std::fs::create_dir_all(&original).unwrap();
+        let pinned = PinnedWorkingDirectory {
+            handle: std::fs::File::open(&original).unwrap(),
+        };
+        let captured = pinned.command_path().unwrap().canonicalize().unwrap();
+
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let resolved = pinned.validate_linked_path(captured);
+
+        drop(pinned);
+        std::fs::remove_dir(&original).unwrap();
+        std::fs::remove_dir(&moved).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+
+        assert_eq!(resolved, None);
     }
 
     #[test]
