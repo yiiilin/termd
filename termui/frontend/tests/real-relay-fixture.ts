@@ -17,12 +17,22 @@ export interface StartedProcess {
 
 export interface RealRelayFixture {
   token: string;
+  daemonClientUrl: string;
+  daemonWebUrl: string;
   relayClientUrl: string;
   relayWebUrl: string;
   serverId: string;
   daemonPublicKey: string;
   diagnostics: () => string;
   issuePairingToken: () => Promise<string>;
+  offerFile: (filePath: string) => Promise<{
+    offer_id: string;
+    name: string;
+    path: string;
+    size_bytes: number;
+    created_at_ms: number;
+    expires_at_ms: number;
+  }>;
   interruptRelayMux: () => Promise<void>;
   restartDaemon: () => Promise<void>;
   waitForRelayReady: () => Promise<void>;
@@ -30,6 +40,7 @@ export interface RealRelayFixture {
 }
 
 interface RealRelayFixtureOptions {
+  enableDaemonWeb?: boolean;
   daemonToRelayLatencyMs?: number;
   relayToDaemonLatencyMs?: number;
   daemonToRelayJitterMs?: number;
@@ -72,6 +83,7 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
   const daemonToken = testSecret("daemon", termdPort);
   const setupTokenFile = path.join(tempDir, "relay-setup-token");
   const daemonRegistryFile = path.join(tempDir, "daemon-registry.json");
+  const controlSocketPath = path.join(tempDir, "termd.sock");
   await writeFile(setupTokenFile, `${setupToken}\n`, { mode: 0o600 });
   await chmod(setupTokenFile, 0o600);
 
@@ -147,7 +159,12 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
     `ws://${relayForDaemon}`,
     "--relay-daemon-token",
     daemonToken,
+    "--control-socket",
+    controlSocketPath,
   ];
+  if (options.enableDaemonWeb) {
+    daemonArgs.push("--web");
+  }
   let daemon = spawnCargo(daemonArgs, "termd", tempDir, options.daemonEnv, daemonLogs);
   const retiredDaemonProcessGroups = new Set<number>();
   await waitForPort(termdPort, daemon, "termd");
@@ -193,6 +210,8 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
 
     return {
       token: pairing.token,
+      daemonClientUrl: `ws://127.0.0.1:${termdPort}/ws`,
+      daemonWebUrl: termdHttp,
       relayClientUrl,
       relayWebUrl: `http://${relayAddr}/`,
       serverId,
@@ -212,6 +231,7 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
         const nextPairing = await issuePairingToken(termdHttp);
         return nextPairing.token;
       },
+      offerFile: (filePath) => offerFileThroughCli(filePath, controlSocketPath, tempDir),
       interruptRelayMux: async () => {
         if (!latencyProxy) {
           throw new Error("relay mux interrupt requires fixture network proxy");
@@ -260,6 +280,94 @@ export async function startRealRelayFixture(options: RealRelayFixtureOptions = {
     await cleanupStartedFixture().catch(() => undefined);
     throw caught;
   }
+}
+
+export function pairingInviteCode(
+  fixture: Pick<RealRelayFixture, "relayClientUrl" | "serverId" | "token" | "daemonPublicKey">,
+): string {
+  const payload = JSON.stringify({
+    type: "termd_pairing_qr",
+    version: 2,
+    ws_url: fixture.relayClientUrl,
+    token: fixture.token,
+    server_id: fixture.serverId,
+    daemon_public_key: fixture.daemonPublicKey,
+    expires_at_ms: Date.now() + 60_000,
+  });
+  return `termd-pair:v2:${Buffer.from(payload, "utf8").toString("base64url")}`;
+}
+
+async function offerFileThroughCli(
+  filePath: string,
+  controlSocketPath: string,
+  cwd: string,
+): Promise<{
+  offer_id: string;
+  name: string;
+  path: string;
+  size_bytes: number;
+  created_at_ms: number;
+  expires_at_ms: number;
+}> {
+  const stdout = await runCommand(
+    "cargo",
+    [
+      "run",
+      "-q",
+      "--manifest-path",
+      CARGO_MANIFEST,
+      "-p",
+      "termd",
+      "--",
+      "offer-file",
+      filePath,
+      "--socket",
+      controlSocketPath,
+      "--json",
+    ],
+    cwd,
+  );
+  const parsed = JSON.parse(stdout) as Record<string, unknown>;
+  if (
+    typeof parsed.offer_id !== "string" ||
+    typeof parsed.name !== "string" ||
+    typeof parsed.path !== "string" ||
+    typeof parsed.size_bytes !== "number" ||
+    typeof parsed.created_at_ms !== "number" ||
+    typeof parsed.expires_at_ms !== "number"
+  ) {
+    throw new Error("termd offer-file returned an invalid payload");
+  }
+  return parsed as {
+    offer_id: string;
+    name: string;
+    path: string;
+    size_bytes: number;
+    created_at_ms: number;
+    expires_at_ms: number;
+  };
+}
+
+function runCommand(command: string, args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd, env: process.env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`${command} exited with ${code}: ${stderr.trim()}`));
+        return;
+      }
+      resolve(stdout);
+    });
+  });
 }
 
 async function waitForRelayDaemonMux(

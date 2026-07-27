@@ -2549,6 +2549,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "termd-proto",
  "terminstall",
  "termweb",

@@ -23,13 +23,14 @@ async function handlePush(event) {
   }
   await self.registration.showNotification("Termd", {
     body: payload.body,
-    tag: `termd-session-activity-${payload.server_id}-${payload.session_id}`,
+    tag: payload.kind === "file_offer"
+      ? `termd-file-offer-${payload.server_id}-${payload.offer_id}`
+      : `termd-session-activity-${payload.server_id}-${payload.session_id}`,
     icon: new URL("icons/termd.svg", scope.base).toString(),
     silent: true,
-    data: {
-      server_id: payload.server_id,
-      session_id: payload.session_id,
-    },
+    data: payload.kind === "file_offer"
+      ? { kind: "file_offer", server_id: payload.server_id, offer_id: payload.offer_id }
+      : { server_id: payload.server_id, session_id: payload.session_id },
   });
 }
 
@@ -40,7 +41,11 @@ async function handleNotificationClick(data) {
   }
   const target = new URL(scope.base);
   target.searchParams.set("termd_server_id", data.server_id);
-  target.searchParams.set("termd_session_id", data.session_id);
+  if (data.kind === "file_offer") {
+    target.searchParams.set("termd_offer_id", data.offer_id);
+  } else {
+    target.searchParams.set("termd_session_id", data.session_id);
+  }
   const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
   const existing = windows.find((client) => isApplicationClient(client.url, scope.base));
   if (existing) {
@@ -82,6 +87,22 @@ function readPushPayload(data, scopedServerId) {
   } catch {
     return undefined;
   }
+  if (payload?.kind === "file_offer") {
+    if (
+      payload.version !== 1 ||
+      payload.server_id !== scopedServerId ||
+      !isUuid(payload.offer_id)
+    ) {
+      return undefined;
+    }
+    return {
+      version: 1,
+      kind: "file_offer",
+      server_id: payload.server_id,
+      offer_id: payload.offer_id,
+      body: fileOfferNotificationBody(),
+    };
+  }
   if (
     payload?.version !== 1 ||
     payload.server_id !== scopedServerId ||
@@ -96,7 +117,18 @@ function readPushPayload(data, scopedServerId) {
 }
 
 function isNotificationData(data) {
-  return Boolean(data && isUuid(data.server_id) && isUuid(data.session_id));
+  return Boolean(
+    data &&
+    isUuid(data.server_id) &&
+    (data.kind === "file_offer" ? isUuid(data.offer_id) : isUuid(data.session_id))
+  );
+}
+
+function fileOfferNotificationBody() {
+  const language = typeof self.navigator?.language === "string" ? self.navigator.language.toLowerCase() : "";
+  return language.startsWith("zh")
+    ? "一个文件已准备好，打开 Termd 下载。"
+    : "A file is ready. Open Termd to download it.";
 }
 
 function isApplicationClient(rawUrl, baseUrl) {

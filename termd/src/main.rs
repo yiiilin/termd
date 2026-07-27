@@ -3,8 +3,10 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -13,16 +15,26 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose};
 use qrcode::{Color as QrColor, QrCode, render::unicode};
 use serde::Deserialize;
+use termd::agent_skill::{
+    Agent as SkillAgent, InstallAction, SkillState, UninstallAction, bundled_skill, install_auto,
+    installation_status, uninstall as uninstall_skill,
+};
 use termd::config::{
     DaemonConfig, SecretString, normalize_relay_endpoints, normalize_relay_proxy_url,
 };
+#[cfg(unix)]
+use termd::net::control::{ControlSocketServer, DEFAULT_CONTROL_SOCKET_PATH};
 use termd::net::relay::{
     RelayBaseUrl, RelayProxyUrl, RelayReconnectPolicy, run_relay_mux_with_reconnect,
 };
+#[cfg(unix)]
+use termd::net::server::daemon_control_router;
 use termd::net::server::{TlsPaths, serve, serve_tls, try_default_protocol};
 use termd::pty::supervisor::{SessionSupervisorArgs, run_session_supervisor};
 use termd::pty::{CommandSpec, PtySize};
-use termd_proto::{PairingQrPayload, PairingToken, PublicKey, ServerId, UnixTimestampMillis};
+use termd_proto::{
+    FileOfferPayload, PairingQrPayload, PairingToken, PublicKey, ServerId, UnixTimestampMillis,
+};
 use tokio::task::JoinHandle;
 
 mod installer_helper;
@@ -31,6 +43,9 @@ mod process_lock;
 const DEFAULT_PAIRING_URL: &str = "http://127.0.0.1:8765";
 const LOCAL_PAIRING_TOKEN_PATH: &str = "/local/pairing-token";
 const LOCAL_PAIRING_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const CONTROL_SOCKET_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_SOCKET_ENV: &str = "TERMD_SOCKET";
 const DEDICATED_RELAY_PROXY_ENV_VARS: [&str; 2] = ["TERMD_RELAY_PROXY_URL", "TERMD_RELAY_PROXY"];
 const COMMON_WS_PROXY_ENV_VARS: [&str; 4] = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
 const COMMON_WSS_PROXY_ENV_VARS: [&str; 6] = [
@@ -49,6 +64,8 @@ const HELP_TEXT: &str = concat!(
     "USAGE:\n",
     "  termd [OPTIONS]\n",
     "  termd pair [OPTIONS]\n",
+    "  termd offer-file <PATH> [--socket <PATH>] [--json]\n",
+    "  termd skill <install|status|print|uninstall> [OPTIONS]\n",
     "  termd install [OPTIONS]\n",
     "  termd uninstall [OPTIONS]\n",
     "  termd upgrade [OPTIONS]\n\n",
@@ -62,6 +79,8 @@ const HELP_TEXT: &str = concat!(
     "  --tls-cert <CERT_PEM>          TLS certificate path\n",
     "  --tls-key <KEY_PEM>            TLS private key path; must be paired with --tls-cert\n",
     "  --web                          Serve embedded Web UI\n",
+    "  --control-socket <PATH>        Daemon control socket, default /run/termd/termd.sock\n",
+    "  --no-control-socket            Disable the daemon control socket\n",
     "  -h, --help                     Print help\n",
     "  -V, --version                  Print version\n\n",
     "INSTALLATION:\n",
@@ -81,6 +100,8 @@ const HELP_TEXT: &str = concat!(
     "  ALL_PROXY=socks5://127.0.0.1:1080 termd --relay wss://relay.example/ws\n",
     "  termd pair --url http://127.0.0.1:8765\n",
     "  termd pair --qr\n",
+    "  termd offer-file ./report.zip\n",
+    "  termd skill install --agent auto\n",
 );
 
 fn main() -> ExitCode {
@@ -129,6 +150,7 @@ async fn runtime_main() -> Result<(), Box<dyn Error>> {
             relay_proxy_url,
             tls,
             web,
+            control_socket,
         } => {
             serve_daemon(
                 listen,
@@ -137,6 +159,7 @@ async fn runtime_main() -> Result<(), Box<dyn Error>> {
                 relay_proxy_url,
                 tls,
                 web,
+                control_socket,
             )
             .await?
         }
@@ -156,6 +179,18 @@ async fn runtime_main() -> Result<(), Box<dyn Error>> {
                 println!("{}", token.token.0);
             }
         }
+        CliCommand::OfferFile { path, socket, json } => {
+            let offer = offer_file_over_control_socket(&path, socket.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string(&offer)?);
+            } else {
+                println!(
+                    "File offer accepted: {} ({} bytes), id {}, expires at {}",
+                    offer.path, offer.size_bytes, offer.offer_id, offer.expires_at_ms.0
+                );
+            }
+        }
+        CliCommand::Skill(command) => run_skill_command(command)?,
         CliCommand::SessionSupervisor(args) => run_session_supervisor(args).await?,
     }
 
@@ -187,6 +222,7 @@ async fn serve_daemon(
     relay_proxy_url: Option<String>,
     tls: Option<TlsPaths>,
     web_enabled: bool,
+    control_socket: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     // MVP 默认只监听 127.0.0.1:8765；更复杂的配置文件/后台守护留给后续任务。
     let mut config = DaemonConfig::default();
@@ -210,6 +246,15 @@ async fn serve_daemon(
     config.relay_proxy_url = relay_proxy_url.clone();
     let protocol = try_default_protocol(config.clone())?;
 
+    #[cfg(unix)]
+    let control_server = control_socket
+        .map(|path| ControlSocketServer::bind(path, daemon_control_router(protocol.clone())))
+        .transpose()?;
+    #[cfg(not(unix))]
+    if control_socket.is_some() {
+        return Err("daemon control sockets are supported only on Unix".into());
+    }
+
     tracing::info!(
         host = %config.listen_host,
         port = config.listen_port,
@@ -227,8 +272,39 @@ async fn serve_daemon(
             relay_protocol,
         );
     }
+    #[cfg(unix)]
+    match control_server {
+        Some(control_server) => {
+            tokio::select! {
+                result = serve_with_optional_tls(config, protocol, tls, web_enabled) => result?,
+                result = control_server.serve() => result?,
+                result = wait_for_shutdown_signal() => result?,
+            }
+        }
+        None => {
+            tokio::select! {
+                result = serve_with_optional_tls(config, protocol, tls, web_enabled) => result?,
+                result = wait_for_shutdown_signal() => result?,
+            }
+        }
+    }
+    #[cfg(not(unix))]
     serve_with_optional_tls(config, protocol, tls, web_enabled).await?;
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 fn resolve_relay_proxy_url(
@@ -456,13 +532,28 @@ enum CliCommand {
         relay_proxy_url: Option<String>,
         tls: Option<TlsPaths>,
         web: bool,
+        control_socket: Option<PathBuf>,
     },
     Pair {
         url: String,
         qr: bool,
         qr_svg: Option<PathBuf>,
     },
+    OfferFile {
+        path: PathBuf,
+        socket: Option<PathBuf>,
+        json: bool,
+    },
+    Skill(SkillCommand),
     SessionSupervisor(SessionSupervisorArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillCommand {
+    Install { force: bool },
+    Status,
+    Print,
+    Uninstall { agent: SkillAgent },
 }
 
 impl fmt::Debug for CliCommand {
@@ -477,6 +568,7 @@ impl fmt::Debug for CliCommand {
                 relay_proxy_url,
                 tls,
                 web,
+                control_socket,
             } => formatter
                 .debug_struct("Serve")
                 .field("listen", listen)
@@ -488,6 +580,7 @@ impl fmt::Debug for CliCommand {
                 .field("relay_proxy_url", relay_proxy_url)
                 .field("tls", tls)
                 .field("web", web)
+                .field("control_socket", control_socket)
                 .finish(),
             Self::Pair { url, qr, qr_svg } => formatter
                 .debug_struct("Pair")
@@ -495,6 +588,13 @@ impl fmt::Debug for CliCommand {
                 .field("qr", qr)
                 .field("qr_svg", qr_svg)
                 .finish(),
+            Self::OfferFile { path, socket, json } => formatter
+                .debug_struct("OfferFile")
+                .field("path", path)
+                .field("socket", socket)
+                .field("json", json)
+                .finish(),
+            Self::Skill(command) => formatter.debug_tuple("Skill").field(command).finish(),
             Self::SessionSupervisor(args) => formatter
                 .debug_tuple("SessionSupervisor")
                 .field(args)
@@ -514,6 +614,7 @@ impl CliCommand {
                 relay_proxy_url: None,
                 tls: None,
                 web: false,
+                control_socket: Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH)),
             });
         };
 
@@ -521,6 +622,8 @@ impl CliCommand {
             "-h" | "--help" | "help" => Ok(Self::Help),
             "-V" | "--version" | "version" => Ok(Self::Version),
             "pair" => parse_pair_args(args),
+            "offer-file" => parse_offer_file_args(args),
+            "skill" => parse_skill_args(args),
             "__session-supervisor" => parse_session_supervisor_args(args),
             "--listen"
             | "--relay"
@@ -530,7 +633,9 @@ impl CliCommand {
             | "--relay-proxy"
             | "--tls-cert"
             | "--tls-key"
-            | "--web" => parse_serve_args(std::iter::once(command).chain(args)),
+            | "--web"
+            | "--control-socket"
+            | "--no-control-socket" => parse_serve_args(std::iter::once(command).chain(args)),
             other => Err(CliError::UnknownCommand(other.to_owned())),
         }
     }
@@ -544,6 +649,8 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
     let mut tls_cert = None;
     let mut tls_key = None;
     let mut web = false;
+    let mut control_socket = Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH));
+    let mut control_socket_configured = false;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -609,6 +716,24 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
             "--web" => {
                 web = true;
             }
+            "--control-socket" => {
+                if control_socket_configured {
+                    return Err(CliError::ConflictingControlSocketOptions);
+                }
+                let value = args.next().ok_or(CliError::MissingControlSocketValue)?;
+                if value.is_empty() {
+                    return Err(CliError::MissingControlSocketValue);
+                }
+                control_socket = Some(PathBuf::from(value));
+                control_socket_configured = true;
+            }
+            "--no-control-socket" => {
+                if control_socket_configured {
+                    return Err(CliError::ConflictingControlSocketOptions);
+                }
+                control_socket = None;
+                control_socket_configured = true;
+            }
             other => return Err(CliError::UnexpectedArgument(other.to_owned())),
         }
     }
@@ -626,6 +751,7 @@ fn parse_serve_args(args: impl IntoIterator<Item = String>) -> Result<CliCommand
         relay_proxy_url,
         tls,
         web,
+        control_socket,
     })
 }
 
@@ -672,6 +798,139 @@ fn parse_pair_args(mut args: impl Iterator<Item = String>) -> Result<CliCommand,
     // 解析阶段先拒绝不支持的 URL，避免用户等到网络请求时才看到模糊错误。
     let _ = parse_pairing_base_url(&url)?;
     Ok(CliCommand::Pair { url, qr, qr_svg })
+}
+
+fn parse_offer_file_args(mut args: impl Iterator<Item = String>) -> Result<CliCommand, CliError> {
+    let mut path = None;
+    let mut socket = None;
+    let mut json = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(CliCommand::Help),
+            "--socket" => {
+                if socket.is_some() {
+                    return Err(CliError::UnexpectedArgument(arg));
+                }
+                let value = args.next().ok_or(CliError::MissingOfferSocketValue)?;
+                if value.is_empty() {
+                    return Err(CliError::MissingOfferSocketValue);
+                }
+                socket = Some(PathBuf::from(value));
+            }
+            "--json" => json = true,
+            value if value.starts_with('-') => {
+                return Err(CliError::UnexpectedArgument(value.to_owned()));
+            }
+            value if path.is_none() => path = Some(PathBuf::from(value)),
+            value => return Err(CliError::UnexpectedArgument(value.to_owned())),
+        }
+    }
+    let path = path.ok_or(CliError::MissingOfferFilePath)?;
+    if path.as_os_str().is_empty() {
+        return Err(CliError::MissingOfferFilePath);
+    }
+    Ok(CliCommand::OfferFile { path, socket, json })
+}
+
+fn parse_skill_args(mut args: impl Iterator<Item = String>) -> Result<CliCommand, CliError> {
+    let Some(command) = args.next() else {
+        return Err(CliError::MissingSkillCommand);
+    };
+    match command.as_str() {
+        "-h" | "--help" => Ok(CliCommand::Help),
+        "print" => {
+            ensure_no_remaining_args(args)?;
+            Ok(CliCommand::Skill(SkillCommand::Print))
+        }
+        "status" => {
+            ensure_no_remaining_args(args)?;
+            Ok(CliCommand::Skill(SkillCommand::Status))
+        }
+        "install" => {
+            let mut agent_auto = false;
+            let mut force = false;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--agent" => {
+                        let value = args.next().ok_or(CliError::MissingSkillAgentValue)?;
+                        if value != "auto" || agent_auto {
+                            return Err(CliError::UnsupportedSkillAgent(value));
+                        }
+                        agent_auto = true;
+                    }
+                    "--force" => force = true,
+                    _ => return Err(CliError::UnexpectedArgument(arg)),
+                }
+            }
+            if !agent_auto {
+                return Err(CliError::MissingSkillAgentValue);
+            }
+            Ok(CliCommand::Skill(SkillCommand::Install { force }))
+        }
+        "uninstall" => {
+            let flag = args.next().ok_or(CliError::MissingSkillAgentValue)?;
+            if flag != "--agent" {
+                return Err(CliError::UnexpectedArgument(flag));
+            }
+            let value = args.next().ok_or(CliError::MissingSkillAgentValue)?;
+            if value == "auto" {
+                return Err(CliError::UnsupportedSkillAgent(value));
+            }
+            let agent = value
+                .parse::<SkillAgent>()
+                .map_err(|_| CliError::UnsupportedSkillAgent(value))?;
+            ensure_no_remaining_args(args)?;
+            Ok(CliCommand::Skill(SkillCommand::Uninstall { agent }))
+        }
+        _ => Err(CliError::UnknownSkillCommand(command)),
+    }
+}
+
+fn ensure_no_remaining_args(mut args: impl Iterator<Item = String>) -> Result<(), CliError> {
+    if let Some(argument) = args.next() {
+        Err(CliError::UnexpectedArgument(argument))
+    } else {
+        Ok(())
+    }
+}
+
+fn run_skill_command(command: SkillCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        SkillCommand::Install { force } => {
+            for report in install_auto(force)? {
+                let action = match report.action {
+                    InstallAction::Installed => "installed",
+                    InstallAction::AlreadyCurrent => "already current",
+                    InstallAction::Replaced => "replaced",
+                };
+                println!("{}: {action} ({})", report.agent, report.path.display());
+            }
+        }
+        SkillCommand::Status => {
+            for status in installation_status()? {
+                let state = match status.state {
+                    SkillState::ConfigurationMissing => "agent configuration not detected",
+                    SkillState::NotInstalled => "not installed",
+                    SkillState::Current => "current",
+                    SkillState::Modified => "modified",
+                };
+                match status.path {
+                    Some(path) => println!("{}: {state} ({})", status.agent, path.display()),
+                    None => println!("{}: {state}", status.agent),
+                }
+            }
+        }
+        SkillCommand::Print => print!("{}", bundled_skill()),
+        SkillCommand::Uninstall { agent } => {
+            let report = uninstall_skill(agent)?;
+            let action = match report.action {
+                UninstallAction::Removed => "removed",
+                UninstallAction::AlreadyAbsent => "already absent",
+            };
+            println!("{}: {action} ({})", report.agent, report.path.display());
+        }
+    }
+    Ok(())
 }
 
 fn parse_session_supervisor_args(
@@ -922,6 +1181,91 @@ fn parse_pairing_token_http_response(response: &[u8]) -> Result<PairingTokenResp
     Ok(payload)
 }
 
+#[derive(Debug, Deserialize)]
+struct ControlErrorEnvelope {
+    error: ControlErrorPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlErrorPayload {
+    code: String,
+    message: String,
+}
+
+#[cfg(unix)]
+fn offer_file_over_control_socket(
+    path: &std::path::Path,
+    explicit_socket: Option<&std::path::Path>,
+) -> Result<FileOfferPayload, CliError> {
+    let socket = explicit_socket
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os(CONTROL_SOCKET_ENV).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH));
+    if socket.as_os_str().is_empty() {
+        return Err(CliError::InvalidControlSocketPath);
+    }
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| CliError::LocalIo)?
+            .join(path)
+    };
+    let absolute_path = absolute_path
+        .to_str()
+        .ok_or(CliError::InvalidOfferFilePath)?;
+    let body = serde_json::to_vec(&serde_json::json!({"path": absolute_path}))
+        .map_err(|_| CliError::InvalidJson)?;
+    let mut stream =
+        UnixStream::connect(&socket).map_err(|_| CliError::ControlSocketUnavailable)?;
+    stream
+        .set_read_timeout(Some(CONTROL_SOCKET_HTTP_TIMEOUT))
+        .map_err(|_| CliError::LocalIo)?;
+    stream
+        .set_write_timeout(Some(CONTROL_SOCKET_HTTP_TIMEOUT))
+        .map_err(|_| CliError::LocalIo)?;
+    let request = format!(
+        "POST /v1/file-offers HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.write_all(&body))
+        .map_err(|_| CliError::SendFailed)?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|_| CliError::ReceiveFailed)?;
+    parse_file_offer_http_response(&response)
+}
+
+#[cfg(not(unix))]
+fn offer_file_over_control_socket(
+    _path: &std::path::Path,
+    _explicit_socket: Option<&std::path::Path>,
+) -> Result<FileOfferPayload, CliError> {
+    Err(CliError::ControlSocketUnsupported)
+}
+
+fn parse_file_offer_http_response(response: &[u8]) -> Result<FileOfferPayload, CliError> {
+    let raw = std::str::from_utf8(response).map_err(|_| CliError::InvalidHttpResponse)?;
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or(CliError::InvalidHttpResponse)?;
+    let status = parse_http_status(head)?;
+    if status == 201 {
+        return serde_json::from_str(body).map_err(|_| CliError::InvalidJson);
+    }
+    if let Ok(error) = serde_json::from_str::<ControlErrorEnvelope>(body) {
+        return Err(CliError::ControlRequestRejected {
+            status,
+            code: error.error.code,
+            message: error.error.message,
+        });
+    }
+    Err(CliError::HttpStatus { status })
+}
+
 /// 生成 QR invite 时只保留短期信任材料；连接地址由 Web 当前页面决定。
 fn build_pairing_qr_payload(token: &PairingTokenResponse) -> Result<PairingQrPayload, CliError> {
     Ok(
@@ -988,6 +1332,24 @@ enum CliError {
     MissingRelayProxyValue,
     MissingTlsCertValue,
     MissingTlsKeyValue,
+    MissingControlSocketValue,
+    ConflictingControlSocketOptions,
+    MissingOfferFilePath,
+    MissingOfferSocketValue,
+    InvalidControlSocketPath,
+    InvalidOfferFilePath,
+    ControlSocketUnavailable,
+    #[cfg(not(unix))]
+    ControlSocketUnsupported,
+    ControlRequestRejected {
+        status: u16,
+        code: String,
+        message: String,
+    },
+    MissingSkillCommand,
+    UnknownSkillCommand(String),
+    MissingSkillAgentValue,
+    UnsupportedSkillAgent(String),
     EmptyRelayDaemonTokenValue,
     EmptySecretFilePath(&'static str),
     EmptySecretFile(&'static str),
@@ -1007,7 +1369,9 @@ enum CliError {
     ReceiveFailed,
     LocalIo,
     InvalidHttpResponse,
-    HttpStatus { status: u16 },
+    HttpStatus {
+        status: u16,
+    },
     InvalidJson,
     QrRenderFailed,
     QrSvgWriteFailed,
@@ -1021,7 +1385,7 @@ enum CliError {
 
 impl CliError {
     fn usage() -> &'static str {
-        "usage: termd [--listen 127.0.0.1:8765] [--relay ws://host:port] [--relay-daemon-token <token>|--relay-daemon-token-file <path>] [--relay-proxy http://host:port|socks5://host:port] [--tls-cert <cert.pem> --tls-key <key.pem>] [--web] [pair [--url http://127.0.0.1:8765|https://127.0.0.1:8765] [--qr] [--qr-svg <path>]]\ntry `termd --help` for full help"
+        "usage: termd [DAEMON_OPTIONS] | pair [OPTIONS] | offer-file <PATH> [--socket <PATH>] [--json] | skill <COMMAND>\ntry `termd --help` for full help"
     }
 }
 
@@ -1062,6 +1426,62 @@ impl fmt::Display for CliError {
             }
             Self::MissingTlsKeyValue => {
                 write!(f, "`--tls-key` requires a value\n{}", Self::usage())
+            }
+            Self::MissingControlSocketValue => write!(
+                f,
+                "`--control-socket` requires a non-empty path\n{}",
+                Self::usage()
+            ),
+            Self::ConflictingControlSocketOptions => write!(
+                f,
+                "`--control-socket` and `--no-control-socket` cannot be combined\n{}",
+                Self::usage()
+            ),
+            Self::MissingOfferFilePath => write!(
+                f,
+                "`termd offer-file` requires a file path\n{}",
+                Self::usage()
+            ),
+            Self::MissingOfferSocketValue => {
+                write!(f, "`--socket` requires a non-empty path\n{}", Self::usage())
+            }
+            Self::InvalidControlSocketPath => {
+                write!(f, "daemon control socket path is invalid")
+            }
+            Self::InvalidOfferFilePath => {
+                write!(f, "offered file path is not valid UTF-8")
+            }
+            Self::ControlSocketUnavailable => write!(
+                f,
+                "daemon control socket is unavailable; check TERMD_SOCKET or pass --socket"
+            ),
+            #[cfg(not(unix))]
+            Self::ControlSocketUnsupported => {
+                write!(f, "daemon control sockets are supported only on Unix")
+            }
+            Self::ControlRequestRejected {
+                status,
+                code,
+                message,
+            } => write!(
+                f,
+                "daemon rejected file offer (HTTP {status}, {code}): {message}"
+            ),
+            Self::MissingSkillCommand => write!(
+                f,
+                "`termd skill` requires install, status, print, or uninstall\n{}",
+                Self::usage()
+            ),
+            Self::UnknownSkillCommand(_) => {
+                write!(f, "unknown `termd skill` command\n{}", Self::usage())
+            }
+            Self::MissingSkillAgentValue => write!(
+                f,
+                "`--agent` requires auto, codex, claude, or opencode\n{}",
+                Self::usage()
+            ),
+            Self::UnsupportedSkillAgent(_) => {
+                write!(f, "unsupported skill agent\n{}", Self::usage())
             }
             Self::EmptyRelayDaemonTokenValue => {
                 write!(
@@ -1139,9 +1559,9 @@ impl fmt::Display for CliError {
                 )
             }
             Self::ConnectFailed => write!(f, "failed to connect to the running termd daemon"),
-            Self::SendFailed => write!(f, "failed to send pairing token request"),
-            Self::ReceiveFailed => write!(f, "failed to read pairing token response"),
-            Self::LocalIo => write!(f, "local IO error while requesting pairing token"),
+            Self::SendFailed => write!(f, "failed to send daemon HTTP request"),
+            Self::ReceiveFailed => write!(f, "failed to read daemon HTTP response"),
+            Self::LocalIo => write!(f, "local daemon HTTP IO failed"),
             Self::InvalidHttpResponse => write!(f, "daemon returned an invalid HTTP response"),
             Self::HttpStatus { status } => {
                 write!(
@@ -1181,6 +1601,7 @@ mod tests {
                 relay_proxy_url: None,
                 tls: None,
                 web: false,
+                control_socket: Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH)),
             }
         );
     }
@@ -1206,6 +1627,104 @@ mod tests {
         assert!(HELP_TEXT.contains("termd install [OPTIONS]"));
         assert!(HELP_TEXT.contains("termd uninstall [OPTIONS]"));
         assert!(HELP_TEXT.contains("termd upgrade [OPTIONS]"));
+        assert!(HELP_TEXT.contains("termd offer-file <PATH>"));
+        assert!(HELP_TEXT.contains("termd skill install --agent auto"));
+    }
+
+    #[test]
+    fn parses_control_socket_and_explicit_disable() {
+        let custom = PathBuf::from("/tmp/termd-control-test.sock");
+        assert!(matches!(
+            CliCommand::parse([
+                "--control-socket".to_owned(),
+                custom.to_string_lossy().into_owned(),
+            ])
+            .unwrap(),
+            CliCommand::Serve { control_socket: Some(path), .. } if path == custom
+        ));
+        assert!(matches!(
+            CliCommand::parse(["--no-control-socket".to_owned()]).unwrap(),
+            CliCommand::Serve {
+                control_socket: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            CliCommand::parse([
+                "--control-socket".to_owned(),
+                "/tmp/termd.sock".to_owned(),
+                "--no-control-socket".to_owned(),
+            ])
+            .unwrap_err(),
+            CliError::ConflictingControlSocketOptions
+        ));
+    }
+
+    #[test]
+    fn parses_offer_file_and_skill_commands() {
+        assert_eq!(
+            CliCommand::parse([
+                "offer-file".to_owned(),
+                "report.zip".to_owned(),
+                "--socket".to_owned(),
+                "/run/custom.sock".to_owned(),
+                "--json".to_owned(),
+            ])
+            .unwrap(),
+            CliCommand::OfferFile {
+                path: PathBuf::from("report.zip"),
+                socket: Some(PathBuf::from("/run/custom.sock")),
+                json: true,
+            }
+        );
+        assert_eq!(
+            CliCommand::parse([
+                "skill".to_owned(),
+                "install".to_owned(),
+                "--agent".to_owned(),
+                "auto".to_owned(),
+                "--force".to_owned(),
+            ])
+            .unwrap(),
+            CliCommand::Skill(SkillCommand::Install { force: true })
+        );
+        assert_eq!(
+            CliCommand::parse([
+                "skill".to_owned(),
+                "uninstall".to_owned(),
+                "--agent".to_owned(),
+                "codex".to_owned(),
+            ])
+            .unwrap(),
+            CliCommand::Skill(SkillCommand::Uninstall {
+                agent: SkillAgent::Codex,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_file_offer_http_success_and_structured_error() {
+        let offer = FileOfferPayload {
+            offer_id: uuid::Uuid::new_v4(),
+            name: "report.zip".to_owned(),
+            path: "/tmp/report.zip".to_owned(),
+            size_bytes: 4,
+            created_at_ms: UnixTimestampMillis(10),
+            expires_at_ms: UnixTimestampMillis(20),
+        };
+        let success = format!(
+            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n{}",
+            serde_json::to_string(&offer).unwrap()
+        );
+        assert_eq!(
+            parse_file_offer_http_response(success.as_bytes()).unwrap(),
+            offer
+        );
+        let rejected = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":{\"code\":\"file_not_regular\",\"message\":\"offered path is not a regular file\",\"retryable\":false}}";
+        assert!(matches!(
+            parse_file_offer_http_response(rejected).unwrap_err(),
+            CliError::ControlRequestRejected { status: 400, code, .. } if code == "file_not_regular"
+        ));
     }
 
     #[test]
@@ -1258,6 +1777,7 @@ mod tests {
                 relay_proxy_url: None,
                 tls: None,
                 web: false,
+                control_socket: Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH)),
             }
         );
     }
@@ -1276,6 +1796,7 @@ mod tests {
                 relay_proxy_url: None,
                 tls: None,
                 web: false,
+                control_socket: Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH)),
             }
         );
     }
@@ -1291,6 +1812,7 @@ mod tests {
                 relay_proxy_url: None,
                 tls: None,
                 web: false,
+                control_socket: Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH)),
             }
         );
         assert_eq!(
@@ -1303,6 +1825,7 @@ mod tests {
                 relay_proxy_url: None,
                 tls: None,
                 web: false,
+                control_socket: Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH)),
             }
         );
     }
@@ -1318,6 +1841,7 @@ mod tests {
                 relay_proxy_url: None,
                 tls: None,
                 web: false,
+                control_socket: Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH)),
             }
         );
     }
@@ -1347,6 +1871,7 @@ mod tests {
                 relay_proxy_url: None,
                 tls: None,
                 web: true,
+                control_socket: Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH)),
             }
         );
     }
@@ -1583,6 +2108,7 @@ mod tests {
                     "/etc/termd/secret-key.pem"
                 )),
                 web: false,
+                control_socket: Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH)),
             }
         );
         assert!(!format!("{command:?}").contains("secret-key.pem"));
@@ -1614,6 +2140,7 @@ mod tests {
                 relay_proxy_url: None,
                 tls: None,
                 web: false,
+                control_socket: Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH)),
             }
         );
         let rendered = format!("{command:?}");
@@ -1637,6 +2164,7 @@ mod tests {
                 relay_proxy_url: Some("http://127.0.0.1:3128".to_owned()),
                 tls: None,
                 web: false,
+                control_socket: Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH)),
             }
         );
 
@@ -1655,6 +2183,7 @@ mod tests {
                 relay_proxy_url: Some("socks5://127.0.0.1:1080".to_owned()),
                 tls: None,
                 web: false,
+                control_socket: Some(PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH)),
             }
         );
     }

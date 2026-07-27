@@ -6,6 +6,7 @@ import {
   forgetDaemon,
   loadBrowserState,
   recordPairing,
+  recordBrowserNotificationPrompted,
   recordServerUrl,
   renameDaemon,
   saveBrowserPreferences,
@@ -199,8 +200,8 @@ describe("浏览器本地状态", () => {
 
   it("持久化客户端偏好，并对旧数据或异常值做安全归一化", async () => {
     const next = await saveBrowserPreferences({ language: "zh-CN", theme: "light" });
-    expect(next.preferences).toEqual({ language: "zh-CN", theme: "light", notifications: "off", mobileShortcuts: [] });
-    expect((await loadBrowserState()).preferences).toEqual({ language: "zh-CN", theme: "light", notifications: "off", mobileShortcuts: [] });
+    expect(next.preferences).toEqual({ language: "zh-CN", theme: "light", mobileShortcuts: [] });
+    expect((await loadBrowserState()).preferences).toEqual({ language: "zh-CN", theme: "light", mobileShortcuts: [] });
 
     await saveBrowserState({
       pairedServers: [],
@@ -210,14 +211,13 @@ describe("浏览器本地状态", () => {
       },
     } as unknown as BrowserState);
 
-    expect((await loadBrowserState()).preferences).toEqual({ language: "auto", theme: "system", notifications: "off", mobileShortcuts: [] });
+    expect((await loadBrowserState()).preferences).toEqual({ language: "auto", theme: "system", mobileShortcuts: [] });
   });
 
-  it("持久化移动端快捷键和通知偏好，并过滤异常快捷键", async () => {
+  it("持久化移动端快捷键、丢弃旧通知偏好，并过滤异常快捷键", async () => {
     const next = await saveBrowserPreferences({
       language: "en-US",
       theme: "dark",
-      notifications: "mentions",
       mobileShortcuts: [
         { label: "PgUp", data: "\x1b[5~" },
         { label: "", data: "ignored" },
@@ -228,9 +228,21 @@ describe("浏览器本地状态", () => {
     expect(next.preferences).toEqual({
       language: "en-US",
       theme: "dark",
-      notifications: "mentions",
       mobileShortcuts: [{ label: "PgUp", data: "\x1b[5~" }],
     });
+
+    await saveBrowserState({
+      ...(await loadBrowserState()),
+      preferences: { ...next.preferences, notifications: "all" },
+    } as unknown as BrowserState);
+    expect((await loadBrowserState()).preferences).not.toHaveProperty("notifications");
+  });
+
+  it("只持久化一次性的浏览器通知权限引导标志", async () => {
+    await expect(recordBrowserNotificationPrompted()).resolves.toMatchObject({
+      browserNotificationPrompted: true,
+    });
+    expect(await loadBrowserState()).toMatchObject({ browserNotificationPrompted: true });
   });
 });
 

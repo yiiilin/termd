@@ -1,5 +1,4 @@
 import type {
-  BrowserNotificationPreference,
   DeviceState,
   PairedServerState,
 } from "./protocol/types";
@@ -21,10 +20,9 @@ interface PushConfigResponse {
 
 const REMOTE_PUSH_CLEANUP_TIMEOUT_MS = 5_000;
 
-export interface BrowserPushPreferenceSync {
+export interface BrowserPushSubscriptionSync {
   device: DeviceState;
   servers: readonly PairedServerState[];
-  preference: BrowserNotificationPreference;
   locale: "zh-CN" | "en-US";
 }
 
@@ -88,27 +86,19 @@ export async function unsubscribeBrowserPush(serverId: string): Promise<void> {
   await registration.unregister();
 }
 
-export async function syncBrowserPushPreference(input: BrowserPushPreferenceSync): Promise<void> {
+export async function syncBrowserPushSubscriptions(input: BrowserPushSubscriptionSync): Promise<void> {
   const servers = input.servers.filter((server) => Boolean(server.device_certificate));
-  if (
-    input.preference !== "off" &&
-    (!supportsBrowserPush() || Notification.permission !== "granted")
-  ) {
+  if (!supportsBrowserPush() || Notification.permission !== "granted") {
     return;
   }
-  await Promise.allSettled(servers.map((server) => syncServerPushPreference(server, input)));
+  await Promise.allSettled(servers.map((server) => syncServerPushSubscription(server, input)));
 }
 
-async function syncServerPushPreference(
+async function syncServerPushSubscription(
   server: PairedServerState,
-  input: BrowserPushPreferenceSync,
+  input: BrowserPushSubscriptionSync,
 ): Promise<void> {
   let client: V070Client | undefined;
-  if (input.preference === "off") {
-    await removeBrowserPushForServer(server, input.device);
-    return;
-  }
-
   try {
     client = await V070Client.connect(server, input.device);
     const configResponse = await client.requestPush("/api/push/config", { method: "GET" });
@@ -129,7 +119,6 @@ async function syncServerPushPreference(
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         ...subscription,
-        mode: input.preference === "mentions" ? "attention" : "all",
         locale: input.locale,
       }),
     });

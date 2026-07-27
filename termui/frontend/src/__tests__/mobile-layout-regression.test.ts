@@ -110,6 +110,43 @@ describe("mobile layout regressions", () => {
     expect(buttonBlock).not.toContain("align-items: flex-end;");
   });
 
+  it("floats file offers without reserving terminal layout space", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const mobileRules = cssPreferenceBlock(css, "max-width: 760px");
+    const transparencyRules = cssPreferenceBlock(css, "prefers-reduced-transparency: reduce");
+    const motionRules = cssPreferenceBlock(css, "prefers-reduced-motion: reduce");
+
+    expect(cssDeclarations(css, ".workspace")).toMatchObject({
+      position: "relative",
+      "grid-template-rows": "var(--deck-toolbar-height) minmax(0, 1fr) var(--deck-status-height)",
+    });
+    expect(cssDeclarations(css, ".file-offer-center")).toMatchObject({
+      position: "absolute",
+      "z-index": "20",
+      "pointer-events": "none",
+    });
+    expect(cssDeclarations(css, ".file-offer-card")).toMatchObject({
+      "pointer-events": "auto",
+      animation: "file-offer-enter 180ms var(--ease-out-ui) both",
+    });
+    expect(cssDeclarations(mobileRules, ".workspace")).toMatchObject({
+      "grid-template-rows": "var(--mobile-toolbar-height) minmax(0, 1fr) var(--mobile-status-height)",
+    });
+    expect(cssDeclarations(mobileRules, ".file-offer-center")).toMatchObject({
+      left: "calc(8px + env(safe-area-inset-left, 0px))",
+      right: "calc(8px + env(safe-area-inset-right, 0px))",
+      width: "auto",
+    });
+    expect(cssDeclarations(transparencyRules, ".file-offer-card")).toMatchObject({
+      background: "var(--color-surface)",
+      "backdrop-filter": "none",
+    });
+    expect(cssDeclarations(motionRules, ".file-offer-card")).toMatchObject({
+      animation: "file-offer-fade-in 120ms ease-out both",
+      transform: "none",
+    });
+  });
+
   it("keeps narrow settings labels readable and short touch workspaces within their rows", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
     const narrowRules = cssPreferenceBlock(css, "max-width: 360px");

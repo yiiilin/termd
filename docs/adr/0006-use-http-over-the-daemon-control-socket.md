@@ -1,0 +1,3 @@
+# Use HTTP over the daemon control socket
+
+The Daemon Control Protocol uses versioned HTTP/1.1 routes with JSON bodies over `/run/termd/termd.sock` instead of custom message framing. It has a dedicated narrow router whose routes are never mounted on the network listener or admitted by the relay; successful Unix-socket access is the request authorization. `termd offer-file` selects its target in this order: explicit `--socket`, `TERMD_SOCKET`, then `/run/termd/termd.sock`; a daemon with a custom path listens through `--control-socket`, and clients never discover or scan for daemon sockets automatically.

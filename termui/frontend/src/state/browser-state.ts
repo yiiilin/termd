@@ -22,7 +22,6 @@ interface NormalizeRouteWsUrlOptions {
 export const DEFAULT_BROWSER_PREFERENCES: BrowserPreferences = {
   language: "auto",
   theme: "system",
-  notifications: "off",
   mobileShortcuts: [],
 };
 
@@ -160,6 +159,13 @@ export async function saveBrowserPreferences(preferences: BrowserPreferences): P
   return next;
 }
 
+export async function recordBrowserNotificationPrompted(): Promise<BrowserState> {
+  const state = await loadBrowserState();
+  const next = normalizeState({ ...state, browserNotificationPrompted: true });
+  await saveBrowserState(next);
+  return next;
+}
+
 export async function selectDefaultServer(serverId: string): Promise<BrowserState> {
   const state = await loadBrowserState();
   const server = state.pairedServers.find((candidate) => candidate.server_id === serverId);
@@ -221,6 +227,7 @@ function normalizeState(state: BrowserState): BrowserState {
     defaultServerId: state.defaultServerId,
     defaultUrl,
     preferences: normalizePreferences(state.preferences),
+    ...(state.browserNotificationPrompted === true ? { browserNotificationPrompted: true } : {}),
   };
 }
 
@@ -228,12 +235,10 @@ function normalizePreferences(value: unknown): BrowserPreferences {
   const source = isObjectRecord(value) ? value : {};
   const language = normalizeLanguagePreference(source.language);
   const theme = normalizeThemePreference(source.theme);
-  const notifications = normalizeNotificationPreference(source.notifications);
   const mobileShortcuts = normalizeMobileShortcuts(source.mobileShortcuts);
   return {
     language,
     theme,
-    notifications,
     mobileShortcuts,
   };
 }
@@ -250,13 +255,6 @@ function normalizeThemePreference(value: unknown): BrowserThemePreference {
     return value;
   }
   return DEFAULT_BROWSER_PREFERENCES.theme;
-}
-
-function normalizeNotificationPreference(value: unknown): BrowserPreferences["notifications"] {
-  if (value === "off" || value === "mentions" || value === "all") {
-    return value;
-  }
-  return DEFAULT_BROWSER_PREFERENCES.notifications;
 }
 
 function normalizeMobileShortcuts(value: unknown): BrowserPreferences["mobileShortcuts"] {

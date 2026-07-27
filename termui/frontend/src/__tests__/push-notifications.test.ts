@@ -5,7 +5,7 @@ import {
   pushServiceWorkerScope,
   removeBrowserPushForServer,
   subscribeBrowserPush,
-  syncBrowserPushPreference,
+  syncBrowserPushSubscriptions,
   unsubscribeBrowserPush,
 } from "../push-notifications";
 import type { DeviceState, PairedServerState } from "../protocol/types";
@@ -14,6 +14,7 @@ import { V070Client } from "../protocol/v070-client";
 const SERVER_ID = "92ae2d30-ea7f-4bb7-90a6-56d4a70a5890";
 const SECOND_SERVER_ID = "f065aee3-5f1e-46a7-83cd-59bfb64b9989";
 const SESSION_ID = "f7ad50c5-8b33-41ae-a95e-7aab7afb5e7f";
+const OFFER_ID = "4bc18e84-1eb3-4c58-9d72-72cb3208baf8";
 const APPLICATION_SERVER_KEY =
   "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4";
 
@@ -131,7 +132,7 @@ describe("浏览器 Push 生命周期", () => {
     expect(worker.removeEventListener).toHaveBeenCalledTimes(1);
   });
 
-  it("把全局 mentions 偏好同步到所有带设备证书的 daemon", async () => {
+  it("把通知订阅同步到所有带设备证书的 daemon，且不发送模式", async () => {
     const subscription = {
       endpoint: "https://push.example.test/subscription",
       options: { applicationServerKey: undefined },
@@ -167,10 +168,9 @@ describe("浏览器 Push 生命周期", () => {
       close: vi.fn(),
     } as unknown as V070Client));
 
-    await syncBrowserPushPreference({
+    await syncBrowserPushSubscriptions({
       device: testDevice(),
       servers: [testServer(SERVER_ID), testServer(SECOND_SERVER_ID), testServer(SESSION_ID, false)],
-      preference: "mentions",
       locale: "zh-CN",
     });
 
@@ -181,57 +181,26 @@ describe("浏览器 Push 生命周期", () => {
         ["/api/push/config", "GET"],
         ["/api/push/subscription", "PUT"],
       ]);
-      expect(JSON.parse(String(calls?.[1]?.init?.body))).toMatchObject({
+      expect(JSON.parse(String(calls?.[1]?.init?.body))).toEqual({
         endpoint: "https://push.example.test/subscription",
-        mode: "attention",
+        keys: { p256dh: APPLICATION_SERVER_KEY, auth: "BTBZMqHH6r4Tts7J_aSIgg" },
         locale: "zh-CN",
       });
     }
     expect(register).toHaveBeenCalledTimes(2);
   });
 
-  it("关闭偏好时先删除 daemon 订阅，再清理本地 registration", async () => {
-    const operations: string[] = [];
-    const unregister = vi.fn(async () => {
-      operations.push("unregister");
-      return true;
-    });
-    vi.stubGlobal("navigator", {
-      serviceWorker: {
-        getRegistration: vi.fn(async () => ({
-          pushManager: {
-            getSubscription: vi.fn(async () => ({
-              endpoint: "https://push.example.test/subscription",
-              unsubscribe: vi.fn(async () => {
-                operations.push("unsubscribe");
-                return true;
-              }),
-            })),
-          },
-          unregister,
-        })),
-      },
-    });
-    vi.spyOn(V070Client, "connect").mockResolvedValue({
-      serverId: SERVER_ID,
-      requestPush: vi.fn(async (_path: string, init?: RequestInit) => {
-        operations.push("delete");
-        expect(JSON.parse(String(init?.body))).toEqual({
-          endpoint: "https://push.example.test/subscription",
-        });
-        return new Response(null, { status: 204 });
-      }),
-      close: vi.fn(),
-    } as unknown as V070Client);
+  it("权限未授予时不创建或更新订阅", async () => {
+    const connect = vi.spyOn(V070Client, "connect");
+    vi.stubGlobal("Notification", class { static permission = "denied"; });
 
-    await syncBrowserPushPreference({
+    await syncBrowserPushSubscriptions({
       device: testDevice(),
       servers: [testServer(SERVER_ID)],
-      preference: "off",
       locale: "en-US",
     });
 
-    expect(operations).toEqual(["delete", "unsubscribe", "unregister"]);
+    expect(connect).not.toHaveBeenCalled();
   });
 
   it("忘记离线 daemon 时仍通过本地 unsubscribe 使旧 endpoint 失效", async () => {
@@ -388,6 +357,75 @@ describe("实际 service worker 事件", () => {
     );
     expect(focus).toHaveBeenCalledTimes(1);
     expect(worker.self.clients.openWindow).not.toHaveBeenCalled();
+  });
+
+  it("文件 offer 只显示通用文案且不泄漏文件 metadata", async () => {
+    const worker = await loadWorker(
+      `https://termd.test/termd/.termd-push/${SERVER_ID}/`,
+    );
+    worker.self.clients.matchAll.mockResolvedValue([
+      { url: "https://termd.test/termd/", visibilityState: "hidden" },
+    ]);
+
+    await dispatchWaitUntil(worker.listeners.push, {
+      data: {
+        json: () => ({
+          version: 1,
+          kind: "file_offer",
+          server_id: SERVER_ID,
+          offer_id: OFFER_ID,
+          name: "private-report.zip",
+          path: "/secret/private-report.zip",
+          size_bytes: 987654,
+        }),
+      },
+    });
+
+    expect(worker.self.registration.showNotification).toHaveBeenCalledWith(
+      "Termd",
+      expect.objectContaining({
+        body: "A file is ready. Open Termd to download it.",
+        tag: `termd-file-offer-${SERVER_ID}-${OFFER_ID}`,
+        data: { kind: "file_offer", server_id: SERVER_ID, offer_id: OFFER_ID },
+      }),
+    );
+    const options = JSON.stringify(worker.self.registration.showNotification.mock.calls[0]?.[1]);
+    expect(options).not.toContain("private-report.zip");
+    expect(options).not.toContain("/secret/");
+    expect(options).not.toContain("987654");
+  });
+
+  it("点击文件 offer 通知只恢复对应 daemon 的 App prompt", async () => {
+    const worker = await loadWorker(
+      `https://termd.test/termd/.termd-push/${SERVER_ID}/`,
+    );
+    worker.self.clients.matchAll.mockResolvedValue([]);
+
+    await dispatchWaitUntil(worker.listeners.notificationclick, {
+      notification: {
+        data: { kind: "file_offer", server_id: SERVER_ID, offer_id: OFFER_ID },
+        close: vi.fn(),
+      },
+    });
+
+    expect(worker.self.clients.openWindow).toHaveBeenCalledWith(
+      `https://termd.test/termd/?termd_server_id=${SERVER_ID}&termd_offer_id=${OFFER_ID}`,
+    );
+  });
+
+  it("拒绝跨 daemon 或非法 offer id 的文件 Push", async () => {
+    const worker = await loadWorker(
+      `https://termd.test/termd/.termd-push/${SERVER_ID}/`,
+    );
+    for (const payload of [
+      { version: 1, kind: "file_offer", server_id: SECOND_SERVER_ID, offer_id: OFFER_ID },
+      { version: 1, kind: "file_offer", server_id: SERVER_ID, offer_id: "../secret" },
+    ]) {
+      await dispatchWaitUntil(worker.listeners.push, { data: { json: () => payload } });
+    }
+
+    expect(worker.self.clients.matchAll).not.toHaveBeenCalled();
+    expect(worker.self.registration.showNotification).not.toHaveBeenCalled();
   });
 
   it("拒绝非法 payload，并在没有应用窗口时打开可信目标", async () => {

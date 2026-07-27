@@ -6,6 +6,8 @@ import type {
   DaemonStatusResultPayload,
   DeviceState,
   Envelope,
+  FileOfferDownloadReadyPayload,
+  FileOfferPayload,
   PairedServerState,
   SessionAttachedPayload,
   SessionClosedPayload,
@@ -60,6 +62,7 @@ const FILE_CHUNK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const METADATA_RECONNECT_BASE_DELAY_MS = 100;
 const METADATA_RECONNECT_MAX_DELAY_MS = 2_000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function isRawFileTransferRequest(path: string, method?: string): boolean {
   const normalizedMethod = (method ?? "GET").toUpperCase();
@@ -104,6 +107,7 @@ export class V070Client {
     state: WorkspaceMetadataState,
     deliveryKind: MetadataDeliveryKind,
   ) => void>();
+  private fileOfferListeners = new Set<(offer: FileOfferPayload) => void>();
   private terminalSessionId?: UUID;
   private terminalOpen?: PendingTerminalOpen;
   private terminalGeneration = 0;
@@ -156,6 +160,11 @@ export class V070Client {
       listener(this.metadataRevision, this.metadataState, "snapshot");
     }
     return () => this.metadataListeners.delete(listener);
+  }
+
+  watchFileOffers(listener: (offer: FileOfferPayload) => void): () => void {
+    this.fileOfferListeners.add(listener);
+    return () => this.fileOfferListeners.delete(listener);
   }
 
   async listSessions(): Promise<SessionListResultPayload> {
@@ -301,6 +310,66 @@ export class V070Client {
 
   async requestPush(path: PushApiPath, init: RequestInit = {}): Promise<Response> {
     return this.httpRequest(path, init);
+  }
+
+  async resolveFileOffer(offerId: UUID): Promise<FileOfferPayload> {
+    requireUuid(offerId, "offer_id");
+    const response = await this.fileJson(`/api/files/offers/${offerId}`, { method: "GET" });
+    const offer = parseFileOffer(response);
+    if (!offer || offer.offer_id !== offerId) {
+      throw new ProtocolClientError("invalid_file_offer", "file offer response is invalid");
+    }
+    return offer;
+  }
+
+  async prepareFileOfferDownload(offerId: UUID): Promise<FileOfferDownloadReadyPayload> {
+    requireUuid(offerId, "offer_id");
+    const response = await this.fileJson(`/api/files/offers/${offerId}/downloads`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+      credentials: "include",
+    });
+    if (
+      !isObjectRecord(response) ||
+      typeof response.download_id !== "string" || !UUID_PATTERN.test(response.download_id) ||
+      typeof response.download_url !== "string" || response.download_url.length === 0 ||
+      typeof response.name !== "string" || response.name.length === 0 ||
+      !Number.isSafeInteger(response.size_bytes) || (response.size_bytes as number) < 0 ||
+      !Number.isSafeInteger(response.expires_at_ms) || (response.expires_at_ms as number) < 0
+    ) {
+      throw new ProtocolClientError("invalid_file_download", "file offer download response is invalid");
+    }
+    const ready: FileOfferDownloadReadyPayload = {
+      download_id: response.download_id,
+      download_url: response.download_url,
+      name: response.name,
+      size_bytes: response.size_bytes as number,
+      expires_at_ms: response.expires_at_ms as number,
+    };
+    this.fileOfferDownloadUrl(ready);
+    return ready;
+  }
+
+  fileOfferDownloadUrl(ready: FileOfferDownloadReadyPayload): string {
+    requireUuid(ready.download_id, "download_id");
+    const applicationBase = new URL(applicationHttpUrl(this.server.url, "/"));
+    let downloadUrl: URL;
+    try {
+      downloadUrl = new URL(ready.download_url, applicationBase);
+    } catch {
+      throw new ProtocolClientError("invalid_file_download", "file offer download URL is invalid");
+    }
+    if (
+      downloadUrl.origin !== applicationBase.origin ||
+      downloadUrl.username ||
+      downloadUrl.password ||
+      downloadUrl.hash ||
+      downloadUrl.pathname !== `/api/files/offer-downloads/${ready.download_id}`
+    ) {
+      throw new ProtocolClientError("invalid_file_download", "file offer download URL is invalid");
+    }
+    return downloadUrl.toString();
   }
 
   async listSessionFiles(sessionId: UUID, path?: string): Promise<any> {
@@ -546,6 +615,12 @@ export class V070Client {
     try {
       message = JSON.parse(data);
     } catch {
+      return;
+    }
+    if (message.type === "file.offer") {
+      const offer = parseFileOffer(message.payload);
+      if (!offer) return;
+      for (const listener of this.fileOfferListeners) listener(offer);
       return;
     }
     if (message.type === "error") {
@@ -854,4 +929,36 @@ export class V070Client {
       body?.error?.message ?? "request failed",
     );
   }
+}
+
+function parseFileOffer(value: unknown): FileOfferPayload | undefined {
+  if (!isObjectRecord(value)) return undefined;
+  if (
+    typeof value.offer_id !== "string" || !UUID_PATTERN.test(value.offer_id) ||
+    typeof value.name !== "string" || value.name.length === 0 ||
+    typeof value.path !== "string" || !value.path.startsWith("/") ||
+    !Number.isSafeInteger(value.size_bytes) || (value.size_bytes as number) < 0 ||
+    !Number.isSafeInteger(value.created_at_ms) || (value.created_at_ms as number) < 0 ||
+    !Number.isSafeInteger(value.expires_at_ms) || (value.expires_at_ms as number) < (value.created_at_ms as number)
+  ) {
+    return undefined;
+  }
+  return {
+    offer_id: value.offer_id,
+    name: value.name,
+    path: value.path,
+    size_bytes: value.size_bytes as number,
+    created_at_ms: value.created_at_ms as number,
+    expires_at_ms: value.expires_at_ms as number,
+  };
+}
+
+function requireUuid(value: string, field: string): void {
+  if (!UUID_PATTERN.test(value)) {
+    throw new ProtocolClientError("invalid_file_offer", `${field} is invalid`);
+  }
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

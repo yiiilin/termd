@@ -3,8 +3,10 @@
 //! 当前公开 PTY、session/control 和设备级 auth 基础模块。WebSocket、relay
 //! 和持久化会在后续优先级中接入，避免把 daemon 过早做成复杂平台。
 
+pub mod agent_skill;
 pub mod auth;
 pub mod config;
+pub mod file_offer;
 pub mod net;
 pub mod notifications;
 pub mod pty;

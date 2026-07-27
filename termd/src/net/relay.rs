@@ -20,7 +20,7 @@ use termd_proto::{
     RouteReadyPayload as ProtoRouteReadyPayload, RouteRole as ProtoRouteRole, ServerId, SessionId,
     decode_relay_data_control, decode_relay_http_tunnel_frame,
     encode_relay_http_tunnel_response_body, encode_relay_http_tunnel_response_end,
-    encode_relay_http_tunnel_response_head_with_headers,
+    encode_relay_http_tunnel_response_head_with_headers, is_http_tunnel_path_allowed,
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1136,13 +1136,14 @@ async fn run_relay_v070_metadata(
     writer_failed_rx: &mut mpsc::Receiver<()>,
 ) -> Result<(), RelayConnectorError> {
     let mut revision = 1_u64;
-    let (mut changes, mut previous) = {
+    let (mut changes, mut file_offers, mut previous) = {
         let mut guard = protocol.lock().await;
         let changes = guard.v070_metadata_signal();
+        let file_offers = guard.file_offer_events();
         let payload = guard
             .v070_metadata_payload(device_id)
             .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
-        (changes, payload)
+        (changes, file_offers, payload)
     };
     enqueue_v070_json(
         write_tx,
@@ -1180,6 +1181,20 @@ async fn run_relay_v070_metadata(
                     enqueue_v070_json(write_tx, "metadata.update", serde_json::json!({
                         "revision": revision, "state": current
                     })).await?;
+                }
+            },
+            offer = file_offers.recv() => match offer {
+                Ok(offer) => enqueue_v070_json(
+                    write_tx,
+                    "file.offer",
+                    serde_json::to_value(offer).map_err(|_| RelayConnectorError::InvalidEnvelope)?,
+                ).await?,
+                // create_file_offer prevents queue overwrite; fail closed if that invariant regresses.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    return Err(RelayConnectorError::SendFailed);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(RelayConnectorError::ReceiveFailed);
                 }
             },
             failed = writer_failed_rx.recv() => {
@@ -1579,7 +1594,10 @@ async fn cleanup_relay_http_tunnel_response_task(
 }
 
 fn is_relay_http_tunnel_download(method: &str, path: &str) -> bool {
-    method.eq_ignore_ascii_case("POST") && path == "/api/files/download"
+    method.eq_ignore_ascii_case("GET")
+        && is_http_tunnel_path_allowed(method, path)
+        && (path.starts_with("/api/files/downloads/")
+            || path.starts_with("/api/files/offer-downloads/"))
 }
 
 async fn send_relay_http_tunnel_response(
@@ -2497,6 +2515,26 @@ mod tests {
     };
 
     use crate::auth::AccessTokenProofInput;
+
+    #[test]
+    fn relay_download_disconnect_detection_covers_current_streaming_routes_only() {
+        assert!(is_relay_http_tunnel_download(
+            "GET",
+            "/api/files/downloads/00000000-0000-4000-8000-000000000701"
+        ));
+        assert!(is_relay_http_tunnel_download(
+            "GET",
+            "/api/files/offer-downloads/00000000-0000-4000-8000-000000000702"
+        ));
+        assert!(!is_relay_http_tunnel_download(
+            "POST",
+            "/api/files/offers/00000000-0000-4000-8000-000000000601/downloads"
+        ));
+        assert!(!is_relay_http_tunnel_download(
+            "GET",
+            "/api/files/offer-downloads/not-a-download-id"
+        ));
+    }
 
     async fn relay_access_token_for_test(protocol: &SharedDaemonProtocol) -> String {
         let signing_key = SigningKey::generate(&mut OsRng);

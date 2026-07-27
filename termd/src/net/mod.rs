@@ -4,6 +4,8 @@
 //! trusted relay 可以看到 TLS 终止后的明文应用流量；pairing、challenge-response、
 //! operator 和 session 权限仍由 daemon 校验。
 
+#[cfg(unix)]
+pub mod control;
 pub mod protocol;
 pub mod pty_bridge;
 pub mod relay;

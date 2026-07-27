@@ -1,6 +1,6 @@
-import { Bell, Keyboard, MonitorCog, Palette, Languages, X } from "lucide-react";
+import { Keyboard, MonitorCog, Palette, Languages, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { BrowserNotificationPreference, BrowserPreferences, BrowserLanguagePreference, BrowserThemePreference, EffectiveTheme } from "../protocol/types";
+import type { BrowserPreferences, BrowserLanguagePreference, BrowserThemePreference, EffectiveTheme } from "../protocol/types";
 import { useI18n, type Locale } from "../i18n";
 import { useModalFocus } from "./useModalFocus";
 
@@ -40,7 +40,6 @@ export function SettingsDialog({
 
   const setLanguage = (language: BrowserLanguagePreference) => onPreferencesChange({ ...preferences, language });
   const setTheme = (theme: BrowserThemePreference) => onPreferencesChange({ ...preferences, theme });
-  const setNotifications = (notifications: BrowserNotificationPreference) => onPreferencesChange({ ...preferences, notifications });
   const mobileShortcutsValidation = parseMobileShortcutsText(mobileShortcutsDraft);
   const mobileShortcutsDirty = mobileShortcutsDraft !== committedMobileShortcutsText;
   const mobileShortcutsError = mobileShortcutsValidation.error
@@ -127,27 +126,6 @@ export function SettingsDialog({
 
           <fieldset className="settings-fieldset">
             <legend>
-              <Bell size={15} aria-hidden="true" />
-              <span>{t("settings.notifications")}</span>
-            </legend>
-            <div className="settings-segmented" role="radiogroup" aria-label={t("settings.notifications")}>
-              {notificationOptions.map((option) => (
-                <label key={option.value}>
-                  <input
-                    type="radio"
-                    name="termd-notifications"
-                    value={option.value}
-                    checked={(preferences.notifications ?? "off") === option.value}
-                    onChange={() => setNotifications(option.value)}
-                  />
-                  <span>{t(option.labelKey)}</span>
-                </label>
-              ))}
-            </div>
-          </fieldset>
-
-          <fieldset className="settings-fieldset">
-            <legend>
               <Keyboard size={15} aria-hidden="true" />
               <span>{t("settings.mobileShortcuts")}</span>
             </legend>
@@ -198,12 +176,6 @@ const themeOptions: Array<{ value: BrowserThemePreference; labelKey: "settings.t
   { value: "system", labelKey: "settings.theme.system" },
   { value: "dark", labelKey: "settings.theme.dark" },
   { value: "light", labelKey: "settings.theme.light" },
-];
-
-const notificationOptions: Array<{ value: BrowserNotificationPreference; labelKey: "settings.notifications.off" | "settings.notifications.mentions" | "settings.notifications.all" }> = [
-  { value: "off", labelKey: "settings.notifications.off" },
-  { value: "mentions", labelKey: "settings.notifications.mentions" },
-  { value: "all", labelKey: "settings.notifications.all" },
 ];
 
 function localeLabelKey(locale: Locale): "settings.language.zhCN" | "settings.language.enUS" {

@@ -1609,7 +1609,11 @@ test_termd_default_install_uses_managed_user() (
   assert_file_contains "$unit_file" "Group=termd"
   assert_file_contains "$unit_file" "WorkingDirectory=${unit_file%.service}-state"
   assert_file_contains "$unit_file" "EnvironmentFile=-${tmp_dir}/termd.env"
+  assert_file_contains "$unit_file" "RuntimeDirectory=termd"
+  assert_file_contains "$unit_file" "RuntimeDirectoryMode=0700"
   assert_file_contains "$unit_file" "StateDirectory=termd"
+  assert_file_contains "$unit_file" "ExecStart=${unit_file%.service}-run"
+  ! grep -Fq -- '--control-socket' "${unit_file%.service}-run"
 
   assert_file_contains "${tmp_dir}/termd.env" "HOME=/var/lib/termd"
   assert_file_contains "${tmp_dir}/termd.env" "SHELL=/bin/sh"
@@ -1642,6 +1646,8 @@ EOF
   assert_file_contains "$unit_file" "Group=deploy"
   assert_file_contains "$unit_file" "WorkingDirectory=${unit_file%.service}-state"
   assert_file_contains "$unit_file" "EnvironmentFile=-${tmp_dir}/termd.env"
+  assert_file_contains "$unit_file" "RuntimeDirectory=termd"
+  assert_file_contains "$unit_file" "RuntimeDirectoryMode=0700"
   assert_file_contains "${tmp_dir}/termd.env" "HOME=/home/alice"
   assert_file_contains "${tmp_dir}/termd.env" "SHELL=/bin/zsh"
 )
@@ -1693,6 +1699,8 @@ EOF
   assert_file_contains "$unit_file" "Group=bob-primary"
   assert_file_contains "$unit_file" "WorkingDirectory=${unit_file%.service}-state"
   assert_file_contains "$unit_file" "EnvironmentFile=-${tmp_dir}/termd.env"
+  assert_file_contains "$unit_file" "RuntimeDirectory=termd"
+  assert_file_contains "$unit_file" "RuntimeDirectoryMode=0700"
   assert_file_contains "${tmp_dir}/termd.env" "HOME=/srv/bob"
   assert_file_contains "${tmp_dir}/termd.env" "SHELL=/bin/sh"
 )

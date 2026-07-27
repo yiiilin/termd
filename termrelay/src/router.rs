@@ -9,7 +9,7 @@ use axum::routing::{any, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use termd_proto::{RelayRouteKind, ServerId, is_http_tunnel_path_allowed};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::ws::{
@@ -153,10 +153,26 @@ fn http_api_tunnel_router() -> Router<RelayState> {
             put(relay_http_tunnel)
                 .delete(relay_http_tunnel)
                 .options(relay_http_tunnel_preflight),
-        );
+        )
+        .route_layer(http_api_tunnel_cors_layer());
+
+    let file_offers = Router::new()
+        .route(
+            "/api/files/offers/:id",
+            get(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/files/offers/:id/downloads",
+            post(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/files/offer-downloads/:id",
+            get(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route_layer(file_offer_api_tunnel_cors_layer());
 
     // 中文注释：跨源预检只挂在 relay HTTP API tunnel 上；真正鉴权仍在 daemon access token。
-    router.route_layer(http_api_tunnel_cors_layer())
+    router.merge(file_offers)
 }
 
 async fn relay_http_tunnel_preflight() -> StatusCode {
@@ -177,6 +193,19 @@ fn http_api_tunnel_cors_layer() -> CorsLayer {
         .allow_headers([
             CONTENT_TYPE,
             HeaderName::from_static("content-range"),
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("x-termd-server-id"),
+        ])
+}
+
+fn file_offer_api_tunnel_cors_layer() -> CorsLayer {
+    // relay 不读取 cookie，但必须原样支持浏览器从同站跨源 UI 接收 daemon grant cookie。
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_credentials(true)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            CONTENT_TYPE,
             HeaderName::from_static("authorization"),
             HeaderName::from_static("x-termd-server-id"),
         ])
@@ -212,11 +241,17 @@ async fn relay_http_tunnel(
             "relay application route was not found",
         );
     }
+    let native_offer_download = is_native_file_offer_download_path(uri.path());
     let Some(server_id) = headers
         .get("x-termd-server-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| Uuid::parse_str(value).ok())
         .map(ServerId)
+        .or_else(|| {
+            native_offer_download
+                .then(|| native_download_server_id(&uri))
+                .flatten()
+        })
     else {
         return relay_json_error(
             StatusCode::BAD_REQUEST,
@@ -255,6 +290,7 @@ async fn relay_http_tunnel(
 #[derive(Debug, Clone, Copy)]
 enum RelayHttpAdmissionRequirement {
     Bootstrap,
+    DownloadGrant,
     Signed {
         scheme: &'static str,
         kind: RelaySignedCredentialKind,
@@ -293,6 +329,17 @@ fn authorize_relay_http_request(
             "relay admission policy does not allow this application route",
         ));
     };
+    if matches!(requirement, RelayHttpAdmissionRequirement::DownloadGrant) {
+        return if state.daemon_public_key(server_id).is_some() {
+            Ok(())
+        } else {
+            Err(relay_json_error(
+                StatusCode::FORBIDDEN,
+                "daemon_identity_untrusted",
+                "the requested daemon identity is not trusted by this relay",
+            ))
+        };
+    }
     let RelayHttpAdmissionRequirement::Signed {
         scheme: required_scheme,
         kind,
@@ -372,6 +419,9 @@ fn relay_http_admission_requirement(path: &str) -> Option<RelayHttpAdmissionRequ
         | "/api/auth/device-certificate/migrate/challenge" => {
             Some(RelayHttpAdmissionRequirement::Bootstrap)
         }
+        path if is_native_file_offer_download_path(path) => {
+            Some(RelayHttpAdmissionRequirement::DownloadGrant)
+        }
         path if path.starts_with("/api/control/")
             || path.starts_with("/api/files/")
             || path.starts_with("/api/push/") =>
@@ -383,6 +433,22 @@ fn relay_http_admission_requirement(path: &str) -> Option<RelayHttpAdmissionRequ
         }
         _ => None,
     }
+}
+
+fn is_native_file_offer_download_path(path: &str) -> bool {
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    matches!(segments.as_slice(), ["api", "files", "offer-downloads", id] if Uuid::parse_str(id).is_ok())
+}
+
+fn native_download_server_id(uri: &Uri) -> Option<ServerId> {
+    uri.query()?
+        .split('&')
+        .find_map(|part| part.strip_prefix("server_id="))
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .map(ServerId)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1102,13 +1168,33 @@ mod tests {
 
     #[tokio::test]
     async fn router_mounts_all_v070_http_file_tunnel_routes() {
+        let offer_id = Uuid::new_v4();
+        let download_id = Uuid::new_v4();
         for (method, path) in [
-            (Method::POST, "/api/files/uploads"),
-            (Method::PUT, "/api/files/uploads/upload-id/chunks"),
-            (Method::POST, "/api/files/uploads/upload-id/commit"),
-            (Method::POST, "/api/files/uploads/upload-id/abort"),
-            (Method::POST, "/api/files/downloads"),
-            (Method::GET, "/api/files/downloads/download-id"),
+            (Method::POST, "/api/files/uploads".to_owned()),
+            (
+                Method::PUT,
+                "/api/files/uploads/upload-id/chunks".to_owned(),
+            ),
+            (
+                Method::POST,
+                "/api/files/uploads/upload-id/commit".to_owned(),
+            ),
+            (
+                Method::POST,
+                "/api/files/uploads/upload-id/abort".to_owned(),
+            ),
+            (Method::POST, "/api/files/downloads".to_owned()),
+            (Method::GET, "/api/files/downloads/download-id".to_owned()),
+            (Method::GET, format!("/api/files/offers/{offer_id}")),
+            (
+                Method::POST,
+                format!("/api/files/offers/{offer_id}/downloads"),
+            ),
+            (
+                Method::GET,
+                format!("/api/files/offer-downloads/{download_id}"),
+            ),
         ] {
             let response = router(RelayState::default(), true)
                 .oneshot(
@@ -1124,6 +1210,32 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
+    }
+
+    #[tokio::test]
+    async fn native_file_offer_download_uses_non_authorizing_server_routing_hint() {
+        let fixture = relay_http_credential_fixture();
+        let server_id = fixture.identity.server_id();
+        let download_id = Uuid::new_v4();
+        let response = router(fixture.state, false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/files/offer-downloads/{download_id}?server_id={}",
+                        server_id.0
+                    ))
+                    .header("cookie", "termd_offer=fake-grant")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "routing hint and exact path should reach the offline daemon boundary"
+        );
     }
 
     #[tokio::test]
@@ -1361,6 +1473,43 @@ mod tests {
                 .get("access-control-allow-origin")
                 .and_then(|value| value.to_str().ok()),
             Some("*")
+        );
+    }
+
+    #[tokio::test]
+    async fn router_file_offer_preflight_mirrors_origin_and_allows_credentials() {
+        let origin = "http://127.0.0.1:4173";
+        let response = router(RelayState::default(), true)
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/files/offers/00000000-0000-4000-8000-000000000601/downloads")
+                    .header("origin", origin)
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "authorization,content-type,x-termd-server-id",
+                    )
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert!(response.status().is_success());
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some(origin)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-credentials")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
         );
     }
 

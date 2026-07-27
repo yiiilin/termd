@@ -2,7 +2,7 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 import { mkdtemp, open, rm, stat, truncate, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { startRealRelayFixture } from "./real-relay-fixture";
+import { pairingInviteCode, startRealRelayFixture } from "./real-relay-fixture";
 
 async function activateButton(page: Page, name: string): Promise<void> {
   const button = page.getByRole("button", { name });
@@ -1251,19 +1251,6 @@ test("relay Web 后台空闲超过保活间隔后恢复仍能继续输入", asyn
     await fixture.stop();
   }
 });
-
-function pairingInviteCode(fixture: { relayClientUrl: string; serverId: string; token: string; daemonPublicKey: string }): string {
-  const payload = JSON.stringify({
-    type: "termd_pairing_qr",
-    version: 2,
-    ws_url: fixture.relayClientUrl,
-    token: fixture.token,
-    server_id: fixture.serverId,
-    daemon_public_key: fixture.daemonPublicKey,
-    expires_at_ms: Date.now() + 60_000,
-  });
-  return `termd-pair:v2:${Buffer.from(payload, "utf8").toString("base64url")}`;
-}
 
 function terminalPane(page: Page): Locator {
   return page.getByTestId("terminal-pane");

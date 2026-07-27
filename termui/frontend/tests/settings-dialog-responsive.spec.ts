@@ -57,31 +57,7 @@ for (const scenario of viewports) {
     const cancel = dialog.getByRole("button", { name: "Cancel" });
     const apply = dialog.getByRole("button", { name: "Apply" });
     await expect(dialog).toBeVisible();
-
-    if (scenario.viewport.width === 320) {
-      const notificationGroup = dialog.getByRole("radiogroup", { name: "Notifications" });
-      const notificationLabels = notificationGroup.locator("label");
-      await expect(notificationLabels).toHaveCount(3);
-      await expect(notificationLabels).toHaveText(["Off", "Needs attention", "All AI activity"]);
-      const labelGeometry = await notificationLabels.evaluateAll((labels) =>
-        labels.map((label) => {
-          const text = label.querySelector("span");
-          const rect = label.getBoundingClientRect();
-          return {
-            left: rect.left,
-            right: rect.right,
-            height: rect.height,
-            textFits: text
-              ? text.scrollWidth <= text.clientWidth && text.scrollHeight <= text.clientHeight
-              : false,
-          };
-        }),
-      );
-      expect(labelGeometry.every(({ height, textFits }) => height >= 44 && textFits)).toBe(true);
-      for (let index = 1; index < labelGeometry.length; index += 1) {
-        expect(labelGeometry[index - 1].right).toBeLessThanOrEqual(labelGeometry[index].left);
-      }
-    }
+    await expect(dialog.getByRole("radiogroup", { name: "Notifications" })).toHaveCount(0);
 
     await textarea.fill("Pending=abc");
     await expectActionInsideViewport(page, cancel, scenario.safeArea);

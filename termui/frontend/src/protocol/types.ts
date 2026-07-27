@@ -574,6 +574,23 @@ export interface PongPayload {
   timestamp_ms: UnixTimestampMillis;
 }
 
+export interface FileOfferPayload {
+  offer_id: UUID;
+  name: string;
+  path: string;
+  size_bytes: number;
+  created_at_ms: UnixTimestampMillis;
+  expires_at_ms: UnixTimestampMillis;
+}
+
+export interface FileOfferDownloadReadyPayload {
+  download_id: UUID;
+  download_url: string;
+  name: string;
+  size_bytes: number;
+  expires_at_ms: UnixTimestampMillis;
+}
+
 export interface DeviceState {
   device_id: UUID;
   device_public_key: PublicKeyWire;
@@ -593,7 +610,6 @@ export interface PairedServerState {
 export type BrowserLanguagePreference = "auto" | "zh-CN" | "en-US";
 export type BrowserThemePreference = "system" | "dark" | "light";
 export type EffectiveTheme = "dark" | "light";
-export type BrowserNotificationPreference = "off" | "mentions" | "all";
 
 export interface BrowserMobileShortcut {
   label: string;
@@ -603,7 +619,6 @@ export interface BrowserMobileShortcut {
 export interface BrowserPreferences {
   language: BrowserLanguagePreference;
   theme: BrowserThemePreference;
-  notifications?: BrowserNotificationPreference;
   mobileShortcuts?: BrowserMobileShortcut[];
 }
 
@@ -613,6 +628,7 @@ export interface BrowserState {
   defaultServerId?: UUID;
   defaultUrl?: string;
   preferences?: BrowserPreferences;
+  browserNotificationPrompted?: boolean;
 }
 
 export interface SafeError {

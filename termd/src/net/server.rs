@@ -7,7 +7,7 @@ mod recovery;
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, SeekFrom};
 use std::net::{AddrParseError, IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,7 +17,10 @@ use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, OriginalUri, Path, State};
-use axum::http::header::{CONTENT_TYPE, HeaderName};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderName,
+    HeaderValue, SET_COOKIE,
+};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, options, post, put};
@@ -28,21 +31,26 @@ use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use termd_proto::{
     DeviceId, ErrorPayload, PROTOCOL_PACKET_VERSION, ProtocolVersion, ServerId,
     SessionFileDownloadPreparePayload, SessionFileUploadPayload, SessionId, SessionState,
     UnixTimestampMillis, is_http_control_tunnel_path_allowed, is_http_tunnel_path_allowed,
 };
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tower::ServiceExt as _;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::warn;
 
 use crate::auth::current_unix_timestamp_millis;
 use crate::config::DaemonConfig;
+#[cfg(test)]
+use crate::file_offer::FILE_OFFER_LIMIT;
+use crate::file_offer::{FileOfferError, inspect_file_offer};
 use crate::notifications::{PushNotificationCoordinator, PushNotificationError};
 use crate::pty::PtyRestoreInfo;
 use crate::pty::supervisor::SupervisorPtyBackend;
@@ -52,7 +60,8 @@ use crate::state::{StateError, StateStore};
 #[cfg(test)]
 use super::protocol::V070TerminalOpen;
 use super::protocol::{
-    DaemonProtocol, ProtocolConnection, ProtocolError, cleanup_persisted_session_file_http_uploads,
+    DaemonProtocol, FileOfferDownloadError, ProtocolConnection, ProtocolError,
+    cleanup_persisted_session_file_http_uploads, file_offer_download_cookie_name,
     parse_v070_terminal_open,
 };
 use super::signature::Ed25519SignatureVerifier;
@@ -216,6 +225,22 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
     }
 }
 
+/// Local daemon-control routes. This router is served only over the Unix socket.
+pub fn daemon_control_router(protocol: SharedDaemonProtocol) -> Router {
+    Router::new()
+        .route("/v1/file-offers", post(control_file_offer_create))
+        .method_not_allowed_fallback(api_method_not_allowed)
+        .fallback(|| async {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "daemon control route was not found",
+                false,
+            )
+        })
+        .with_state(protocol)
+}
+
 async fn api_or_plain_not_found(uri: OriginalUri) -> Response {
     if is_api_fallback_path(uri.0.path()) {
         return api_error(
@@ -323,7 +348,8 @@ struct PushConfigResponse {
 struct PushSubscriptionRequest {
     endpoint: String,
     keys: PushSubscriptionKeys,
-    mode: PushNotificationMode,
+    #[serde(default, rename = "mode")]
+    _mode: Option<PushNotificationMode>,
     locale: PushNotificationLocale,
 }
 
@@ -633,14 +659,15 @@ async fn run_metadata_websocket(
     device_id: DeviceId,
 ) {
     let mut revision = 1_u64;
-    let (mut changes, mut previous) = {
+    let (mut changes, mut file_offers, mut previous) = {
         let mut guard = protocol.lock().await;
         let changes = guard.v070_metadata_signal();
+        let file_offers = guard.file_offer_events();
         let payload = match guard.v070_metadata_payload(device_id) {
             Ok(payload) => payload,
             Err(_) => return,
         };
-        (changes, payload)
+        (changes, file_offers, payload)
     };
     if send_v070_json(
         &mut socket,
@@ -687,6 +714,17 @@ async fn run_metadata_websocket(
                         serde_json::json!({"revision": revision, "state": current}),
                     ).await.is_err() { break; }
                 }
+            },
+            offer = file_offers.recv() => match offer {
+                Ok(offer) => {
+                    if send_v070_json(&mut socket, "file.offer", offer).await.is_err() {
+                        break;
+                    }
+                }
+                // create_file_offer applies backpressure before this can occur. If the
+                // invariant is ever broken, close instead of silently losing a one-shot event.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     }
@@ -886,6 +924,451 @@ fn http_file_api_router() -> Router<SharedDaemonProtocol> {
             get(v070_file_download_read).merge(options(v070_preflight)),
         )
         .route_layer(http_file_api_cors_layer())
+        .merge(file_offer_api_router())
+}
+
+fn file_offer_api_router() -> Router<SharedDaemonProtocol> {
+    Router::new()
+        .route(
+            "/api/files/offers/:id",
+            get(file_offer_resolve).merge(options(v070_preflight)),
+        )
+        .route(
+            "/api/files/offers/:id/downloads",
+            post(file_offer_download_create).merge(options(v070_preflight)),
+        )
+        .route(
+            "/api/files/offer-downloads/:id",
+            get(file_offer_download_read)
+                .head(file_offer_download_head)
+                .merge(options(v070_preflight)),
+        )
+        .route_layer(file_offer_api_cors_layer())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateFileOfferRequest {
+    path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyFileOfferDownloadRequest {}
+
+async fn control_file_offer_create(
+    State(protocol): State<SharedDaemonProtocol>,
+    body: Body,
+) -> Response {
+    let request: CreateFileOfferRequest = match read_v070_json_body(body).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if request.path.as_os_str().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "offered path must not be empty",
+            false,
+        );
+    }
+    let inspected =
+        match tokio::task::spawn_blocking(move || inspect_file_offer(request.path)).await {
+            Ok(Ok(inspected)) => inspected,
+            Ok(Err(error)) => return file_offer_error(error),
+            Err(_) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "file_offer_failed",
+                    "file offer could not be created",
+                    true,
+                );
+            }
+        };
+    match protocol
+        .lock()
+        .await
+        .register_file_offer(inspected, current_unix_timestamp_millis())
+    {
+        Ok(offer) => (StatusCode::CREATED, Json(offer)).into_response(),
+        Err(error) => file_offer_error(error),
+    }
+}
+
+async fn file_offer_resolve(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(offer_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_v070_http_device(&protocol, &headers).await {
+        return response;
+    }
+    let offer_id = match uuid::Uuid::parse_str(&offer_id) {
+        Ok(offer_id) => offer_id,
+        Err(_) => return file_offer_error(FileOfferError::OfferNotFound),
+    };
+    match protocol
+        .lock()
+        .await
+        .resolve_file_offer(offer_id, current_unix_timestamp_millis())
+    {
+        Ok(offer) => (StatusCode::OK, Json(offer)).into_response(),
+        Err(error) => file_offer_error(error),
+    }
+}
+
+async fn file_offer_download_create(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(offer_id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let device_id = match authorize_v070_http_device(&protocol, &headers).await {
+        Ok(device_id) => device_id,
+        Err(response) => return response,
+    };
+    if read_v070_json_body::<EmptyFileOfferDownloadRequest>(body)
+        .await
+        .is_err()
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "file offer download request must be an empty JSON object",
+            false,
+        );
+    }
+    let offer_id = match uuid::Uuid::parse_str(&offer_id) {
+        Ok(offer_id) => offer_id,
+        Err(_) => return file_offer_download_error(FileOfferDownloadError::InvalidGrant),
+    };
+    let prepared = match protocol.lock().await.prepare_file_offer_download(
+        device_id,
+        offer_id,
+        current_unix_timestamp_millis(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return file_offer_download_error(error),
+    };
+    let secure = request_uses_https(&headers);
+    let cookie = file_offer_download_cookie(
+        &prepared.cookie_name,
+        &prepared.cookie_secret,
+        prepared.ready.download_id,
+        secure,
+    );
+    let mut response = (StatusCode::CREATED, Json(prepared.ready)).into_response();
+    if let Ok(cookie) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(SET_COOKIE, cookie);
+    } else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file_offer_download_failed",
+            "file offer download could not be prepared",
+            false,
+        );
+    }
+    response
+}
+
+async fn file_offer_download_read(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(download_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let download_id = match uuid::Uuid::parse_str(&download_id) {
+        Ok(download_id) => download_id,
+        Err(_) => return file_offer_download_error(FileOfferDownloadError::InvalidGrant),
+    };
+    let cookie_name = file_offer_download_cookie_name(download_id);
+    let Some(cookie_secret) = request_cookie(&headers, &cookie_name) else {
+        return with_cleared_file_offer_cookie(
+            file_offer_download_error(FileOfferDownloadError::InvalidGrant),
+            &cookie_name,
+            download_id,
+            request_uses_https(&headers),
+        );
+    };
+    let grant = match protocol.lock().await.consume_file_offer_download(
+        download_id,
+        &cookie_secret,
+        current_unix_timestamp_millis(),
+    ) {
+        Ok(grant) => grant,
+        Err(error) => {
+            return with_cleared_file_offer_cookie(
+                file_offer_download_error(error),
+                &cookie_name,
+                download_id,
+                request_uses_https(&headers),
+            );
+        }
+    };
+    let secure = request_uses_https(&headers);
+    let size_bytes = grant.payload.size_bytes;
+    let snapshot = match copy_then_validate_file_offer(
+        &protocol,
+        &grant.payload,
+        grant.file,
+        grant.content_sha256,
+        || {},
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(FileOfferSnapshotError::Invalidated) => {
+            return with_cleared_file_offer_cookie(
+                file_offer_error(FileOfferError::Invalidated),
+                &cookie_name,
+                download_id,
+                secure,
+            );
+        }
+        Err(FileOfferSnapshotError::Io) => {
+            return with_cleared_file_offer_cookie(
+                file_offer_download_snapshot_error(),
+                &cookie_name,
+                download_id,
+                secure,
+            );
+        }
+    };
+    let stream = futures_util::stream::unfold(
+        (snapshot, size_bytes),
+        |(mut file, mut remaining)| async move {
+            if remaining == 0 {
+                return None;
+            }
+            let mut chunk = vec![0_u8; (remaining as usize).min(256 * 1024)];
+            match file.read(&mut chunk).await {
+                Ok(0) => Some((
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "offered file ended early",
+                    )),
+                    (file, 0),
+                )),
+                Ok(read) => {
+                    chunk.truncate(read);
+                    remaining = remaining.saturating_sub(read as u64);
+                    Some((
+                        Ok::<Bytes, io::Error>(Bytes::from(chunk)),
+                        (file, remaining),
+                    ))
+                }
+                Err(error) => Some((Err(error), (file, 0))),
+            }
+        },
+    );
+    let mut response = Body::from_stream(stream).into_response();
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(length) = HeaderValue::from_str(&size_bytes.to_string()) {
+        response.headers_mut().insert(CONTENT_LENGTH, length);
+    }
+    if let Ok(disposition) = HeaderValue::from_str(&content_disposition(&grant.payload.name)) {
+        response
+            .headers_mut()
+            .insert(CONTENT_DISPOSITION, disposition);
+    }
+    with_cleared_file_offer_cookie(response, &cookie_name, download_id, secure)
+}
+
+async fn file_offer_download_head() -> StatusCode {
+    StatusCode::METHOD_NOT_ALLOWED
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileOfferSnapshotError {
+    Invalidated,
+    Io,
+}
+
+async fn copy_then_validate_file_offer<F>(
+    protocol: &SharedDaemonProtocol,
+    payload: &termd_proto::FileOfferPayload,
+    file: fs::File,
+    expected_sha256: [u8; 32],
+    after_first_chunk: F,
+) -> Result<tokio::fs::File, FileOfferSnapshotError>
+where
+    F: FnOnce() + Send,
+{
+    let validation_file = file.try_clone().map_err(|_| FileOfferSnapshotError::Io)?;
+    let snapshot = tempfile::tempfile().map_err(|_| FileOfferSnapshotError::Io)?;
+    let mut source = tokio::fs::File::from_std(file);
+    let mut snapshot = tokio::fs::File::from_std(snapshot);
+    let mut remaining = payload.size_bytes;
+    let mut buffer = vec![0_u8; 256 * 1024];
+    let mut hasher = Sha256::new();
+    let mut after_first_chunk = Some(after_first_chunk);
+    while remaining > 0 {
+        let limit = (remaining as usize).min(buffer.len());
+        let read = source
+            .read(&mut buffer[..limit])
+            .await
+            .map_err(|_| FileOfferSnapshotError::Io)?;
+        if read == 0 {
+            return Err(FileOfferSnapshotError::Invalidated);
+        }
+        snapshot
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|_| FileOfferSnapshotError::Io)?;
+        hasher.update(&buffer[..read]);
+        remaining = remaining.saturating_sub(read as u64);
+        if let Some(after_first_chunk) = after_first_chunk.take() {
+            after_first_chunk();
+        }
+    }
+    if let Some(after_first_chunk) = after_first_chunk.take() {
+        after_first_chunk();
+    }
+    let mut extra = [0_u8; 1];
+    if source
+        .read(&mut extra)
+        .await
+        .map_err(|_| FileOfferSnapshotError::Io)?
+        != 0
+        || <[u8; 32]>::from(hasher.finalize()) != expected_sha256
+    {
+        return Err(FileOfferSnapshotError::Invalidated);
+    }
+    protocol
+        .lock()
+        .await
+        .validate_file_offer_download_snapshot(
+            payload,
+            &validation_file,
+            current_unix_timestamp_millis(),
+        )
+        .map_err(|_| FileOfferSnapshotError::Invalidated)?;
+    snapshot
+        .seek(SeekFrom::Start(0))
+        .await
+        .map_err(|_| FileOfferSnapshotError::Io)?;
+    Ok(snapshot)
+}
+
+fn file_offer_error(error: FileOfferError) -> Response {
+    let status = match error {
+        FileOfferError::NotFound | FileOfferError::OfferNotFound => StatusCode::NOT_FOUND,
+        FileOfferError::NotRegular => StatusCode::BAD_REQUEST,
+        FileOfferError::Unreadable => StatusCode::FORBIDDEN,
+        FileOfferError::Invalidated => StatusCode::GONE,
+        FileOfferError::DeliveryBusy => StatusCode::TOO_MANY_REQUESTS,
+    };
+    api_error(
+        status,
+        error.code(),
+        error.safe_message(),
+        matches!(error, FileOfferError::DeliveryBusy),
+    )
+}
+
+fn file_offer_download_error(error: FileOfferDownloadError) -> Response {
+    let status = match error {
+        FileOfferDownloadError::Offer(error) => {
+            return file_offer_error(error);
+        }
+        FileOfferDownloadError::InvalidGrant => StatusCode::UNAUTHORIZED,
+        FileOfferDownloadError::Capacity => StatusCode::TOO_MANY_REQUESTS,
+    };
+    api_error(status, error.code(), error.safe_message(), false)
+}
+
+fn file_offer_download_snapshot_error() -> Response {
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "file_offer_download_failed",
+        "file offer download could not be read",
+        true,
+    )
+}
+
+fn request_cookie(headers: &HeaderMap, expected_name: &str) -> Option<String> {
+    headers.get_all(COOKIE).iter().find_map(|header| {
+        header.to_str().ok()?.split(';').find_map(|cookie| {
+            let (name, value) = cookie.trim().split_once('=')?;
+            (name == expected_name && !value.is_empty()).then(|| value.to_owned())
+        })
+    })
+}
+
+fn file_offer_download_cookie(
+    name: &str,
+    value: &str,
+    download_id: uuid::Uuid,
+    secure: bool,
+) -> String {
+    format!(
+        "{name}={value}; Path=/api/files/offer-downloads/{download_id}; Max-Age=60; HttpOnly; SameSite=Strict{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+fn with_cleared_file_offer_cookie(
+    mut response: Response,
+    name: &str,
+    download_id: uuid::Uuid,
+    secure: bool,
+) -> Response {
+    let value = format!(
+        "{name}=; Path=/api/files/offer-downloads/{download_id}; Max-Age=0; HttpOnly; SameSite=Strict{}",
+        if secure { "; Secure" } else { "" }
+    );
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response
+}
+
+fn request_uses_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("origin")
+        .or_else(|| headers.get("referer"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("https://"))
+        || headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("https"))
+}
+
+fn content_disposition(name: &str) -> String {
+    let fallback = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let fallback = if fallback.is_empty() {
+        "download".to_owned()
+    } else {
+        fallback
+    };
+    let encoded = name
+        .as_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-' | b'_') {
+                (*byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect::<String>();
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 async fn v070_preflight() -> StatusCode {
@@ -1042,7 +1525,8 @@ fn validated_push_subscription(
         endpoint: request.endpoint,
         p256dh: request.keys.p256dh,
         auth: request.keys.auth,
-        mode: request.mode,
+        // Persist the legacy column as `all`; notification modes are no longer user-configurable.
+        mode: PushNotificationMode::All,
         locale: request.locale,
         updated_at_ms: current_unix_timestamp_millis().0,
     })
@@ -1460,6 +1944,20 @@ fn http_file_api_cors_layer() -> CorsLayer {
         .allow_headers([
             HeaderName::from_static("authorization"),
             HeaderName::from_static("content-range"),
+            CONTENT_TYPE,
+            HeaderName::from_static("x-termd-server-id"),
+        ])
+}
+
+fn file_offer_api_cors_layer() -> CorsLayer {
+    // File Offer prepare 必须允许同站的跨源开发 UI 接收 HttpOnly grant cookie。
+    // 业务授权仍由 Bearer token 完成；原生下载 GET 只消费短期一次性 cookie。
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_credentials(true)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            HeaderName::from_static("authorization"),
             CONTENT_TYPE,
             HeaderName::from_static("x-termd-server-id"),
         ])
@@ -2496,6 +2994,310 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["error"]["code"], "not_found", "{path}");
         }
+
+        let local_only = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/file-offers")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"/tmp/report.zip"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local_only.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn file_offer_is_one_shot_metadata_and_cookie_authorized_native_download() {
+        let fixture = test_protocol("file-offer-flow");
+        let file_path = fixture._state_dir.state_dir.join("report.zip");
+        fs::write(&file_path, b"offered bytes").unwrap();
+        let mut first_events = fixture.protocol.lock().await.file_offer_events();
+        let mut second_events = fixture.protocol.lock().await.file_offer_events();
+        let control = daemon_control_router(fixture.protocol.clone());
+        let created = control
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/file-offers")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"path": file_path}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let offer: termd_proto::FileOfferPayload =
+            serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(offer.name, "report.zip");
+        assert_eq!(offer.size_bytes, 13);
+        assert_eq!(first_events.recv().await.unwrap(), offer);
+        assert_eq!(second_events.recv().await.unwrap(), offer);
+        let mut late_events = fixture.protocol.lock().await.file_offer_events();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), late_events.recv())
+                .await
+                .is_err(),
+            "File Offers must not replay to later metadata subscribers"
+        );
+
+        let (device_id, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        let authorization = format!("Bearer {access_token}");
+        let app = router(fixture.protocol.clone(), false);
+        let resolved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/files/offers/{}", offer.offer_id))
+                    .header("authorization", &authorization)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK);
+
+        let prepared = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/files/offers/{}/downloads", offer.offer_id))
+                    .header("authorization", &authorization)
+                    .header("origin", "https://relay.example.test")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.status(), StatusCode::CREATED);
+        let set_cookie = prepared
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Strict"));
+        assert!(set_cookie.contains("Secure"));
+        assert_eq!(
+            prepared
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://relay.example.test")
+        );
+        assert_eq!(
+            prepared
+                .headers()
+                .get("access-control-allow-credentials")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        let cookie = set_cookie.split(';').next().unwrap().to_owned();
+        let ready: termd_proto::FileOfferDownloadReadyPayload =
+            serde_json::from_slice(&to_bytes(prepared.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(ready.download_url.contains(&format!(
+            "server_id={}",
+            fixture.protocol.lock().await.server_id().0
+        )));
+
+        let wrong_cookie = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&ready.download_url)
+                    .header(
+                        COOKIE,
+                        format!("{}=wrong", cookie.split('=').next().unwrap()),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_cookie.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            wrong_cookie.headers().get(CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+
+        let head = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(&ready.download_url)
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(
+            to_bytes(head.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let downloaded = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&ready.download_url)
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(downloaded.status(), StatusCode::OK);
+        assert_eq!(
+            downloaded.headers().get(CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(downloaded.headers().get(CONTENT_LENGTH).unwrap(), "13");
+        assert!(
+            downloaded
+                .headers()
+                .get(CONTENT_DISPOSITION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("report.zip")
+        );
+        assert_eq!(
+            &to_bytes(downloaded.into_body(), usize::MAX).await.unwrap()[..],
+            b"offered bytes"
+        );
+
+        let repeated = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&ready.download_url)
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(device_id, DeviceId(uuid::Uuid::nil()));
+    }
+
+    #[tokio::test]
+    async fn file_offer_snapshot_rejects_source_changes_before_final_validation() {
+        let fixture = test_protocol("file-offer-snapshot-change");
+        let file_path = fixture._state_dir.state_dir.join("report.zip");
+        let original = vec![b'a'; 512 * 1024];
+        let replacement = vec![b'b'; original.len()];
+        fs::write(&file_path, &original).unwrap();
+        let now = current_unix_timestamp_millis();
+        let grant = {
+            let mut protocol = fixture.protocol.lock().await;
+            let offer = protocol.create_file_offer(&file_path, now).unwrap();
+            let device_id = DeviceId(uuid::Uuid::new_v4());
+            let prepared = protocol
+                .prepare_file_offer_download(device_id, offer.offer_id, now)
+                .unwrap();
+            protocol
+                .consume_file_offer_download(
+                    prepared.ready.download_id,
+                    &prepared.cookie_secret,
+                    now,
+                )
+                .unwrap()
+        };
+        let payload = grant.payload;
+        let source = grant.file;
+        let content_sha256 = grant.content_sha256;
+        let changed_path = file_path.clone();
+        let result = copy_then_validate_file_offer(
+            &fixture.protocol,
+            &payload,
+            source,
+            content_sha256,
+            move || {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .open(changed_path)
+                    .unwrap();
+                file.write_all(&replacement).unwrap();
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(FileOfferSnapshotError::Invalidated)));
+        assert_eq!(fs::read(file_path).unwrap(), vec![b'b'; original.len()]);
+    }
+
+    #[tokio::test]
+    async fn file_offer_creation_backpressures_before_a_connected_client_can_lose_an_event() {
+        let fixture = test_protocol("file-offer-backpressure");
+        let file_path = fixture._state_dir.state_dir.join("report.zip");
+        fs::write(&file_path, b"offered bytes").unwrap();
+        let stalled_events = {
+            let mut protocol = fixture.protocol.lock().await;
+            let events = protocol.file_offer_events();
+            for offset in 0..FILE_OFFER_LIMIT {
+                protocol
+                    .create_file_offer(&file_path, UnixTimestampMillis(1_000 + offset as u64))
+                    .unwrap();
+            }
+            events
+        };
+
+        let control = daemon_control_router(fixture.protocol.clone());
+        let blocked = control
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/file-offers")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"path": file_path}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(blocked.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "file_offer_delivery_busy");
+        assert_eq!(body["error"]["retryable"], true);
+
+        drop(stalled_events);
+        let retried = control
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/file-offers")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"path": file_path}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -2541,6 +3343,44 @@ mod tests {
                 "{method} {path}",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn file_offer_cors_mirrors_origin_and_allows_credentials() {
+        let app = router(test_protocol("file-offer-cors").protocol.clone(), false);
+        let origin = "http://127.0.0.1:4173";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/files/offers/00000000-0000-4000-8000-000000000601/downloads")
+                    .header("origin", origin)
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "authorization,content-type,x-termd-server-id",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success());
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some(origin)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-credentials")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
     }
 
     #[tokio::test]

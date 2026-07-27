@@ -31,6 +31,11 @@ export default defineConfig({
       testMatch: /mobile-terminal-quick-keys\.spec\.ts/,
       use: { ...devices["iPhone 13"], browserName: "chromium" },
     },
+    {
+      name: "mobile-webkit-file-offer",
+      testMatch: /file-offer\.real-relay\.spec\.ts/,
+      use: { ...devices["iPhone 13"], browserName: "webkit" },
+    },
   ],
   webServer: {
     // 中文注释：真实 relay fixture 会在测试内执行 cargo run。先在 WebServer 启动阶段

@@ -47,6 +47,7 @@ import type {
   HelloPayload,
   Envelope,
   ErrorPayload,
+  FileOfferPayload,
   PairRequestPayload,
   RouteHelloPayload,
   SessionCreatePayload,
@@ -126,6 +127,10 @@ interface MockDaemonOptions {
   closeMetadataOnPingNumber?: number;
   sessionTokenExpiresAtMs?: number;
   sessionScopeExpiresAtMs?: number;
+  fileOffers?: Record<UUID, FileOfferPayload>;
+  fileOfferDownloadId?: UUID;
+  fileOfferDownloadFailure?: ErrorPayload;
+  fileOfferDownloadDelayMs?: number;
 }
 
 interface QueuedSessionListResponse {
@@ -361,6 +366,22 @@ export class MockDaemon {
     // 测试另一个客户端已经改变 daemon 端权威列表时，当前浏览器下一次刷新必须服从 daemon 顺序。
     this.options.sessions = sessions;
     this.broadcastV070Metadata();
+  }
+
+  pushFileOffer(offer: FileOfferPayload): void {
+    this.options.fileOffers = { ...(this.options.fileOffers ?? {}), [offer.offer_id]: offer };
+    const message = JSON.stringify({ type: "file.offer", payload: offer });
+    for (const socket of this.v070MetadataSockets.keys()) {
+      if (socket.readyState === socket.OPEN) socket.send(message);
+    }
+  }
+
+  setFileOfferDownloadFailure(error: ErrorPayload | undefined): void {
+    this.options.fileOfferDownloadFailure = error;
+  }
+
+  setFileOfferDownloadDelayMs(delayMs: number): void {
+    this.options.fileOfferDownloadDelayMs = delayMs;
   }
 
   setDaemonClients(clients: DaemonClientSummaryPayload[]): void {
@@ -696,6 +717,48 @@ export class MockDaemon {
           expires_at_ms: expiresAtMs,
           refresh_at_ms: expiresAtMs - 60_000,
         });
+        return;
+      }
+      const fileOfferMatch = url.pathname.match(/^\/api\/files\/offers\/([0-9a-f-]+)$/iu);
+      const fileOfferDownloadMatch = url.pathname.match(/^\/api\/files\/offers\/([0-9a-f-]+)\/downloads$/iu);
+      if (fileOfferMatch || fileOfferDownloadMatch) {
+        const authorization = request.headers.authorization;
+        const accessToken = authorization?.startsWith("Bearer ")
+          ? authorization.slice("Bearer ".length)
+          : undefined;
+        if (!accessToken || !this.accessTokens.has(accessToken)) {
+          this.writeJson(response, 401, { error: { code: "auth_failed", message: "auth failed", retryable: false } });
+          return;
+        }
+        const offerId = (fileOfferDownloadMatch ?? fileOfferMatch)![1] as UUID;
+        const offer = this.options.fileOffers?.[offerId];
+        this.receivedHttpRequests.push({ path: url.pathname, method: request.method ?? "GET", payload: {} });
+        if (!offer) {
+          this.writeJson(response, 404, { error: { code: "file_offer_not_found", message: "file offer was not found", retryable: false } });
+          return;
+        }
+        if (fileOfferMatch && request.method === "GET") {
+          this.writeJson(response, 200, offer);
+          return;
+        }
+        if (fileOfferDownloadMatch && request.method === "POST") {
+          if (this.options.fileOfferDownloadDelayMs) {
+            await new Promise((resolve) => setTimeout(resolve, this.options.fileOfferDownloadDelayMs));
+          }
+          if (this.options.fileOfferDownloadFailure) {
+            this.writeJson(response, 409, { error: { ...this.options.fileOfferDownloadFailure, retryable: false } });
+            return;
+          }
+          this.writeJson(response, 200, {
+            download_id: this.options.fileOfferDownloadId ?? "00000000-0000-4000-8000-000000000701",
+            download_url: `/api/files/offer-downloads/${this.options.fileOfferDownloadId ?? "00000000-0000-4000-8000-000000000701"}?server_id=${this.serverId}`,
+            name: offer.name,
+            size_bytes: offer.size_bytes,
+            expires_at_ms: nowMs() + 60_000,
+          });
+          return;
+        }
+        this.writeJson(response, 405, { error: { code: "method_not_allowed", message: "method not allowed", retryable: false } });
         return;
       }
       if (!/^\/api\/control\//u.test(url.pathname)) {

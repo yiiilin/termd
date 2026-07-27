@@ -1822,6 +1822,7 @@ fn daemon_startup_warns_but_does_not_adopt_unrecorded_live_supervisor() {
     let _ = fs::remove_file(socket_path);
     let _ = fs::remove_file(pid_file);
     let _ = fs::remove_file(log_file);
+    let _ = fs::remove_dir_all(state_dir);
 }
 
 #[test]

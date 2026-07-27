@@ -19,6 +19,7 @@ import App, {
 import { decodeSupervisorTerminalClientFrame } from "../protocol/supervisor-terminal";
 import type {
   AttachFramePayload,
+  FileOfferPayload,
   SessionFileDownloadStreamReadyPayload,
   SessionFileHttpUploadStreamPayload,
   SessionFileHttpUploadReadyPayload,
@@ -50,6 +51,21 @@ vi.mock("../push-notifications", async (importOriginal) => {
 
 const DEFAULT_SESSION_ID = "00000000-0000-0000-0000-000000000401";
 const DEFAULT_SESSION_NAME = fallbackSessionDisplayName(DEFAULT_SESSION_ID);
+const FILE_OFFER_ONE: FileOfferPayload = {
+  offer_id: "00000000-0000-4000-8000-000000000601",
+  name: "untrusted-name.txt",
+  path: "/canonical/report.zip",
+  size_bytes: 1234,
+  created_at_ms: 1785144000000,
+  expires_at_ms: 1785230400000,
+};
+const FILE_OFFER_TWO: FileOfferPayload = {
+  ...FILE_OFFER_ONE,
+  offer_id: "00000000-0000-4000-8000-000000000602",
+  path: "/canonical/newer.tar",
+  size_bytes: 2048,
+  created_at_ms: FILE_OFFER_ONE.created_at_ms + 1,
+};
 
 describe("metadata effect client ownership", () => {
   it("only treats the current unshared metadata client as effect-owned", () => {
@@ -1914,8 +1930,6 @@ describe("termui web 工作台", () => {
 
     await pairWithInvite(user, daemon);
     await waitForWorkspaceSession("Build");
-    await user.click(await screen.findByRole("button", { name: "Settings" }));
-    await user.click(await screen.findByLabelText("All AI activity"));
     daemon.setSessions([{
       session_id: DEFAULT_SESSION_ID,
       name: "Build",
@@ -1928,7 +1942,7 @@ describe("termui web 工作台", () => {
     expect(notifications).not.toHaveBeenCalled();
   });
 
-  it("开启后台通知时会在设置点击中请求浏览器权限", async () => {
+  it("首次进入已配对 workspace 时由权限引导按钮请求通知权限，且只显示一次", async () => {
     const requestPermission = vi.fn(async () => "denied" as NotificationPermission);
     class TestNotification {
       static permission = "default";
@@ -1936,17 +1950,132 @@ describe("termui web 工作台", () => {
     }
     vi.stubGlobal("Notification", TestNotification);
     const user = userEvent.setup();
-    render(<App />);
+    const firstRender = render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "Settings" }));
-    await user.click(await screen.findByLabelText("Needs attention"));
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await user.click(await screen.findByRole("button", { name: "Enable notifications" }));
 
     expect(requestPermission).toHaveBeenCalledTimes(1);
     await waitFor(async () => {
       await expect(loadBrowserState()).resolves.toMatchObject({
-        preferences: { notifications: "mentions" },
+        browserNotificationPrompted: true,
       });
     });
+    firstRender.unmount();
+    render(<App />);
+    await waitForWorkspaceSession();
+    expect(screen.queryByRole("button", { name: "Enable notifications" })).not.toBeInTheDocument();
+  });
+
+  it("接收 daemon-global file offers，按 newest first 独立关闭并保留可重试的原生下载入口", async () => {
+    const user = userEvent.setup();
+    let clickedAnchor: HTMLAnchorElement | undefined;
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      clickedAnchor = this;
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await waitFor(() => expect(daemon.receivedPackets.some((packet) => packet.method === "metadata.subscribe")).toBe(true));
+    act(() => {
+      daemon.pushFileOffer(FILE_OFFER_ONE);
+      daemon.pushFileOffer(FILE_OFFER_TWO);
+    });
+
+    const center = await screen.findByLabelText("Available files");
+    await waitFor(() => {
+      expect(center.querySelectorAll(".file-offer-card:not(.notification-permission-card) strong")).toHaveLength(2);
+    });
+    expect([...center.querySelectorAll(".file-offer-card:not(.notification-permission-card) strong")].map((node) => node.textContent)).toEqual([
+      "newer.tar",
+      "report.zip",
+    ]);
+    expect(within(center).queryByText("untrusted-name.txt")).not.toBeInTheDocument();
+    await user.click(within(center).getByRole("button", { name: "Dismiss report.zip" }));
+    expect(within(center).queryByText("report.zip")).not.toBeInTheDocument();
+
+    await user.click(within(center).getByRole("button", { name: "Download newer.tar" }));
+    await waitFor(() => expect(daemon.receivedHttpRequests).toContainEqual({
+      path: `/api/files/offers/${FILE_OFFER_TWO.offer_id}/downloads`,
+      method: "POST",
+      payload: {},
+    }));
+    expect(anchorClick).toHaveBeenCalledTimes(1);
+    expect(clickedAnchor?.href).toBe(
+      `${daemon.httpBaseUrl()}/api/files/offer-downloads/00000000-0000-4000-8000-000000000701?server_id=${daemon.serverId}`,
+    );
+    expect(clickedAnchor).not.toHaveAttribute("download");
+    expect(within(center).getByText("newer.tar")).toBeInTheDocument();
+    expect(within(center).getByRole("button", { name: "Download newer.tar" })).toBeEnabled();
+    await user.click(within(center).getByRole("button", { name: "Download newer.tar" }));
+    await waitFor(() => expect(anchorClick).toHaveBeenCalledTimes(2));
+    await user.click(within(center).getByRole("button", { name: "Dismiss newer.tar" }));
+    expect(within(center).queryByText("newer.tar")).not.toBeInTheDocument();
+    anchorClick.mockRestore();
+  });
+
+  it("刷新页面不重放 WebSocket file offer，但 Push query 可恢复 prompt 且不自动下载", async () => {
+    const user = userEvent.setup();
+    const firstRender = render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await waitFor(() => expect(daemon.receivedPackets.some((packet) => packet.method === "metadata.subscribe")).toBe(true));
+    act(() => daemon.pushFileOffer(FILE_OFFER_ONE));
+    expect(await screen.findByText("report.zip")).toBeInTheDocument();
+    firstRender.unmount();
+
+    render(<App />);
+    await waitForWorkspaceSession();
+    expect(screen.queryByText("report.zip")).not.toBeInTheDocument();
+    cleanup();
+    window.history.replaceState({}, "", `/?termd_server_id=${daemon.serverId}&termd_offer_id=${FILE_OFFER_ONE.offer_id}`);
+    render(<App />);
+
+    expect(await screen.findByText("report.zip")).toBeInTheDocument();
+    await waitFor(() => expect(daemon.receivedHttpRequests).toContainEqual({
+      path: `/api/files/offers/${FILE_OFFER_ONE.offer_id}`,
+      method: "GET",
+      payload: {},
+    }));
+    expect(daemon.receivedHttpRequests.some((request) => request.path.endsWith("/downloads"))).toBe(false);
+  });
+
+  it("file offer prepare 失败时保留 prompt 并显示可重试错误", async () => {
+    const user = userEvent.setup();
+    daemon.setFileOfferDownloadFailure({ code: "file_offer_expired", message: "expired" });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await waitFor(() => expect(daemon.receivedPackets.some((packet) => packet.method === "metadata.subscribe")).toBe(true));
+    act(() => daemon.pushFileOffer(FILE_OFFER_ONE));
+    await user.click(await screen.findByRole("button", { name: "Download report.zip" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not prepare the download.");
+    expect(screen.getByText("report.zip")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download report.zip" })).toBeEnabled();
+  });
+
+  it("prepare 期间关闭 file offer 后忽略迟到的下载响应", async () => {
+    const user = userEvent.setup();
+    daemon.setFileOfferDownloadDelayMs(80);
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await waitFor(() => expect(daemon.receivedPackets.some((packet) => packet.method === "metadata.subscribe")).toBe(true));
+    act(() => daemon.pushFileOffer(FILE_OFFER_ONE));
+    await user.click(await screen.findByRole("button", { name: "Download report.zip" }));
+    await user.click(screen.getByRole("button", { name: "Dismiss report.zip" }));
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+
+    expect(screen.queryByText("report.zip")).not.toBeInTheDocument();
+    expect(anchorClick).not.toHaveBeenCalled();
+    anchorClick.mockRestore();
   });
 
   it("已 attach 终端切换主题会重建 xterm 并请求完整 snapshot", async () => {

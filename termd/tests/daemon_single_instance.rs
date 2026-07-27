@@ -233,7 +233,11 @@ fn supervisor_pid(session: &SessionStateRecord) -> u32 {
 
 fn spawn_daemon(state_dir: &Path, port: u16) -> Child {
     Command::new(env!("CARGO_BIN_EXE_termd"))
-        .args(["--listen", &format!("127.0.0.1:{port}")])
+        .args([
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+            "--no-control-socket",
+        ])
         .current_dir(state_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -1,0 +1,3 @@
+# Make file offers daemon-global one-time broadcasts
+
+A File Offer advertises completed output to the user's paired clients; it does not operate on, or belong to, a terminal session. Each explicit offer action therefore creates one daemon-global notification broadcast, and notifying clients again requires another explicit action. The daemon retains only short-lived internal offer state so a delayed click can be resolved, while each client receives a separate download grant when it chooses to download. This avoids retrofitting session identity into existing shells and keeps offer state out of the relay.

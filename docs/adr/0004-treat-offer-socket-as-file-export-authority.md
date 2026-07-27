@@ -1,0 +1,3 @@
+# Treat offer-socket access as daemon file-export authority
+
+An Offer Producer may name any regular file readable by the daemon, even when the producer's own Unix user could not read it. The daemon resolves and opens the path using its own filesystem authority; it does not compare peer credentials or require the producer to pass an already-open file descriptor. Consequently, access to the dedicated offer Unix socket is also authority to disclose daemon-readable files to every paired client, so that socket must be treated as a privileged local capability and must never be exposed through HTTP, WebSocket, terminal output, or relay routing.

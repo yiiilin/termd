@@ -1,0 +1,3 @@
+# Authorize offer producers by Unix socket access
+
+Access to the dedicated local Unix socket at `/run/termd/termd.sock` is sufficient authority to create a File Offer. The daemon does not additionally require the connecting process to have the daemon's Unix user ID; operators can grant access through the socket path's filesystem ownership, group, and mode. The socket preserves termd's current private local-control convention by defaulting to mode `0600`. The offer-creation interface remains local-only and is not exposed through browser HTTP, WebSocket, terminal escape sequences, or relay routes. This supports agents running under deliberately different local users without introducing a reusable application credential.

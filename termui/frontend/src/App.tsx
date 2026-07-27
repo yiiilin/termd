@@ -27,6 +27,7 @@ import type {
   DaemonClientSummaryPayload,
   DaemonStatusResultPayload,
   EffectiveTheme,
+  FileOfferPayload,
   PairedServerState,
   SafeError,
   SessionCreatedPayload,
@@ -45,6 +46,7 @@ import {
   loadBrowserState,
   normalizeRouteWsUrl,
   forgetDaemon,
+  recordBrowserNotificationPrompted,
   recordPairing,
   recordDeviceCertificate,
   recordServerUrl,
@@ -57,6 +59,7 @@ import { CollapsedSessionButton, SessionList } from "./components/SessionList";
 import { StatusBar } from "./components/StatusBar";
 import { TerminalPane } from "./components/TerminalPane";
 import { DestructiveActionDialog } from "./components/DestructiveActionDialog";
+import { FileOfferCenter } from "./components/FileOfferCenter";
 import { UnsavedFileDialog } from "./components/UnsavedFileDialog";
 import { useDismissiblePopover } from "./components/useDismissiblePopover";
 import type { TerminalOutputItem, TerminalResyncOptions } from "./components/terminal/types";
@@ -89,7 +92,7 @@ import { panelDefaultsForBand, viewportBandForWidth, type ViewportBand } from ".
 import type { BrowserPreferences } from "./protocol/types";
 import { recordTermdDiagnostic } from "./diagnostics";
 import { displayUrlWithoutQueryOrFragment, stripSensitiveUrlParts } from "./protocol/url";
-import { removeBrowserPushForServer, syncBrowserPushPreference } from "./push-notifications";
+import { removeBrowserPushForServer, syncBrowserPushSubscriptions } from "./push-notifications";
 
 const DaemonClientsPanel = lazy(() => import("./components/DaemonClientsPanel").then((module) => ({ default: module.DaemonClientsPanel })));
 const DaemonManagerPanel = lazy(() => import("./components/DaemonManagerPanel").then((module) => ({ default: module.DaemonManagerPanel })));
@@ -160,7 +163,15 @@ interface AttachUiOptions {
 
 interface PendingNotificationTarget {
   serverId: UUID;
-  sessionId: UUID;
+  sessionId?: UUID;
+  offerId?: UUID;
+}
+
+interface FileOfferPrompt {
+  serverId: UUID;
+  offer: FileOfferPayload;
+  busy?: boolean;
+  error?: string;
 }
 
 type PendingFileEditorAction = () => void | Promise<void>;
@@ -428,6 +439,8 @@ export default function App() {
   const [metadataReady, setMetadataReady] = useState(false);
   const [metadataRetryNonce, setMetadataRetryNonce] = useState(0);
   const [pushPermissionRevision, setPushPermissionRevision] = useState(0);
+  const [fileOfferPrompts, setFileOfferPrompts] = useState<FileOfferPrompt[]>([]);
+  const fileOfferPromptsRef = useRef<FileOfferPrompt[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<UUID | undefined>();
   const [attachedSessionId, setAttachedSessionId] = useState<UUID | undefined>();
   const [renamingSessionId, setRenamingSessionId] = useState<UUID | undefined>();
@@ -733,10 +746,9 @@ export default function App() {
     if (!device || state.pairedServers.length === 0) {
       return;
     }
-    const sync = () => syncBrowserPushPreference({
+    const sync = () => syncBrowserPushSubscriptions({
       device,
       servers: state.pairedServers,
-      preference: preferences.notifications ?? "off",
       locale: effectiveLocale,
     });
     pushPreferenceSyncQueueRef.current = pushPreferenceSyncQueueRef.current
@@ -745,7 +757,6 @@ export default function App() {
       .catch(() => undefined);
   }, [
     effectiveLocale,
-    preferences.notifications,
     pushPermissionRevision,
     pushPreferenceServersKey,
     state.device?.device_id,
@@ -901,6 +912,15 @@ export default function App() {
   const connectionReady = showConnectionStatus && status !== "idle" && status !== "connecting";
   const workspaceError = error ?? sessionCreateError;
   const workspaceErrorTitle = error ? t("protocolError.title") : t("sessions.createFailed");
+  const visibleFileOffers = fileOfferPrompts
+    .filter((prompt) => prompt.serverId === activeServer?.server_id)
+    .map((prompt) => ({ ...prompt.offer, busy: prompt.busy, error: prompt.error }));
+  const showNotificationPermissionPrompt = Boolean(
+    hasPairedServer &&
+    !state.browserNotificationPrompted &&
+    typeof Notification !== "undefined" &&
+    Notification.permission === "default"
+  );
   useEffect(() => {
     recordTermdDiagnostic("app_connection_state", {
       status,
@@ -1084,26 +1104,110 @@ export default function App() {
     (nextPreferences: BrowserPreferences) => {
       // 偏好是当前浏览器的纯 UI 状态；先乐观更新，保存失败再显示错误。
       setState((current) => ({ ...current, preferences: nextPreferences }));
-      if (
-        nextPreferences.notifications !== preferences.notifications &&
-        nextPreferences.notifications !== "off" &&
-        typeof Notification !== "undefined" &&
-        Notification.permission === "default"
-      ) {
-        try {
-          void Notification.requestPermission()
-            .then(() => setPushPermissionRevision((current) => current + 1))
-            .catch(() => undefined);
-        } catch {
-          // 浏览器权限 API 失败不能影响本地设置保存。
-        }
-      }
       void saveBrowserPreferences(nextPreferences)
         .then((nextState) => setState(nextState))
         .catch(setSafeError);
     },
-    [preferences.notifications, setSafeError],
+    [setSafeError],
   );
+
+  const markBrowserNotificationPrompted = useCallback(() => {
+    setState((current) => ({ ...current, browserNotificationPrompted: true }));
+    void recordBrowserNotificationPrompted()
+      .then((nextState) => setState(nextState))
+      .catch(setSafeError);
+  }, [setSafeError]);
+
+  const handleRequestNotificationPermission = useCallback(() => {
+    let permissionRequest: Promise<NotificationPermission> | undefined;
+    if (typeof Notification !== "undefined" && Notification.permission === "default") {
+      try {
+        permissionRequest = Notification.requestPermission();
+      } catch {
+        permissionRequest = undefined;
+      }
+    }
+    markBrowserNotificationPrompted();
+    void permissionRequest
+      ?.then(() => setPushPermissionRevision((current) => current + 1))
+      .catch(() => undefined);
+  }, [markBrowserNotificationPrompted]);
+
+  const addFileOfferPrompt = useCallback((serverId: UUID, offer: FileOfferPayload) => {
+    setFileOfferPrompts((current) => {
+      if (current.some((prompt) => prompt.serverId === serverId && prompt.offer.offer_id === offer.offer_id)) {
+        return current;
+      }
+      const next = [{ serverId, offer }, ...current];
+      fileOfferPromptsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleDismissFileOffer = useCallback((offerId: string) => {
+    const serverId = activeServerIdRef.current;
+    setFileOfferPrompts((current) => {
+      const next = current.filter(
+        (prompt) => prompt.serverId !== serverId || prompt.offer.offer_id !== offerId,
+      );
+      fileOfferPromptsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleDownloadFileOffer = useCallback(async (offerId: string) => {
+    const serverId = activeServerIdRef.current;
+    if (!serverId) return;
+    setFileOfferPrompts((current) => {
+      const next = current.map((prompt) =>
+        prompt.serverId === serverId && prompt.offer.offer_id === offerId
+          ? { ...prompt, busy: true, error: undefined }
+          : prompt,
+      );
+      fileOfferPromptsRef.current = next;
+      return next;
+    });
+    try {
+      const client = await authenticatedWorkspaceClient(APP_CONNECTION_TIMEOUT_MS);
+      if (client.serverId !== serverId) {
+        throw new ProtocolClientError("stale_connection", "daemon changed");
+      }
+      const ready = await client.prepareFileOfferDownload(offerId);
+      const promptStillVisible = fileOfferPromptsRef.current.some(
+        (prompt) => prompt.serverId === serverId && prompt.offer.offer_id === offerId,
+      );
+      if (!promptStillVisible) return;
+      if (activeServerIdRef.current !== serverId) {
+        setFileOfferPrompts((current) => current.map((prompt) =>
+          prompt.serverId === serverId && prompt.offer.offer_id === offerId
+            ? { ...prompt, busy: false }
+            : prompt,
+        ));
+        return;
+      }
+      navigateToNativeDownload(client.fileOfferDownloadUrl(ready));
+      setFileOfferPrompts((current) => {
+        const next = current.map((prompt) =>
+          prompt.serverId === serverId && prompt.offer.offer_id === offerId
+            ? { ...prompt, busy: false }
+            : prompt,
+        );
+        fileOfferPromptsRef.current = next;
+        return next;
+      });
+    } catch {
+      const daemonChanged = activeServerIdRef.current !== serverId;
+      setFileOfferPrompts((current) => {
+        const next = current.map((prompt) =>
+          prompt.serverId === serverId && prompt.offer.offer_id === offerId
+            ? { ...prompt, busy: false, error: daemonChanged ? undefined : t("fileOffers.downloadFailed") }
+            : prompt,
+        );
+        fileOfferPromptsRef.current = next;
+        return next;
+      });
+    }
+  }, [authenticatedWorkspaceClient, t]);
 
   const isIgnoredClosingSessionError = useCallback((sessionId: UUID, caught: unknown) => {
     const code = toSafeError(caught).code;
@@ -3531,6 +3635,7 @@ export default function App() {
     void (async () => {
       let client: V070Client | undefined;
       let unsubscribeMetadata: (() => void) | undefined;
+      let unsubscribeFileOffers: (() => void) | undefined;
       let latencyTimer: number | undefined;
       let latencyInFlight = false;
       let latencyRestartPending = false;
@@ -3540,11 +3645,25 @@ export default function App() {
           return;
         }
         metadataClientRef.current = client;
+        unsubscribeFileOffers = client.watchFileOffers((offer) => {
+          if (isCurrentMetadataClient()) addFileOfferPrompt(requestServerId, offer);
+        });
         await client.subscribeMetadata();
         if (!isCurrentMetadataClient()) {
           return;
         }
         setMetadataReady(true);
+        const notificationTarget = pendingNotificationTargetRef.current;
+        if (notificationTarget?.serverId === requestServerId && notificationTarget.offerId) {
+          const targetOfferId = notificationTarget.offerId;
+          void client.resolveFileOffer(targetOfferId).then((offer) => {
+            if (!isCurrentMetadataClient()) return;
+            addFileOfferPrompt(requestServerId, offer);
+            if (pendingNotificationTargetRef.current === notificationTarget) {
+              pendingNotificationTargetRef.current = undefined;
+            }
+          }).catch(() => undefined);
+        }
         const latencyClient = client;
         const scheduleNextLatencyMeasurement = () => {
           if (!isCurrentMetadataClient() || latencyTimer !== undefined) {
@@ -3643,6 +3762,7 @@ export default function App() {
           window.clearTimeout(latencyTimer);
         }
         unsubscribeMetadata?.();
+        unsubscribeFileOffers?.();
         if (metadataClientAbortControllerRef.current === abortController) {
           metadataClientAbortControllerRef.current = undefined;
         }
@@ -3655,6 +3775,7 @@ export default function App() {
     return () => closeMetadataClient();
   }, [
     activeServer?.server_id,
+    addFileOfferPrompt,
     applyDaemonClientsSnapshot,
     applyDaemonStatusSnapshot,
     authenticatedClient,
@@ -4573,6 +4694,14 @@ export default function App() {
             </div>
           ) : null}
         </div>
+        <FileOfferCenter
+          offers={visibleFileOffers}
+          showNotificationPermissionPrompt={showNotificationPermissionPrompt}
+          onDownload={(offerId) => void handleDownloadFileOffer(offerId)}
+          onDismiss={handleDismissFileOffer}
+          onRequestNotificationPermission={handleRequestNotificationPermission}
+          onDismissNotificationPermissionPrompt={markBrowserNotificationPrompted}
+        />
         <div
           className={
             [
@@ -5257,17 +5386,30 @@ function consumeNotificationTargetFromUrl(): PendingNotificationTarget | undefin
   const url = new URL(window.location.href);
   const serverId = url.searchParams.get("termd_server_id");
   const sessionId = url.searchParams.get("termd_session_id");
-  if (serverId === null && sessionId === null) {
+  const offerId = url.searchParams.get("termd_offer_id");
+  if (serverId === null && sessionId === null && offerId === null) {
     return undefined;
   }
   url.searchParams.delete("termd_server_id");
   url.searchParams.delete("termd_session_id");
+  url.searchParams.delete("termd_offer_id");
   window.history.replaceState(
     window.history.state,
     "",
     `${url.pathname}${url.search}${url.hash}`,
   );
-  return isUuid(serverId) && isUuid(sessionId) ? { serverId, sessionId } : undefined;
+  if (!isUuid(serverId)) return undefined;
+  if (isUuid(offerId)) return { serverId, offerId };
+  return isUuid(sessionId) ? { serverId, sessionId } : undefined;
+}
+
+function navigateToNativeDownload(url: string): void {
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.hidden = true;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
 }
 
 function isUuid(value: string | null): value is UUID {

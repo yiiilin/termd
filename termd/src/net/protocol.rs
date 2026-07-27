@@ -32,15 +32,17 @@ use base64::{
 use rand_core::{OsRng, RngCore};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use termd_proto::{
     AttachRole, AuthPayload, ClientId, ControlGrantPayload, ControlRequestPayload,
     DaemonClientForgetPayload, DaemonClientForgotPayload, DaemonClientSummaryPayload,
     DaemonClientsResultPayload, DaemonStatusResultPayload, DeviceId, Envelope,
-    METHOD_CONTROL_REQUEST, METHOD_DAEMON_CLIENT_FORGET, METHOD_SESSION_CLOSE,
-    METHOD_SESSION_FILE_DELETE, METHOD_SESSION_FILE_READ, METHOD_SESSION_FILE_WRITE,
-    METHOD_SESSION_FILES, METHOD_SESSION_GIT, METHOD_SESSION_GIT_ACTION, METHOD_SESSION_GIT_DIFF,
-    METHOD_SESSION_RENAME, METHOD_SESSION_REORDER, METHOD_SESSION_SEARCH, MessageType, ServerId,
-    SessionAttachPayload, SessionAttachedPayload, SessionClosePayload, SessionClosedPayload,
+    FileOfferDownloadReadyPayload, FileOfferPayload, METHOD_CONTROL_REQUEST,
+    METHOD_DAEMON_CLIENT_FORGET, METHOD_SESSION_CLOSE, METHOD_SESSION_FILE_DELETE,
+    METHOD_SESSION_FILE_READ, METHOD_SESSION_FILE_WRITE, METHOD_SESSION_FILES, METHOD_SESSION_GIT,
+    METHOD_SESSION_GIT_ACTION, METHOD_SESSION_GIT_DIFF, METHOD_SESSION_RENAME,
+    METHOD_SESSION_REORDER, METHOD_SESSION_SEARCH, MessageType, ServerId, SessionAttachPayload,
+    SessionAttachedPayload, SessionClosePayload, SessionClosedPayload,
     SessionCreateInSessionCwdPayload, SessionCreatePayload, SessionCreatedPayload,
     SessionFileDeletePayload, SessionFileDeletedPayload, SessionFileDownloadPreparePayload,
     SessionFileDownloadReadyPayload, SessionFileDownloadStreamReadyPayload,
@@ -57,7 +59,7 @@ use termd_proto::{
 };
 use termd_proto::{SessionSearchMatchPayload, SessionSearchResultPayload};
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::auth::{
     AccessTokenProofInput, AuthChallengeManager, ChallengeResponseService, CredentialKind,
@@ -67,6 +69,7 @@ use crate::auth::{
     validate_device_public_key_wire, verify_credential,
 };
 use crate::config::DaemonConfig;
+use crate::file_offer::{FileOfferError, FileOfferStore, InspectedFileOffer, inspect_file_offer};
 use crate::notifications::{PushNotificationCoordinator, SessionActivitySnapshot};
 use crate::pty::supervisor::{
     SupervisorTerminalClientFrame, decode_supervisor_terminal_client_frame,
@@ -106,6 +109,9 @@ const TERMINAL_STREAM_FRAME_TRANSPORT_OVERHEAD_BYTES: usize = 256;
 const SESSION_TERMINAL_CWD_PROBE_MIN_INTERVAL_MS: u64 = 1_000;
 const SESSION_FILE_DOWNLOAD_TOKEN_TTL_MS: u64 = 60_000;
 const SESSION_FILE_DOWNLOAD_GRANT_LIMIT: usize = 128;
+const FILE_OFFER_DOWNLOAD_TOKEN_TTL_MS: u64 = 60_000;
+const FILE_OFFER_DOWNLOAD_GRANT_LIMIT: usize = 128;
+const FILE_OFFER_EVENT_QUEUE_CAPACITY: usize = crate::file_offer::FILE_OFFER_LIMIT;
 const SESSION_FILE_HTTP_UPLOAD_ACTIVE_IDLE_TTL_MS: u64 = 60 * 60 * 1000;
 const SESSION_FILE_HTTP_UPLOAD_TOMBSTONE_TTL_MS: u64 = 10 * 60 * 1000;
 #[cfg(windows)]
@@ -553,6 +559,60 @@ pub struct SessionFileDownloadGrant {
     pub expires_at_ms: UnixTimestampMillis,
 }
 
+/// One browser-native, cookie-authorized File Offer download.
+#[derive(Debug)]
+pub struct FileOfferDownloadGrant {
+    pub payload: FileOfferPayload,
+    pub file: fs::File,
+    pub content_sha256: [u8; 32],
+    pub expires_at_ms: UnixTimestampMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedFileOfferDownload {
+    pub ready: FileOfferDownloadReadyPayload,
+    pub cookie_name: String,
+    pub cookie_secret: String,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum FileOfferDownloadError {
+    #[error(transparent)]
+    Offer(#[from] FileOfferError),
+    #[error("file offer download grant is invalid or expired")]
+    InvalidGrant,
+    #[error("too many file offer downloads are pending")]
+    Capacity,
+}
+
+impl FileOfferDownloadError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Offer(error) => error.code(),
+            Self::InvalidGrant => "file_offer_download_invalid",
+            Self::Capacity => "file_offer_download_capacity",
+        }
+    }
+
+    pub fn safe_message(self) -> &'static str {
+        match self {
+            Self::Offer(error) => error.safe_message(),
+            Self::InvalidGrant => "file offer download grant is invalid or expired",
+            Self::Capacity => "too many file offer downloads are pending",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingFileOfferDownload {
+    device_id: DeviceId,
+    payload: FileOfferPayload,
+    file: fs::File,
+    content_sha256: [u8; 32],
+    secret_hash: [u8; 32],
+    expires_at_ms: UnixTimestampMillis,
+}
+
 /// session 级输出回放窗口。
 ///
 /// PTY 输出只能被读取一次；这里先按 session 保留，再按每条连接自己的 offset 加密发送，
@@ -716,6 +776,9 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
     session_terminal_cwds: HashMap<SessionId, PathBuf>,
     session_terminal_cwd_probe_notified_at_ms: HashMap<SessionId, u64>,
     session_file_downloads: HashMap<String, SessionFileDownloadGrant>,
+    file_offers: FileOfferStore,
+    file_offer_downloads: HashMap<uuid::Uuid, PendingFileOfferDownload>,
+    file_offer_events: broadcast::Sender<FileOfferPayload>,
     session_file_http_uploads: HashMap<String, SessionFileHttpUploadState>,
     daemon_clients: HashMap<DeviceId, DaemonClientRecord>,
     client_history: ClientHistoryStore,
@@ -898,6 +961,7 @@ where
         let (v070_metadata_signal, _) = watch::channel(0);
         let (activity_event_tx, activity_event_rx) =
             mpsc::channel(SESSION_ACTIVITY_EVENT_QUEUE_CAPACITY);
+        let (file_offer_events, _) = broadcast::channel(FILE_OFFER_EVENT_QUEUE_CAPACITY);
         let runtime = SessionRuntime::new_with_activity_signals(
             backend,
             v070_metadata_signal.clone(),
@@ -923,6 +987,9 @@ where
             session_terminal_cwds: HashMap::new(),
             session_terminal_cwd_probe_notified_at_ms: HashMap::new(),
             session_file_downloads: HashMap::new(),
+            file_offers: FileOfferStore::default(),
+            file_offer_downloads: HashMap::new(),
+            file_offer_events,
             session_file_http_uploads: HashMap::new(),
             daemon_clients: HashMap::new(),
             client_history,
@@ -1381,6 +1448,144 @@ where
 
     pub fn v070_metadata_signal(&self) -> watch::Receiver<u64> {
         self.v070_metadata_signal.subscribe()
+    }
+
+    pub fn file_offer_events(&self) -> broadcast::Receiver<FileOfferPayload> {
+        self.file_offer_events.subscribe()
+    }
+
+    pub fn create_file_offer(
+        &mut self,
+        path: impl AsRef<Path>,
+        now_ms: UnixTimestampMillis,
+    ) -> Result<FileOfferPayload, FileOfferError> {
+        let inspected = inspect_file_offer(path)?;
+        self.register_file_offer(inspected, now_ms)
+    }
+
+    pub fn register_file_offer(
+        &mut self,
+        inspected: InspectedFileOffer,
+        now_ms: UnixTimestampMillis,
+    ) -> Result<FileOfferPayload, FileOfferError> {
+        if self.file_offer_events.receiver_count() > 0
+            && self.file_offer_events.len() >= FILE_OFFER_EVENT_QUEUE_CAPACITY
+        {
+            return Err(FileOfferError::DeliveryBusy);
+        }
+        let offer = self.file_offers.register(inspected, now_ms);
+        let _ = self.file_offer_events.send(offer.clone());
+        self.push_notifications.observe_file_offer(offer.offer_id);
+        Ok(offer)
+    }
+
+    pub fn resolve_file_offer(
+        &mut self,
+        offer_id: uuid::Uuid,
+        now_ms: UnixTimestampMillis,
+    ) -> Result<FileOfferPayload, FileOfferError> {
+        self.file_offers.resolve(offer_id, now_ms)
+    }
+
+    pub fn prepare_file_offer_download(
+        &mut self,
+        device_id: DeviceId,
+        offer_id: uuid::Uuid,
+        now_ms: UnixTimestampMillis,
+    ) -> Result<PreparedFileOfferDownload, FileOfferDownloadError> {
+        self.expire_file_offer_downloads(now_ms);
+        if self.file_offer_downloads.len() >= FILE_OFFER_DOWNLOAD_GRANT_LIMIT {
+            return Err(FileOfferDownloadError::Capacity);
+        }
+        let prepared = self.file_offers.prepare(offer_id, now_ms)?;
+        let download_id = uuid::Uuid::new_v4();
+        let mut random = [0_u8; 32];
+        OsRng.fill_bytes(&mut random);
+        let cookie_secret = format!("{}.{}", device_id.0, URL_SAFE_NO_PAD.encode(random));
+        let secret_hash: [u8; 32] = Sha256::digest(cookie_secret.as_bytes()).into();
+        let expires_at_ms =
+            UnixTimestampMillis(now_ms.0.saturating_add(FILE_OFFER_DOWNLOAD_TOKEN_TTL_MS));
+        let ready = FileOfferDownloadReadyPayload {
+            download_id,
+            download_url: format!(
+                "/api/files/offer-downloads/{download_id}?server_id={}",
+                self.daemon_identity.server_id().0
+            ),
+            name: prepared.payload.name.clone(),
+            size_bytes: prepared.payload.size_bytes,
+            expires_at_ms,
+        };
+        let cookie_name = file_offer_download_cookie_name(download_id);
+        self.file_offer_downloads.insert(
+            download_id,
+            PendingFileOfferDownload {
+                device_id,
+                payload: prepared.payload,
+                file: prepared.file,
+                content_sha256: prepared.content_sha256,
+                secret_hash,
+                expires_at_ms,
+            },
+        );
+        Ok(PreparedFileOfferDownload {
+            ready,
+            cookie_name,
+            cookie_secret,
+        })
+    }
+
+    pub fn consume_file_offer_download(
+        &mut self,
+        download_id: uuid::Uuid,
+        cookie_secret: &str,
+        now_ms: UnixTimestampMillis,
+    ) -> Result<FileOfferDownloadGrant, FileOfferDownloadError> {
+        self.expire_file_offer_downloads(now_ms);
+        let pending = self
+            .file_offer_downloads
+            .get(&download_id)
+            .ok_or(FileOfferDownloadError::InvalidGrant)?;
+        let cookie_device_id = cookie_secret
+            .split_once('.')
+            .and_then(|(device_id, secret)| {
+                (!secret.is_empty())
+                    .then(|| uuid::Uuid::parse_str(device_id).ok())
+                    .flatten()
+            })
+            .map(DeviceId)
+            .ok_or(FileOfferDownloadError::InvalidGrant)?;
+        let actual_hash: [u8; 32] = Sha256::digest(cookie_secret.as_bytes()).into();
+        if cookie_device_id != pending.device_id || actual_hash != pending.secret_hash {
+            return Err(FileOfferDownloadError::InvalidGrant);
+        }
+        let pending = self
+            .file_offer_downloads
+            .remove(&download_id)
+            .ok_or(FileOfferDownloadError::InvalidGrant)?;
+        self.file_offers
+            .validate_open_file(&pending.payload, &pending.file, now_ms)?;
+        Ok(FileOfferDownloadGrant {
+            payload: pending.payload,
+            file: pending.file,
+            content_sha256: pending.content_sha256,
+            expires_at_ms: pending.expires_at_ms,
+        })
+    }
+
+    pub fn validate_file_offer_download_snapshot(
+        &mut self,
+        payload: &FileOfferPayload,
+        file: &fs::File,
+        now_ms: UnixTimestampMillis,
+    ) -> Result<(), FileOfferDownloadError> {
+        self.file_offers
+            .validate_open_file(payload, file, now_ms)
+            .map_err(FileOfferDownloadError::from)
+    }
+
+    fn expire_file_offer_downloads(&mut self, now_ms: UnixTimestampMillis) {
+        self.file_offer_downloads
+            .retain(|_, grant| grant.expires_at_ms > now_ms);
     }
 
     pub fn push_activity_snapshot(&self) -> Vec<SessionActivitySnapshot> {
@@ -5286,6 +5491,10 @@ fn session_file_download_token() -> String {
     let mut bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+pub fn file_offer_download_cookie_name(download_id: uuid::Uuid) -> String {
+    format!("termd_offer_{}", download_id.simple())
 }
 
 fn session_file_download_name(path: &Path) -> String {

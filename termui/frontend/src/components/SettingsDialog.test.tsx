@@ -9,7 +9,6 @@ import { SettingsDialog } from "./SettingsDialog";
 const initialPreferences: BrowserPreferences = {
   language: "auto",
   theme: "system",
-  notifications: "off",
   mobileShortcuts: [],
 };
 
@@ -46,6 +45,14 @@ function SettingsHarness({
 }
 
 describe("SettingsDialog", () => {
+  it("does not expose notification delivery modes", async () => {
+    const user = userEvent.setup();
+    render(<SettingsHarness />);
+
+    await user.click(screen.getByRole("button", { name: "Open settings" }));
+    expect(screen.queryByRole("radiogroup", { name: "Notifications" })).not.toBeInTheDocument();
+  });
+
   it("keeps keyboard focus inside and restores it after Escape closes the dialog", async () => {
     const user = userEvent.setup();
     render(<SettingsHarness />);

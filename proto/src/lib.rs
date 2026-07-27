@@ -340,6 +340,15 @@ fn is_http_file_tunnel_path_allowed(method: &str, path: &str) -> bool {
         ["api", "files", "downloads", download_id] => {
             !download_id.is_empty() && method.eq_ignore_ascii_case("GET")
         }
+        ["api", "files", "offers", offer_id] => {
+            Uuid::parse_str(offer_id).is_ok() && method.eq_ignore_ascii_case("GET")
+        }
+        ["api", "files", "offers", offer_id, "downloads"] => {
+            Uuid::parse_str(offer_id).is_ok() && method.eq_ignore_ascii_case("POST")
+        }
+        ["api", "files", "offer-downloads", download_id] => {
+            Uuid::parse_str(download_id).is_ok() && method.eq_ignore_ascii_case("GET")
+        }
         _ => false,
     }
 }
@@ -1298,6 +1307,26 @@ pub struct SessionFileDownloadStreamReadyPayload {
     pub modified_at_ms: Option<UnixTimestampMillis>,
 }
 
+/// One daemon-global, transient file offered to all currently connected clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOfferPayload {
+    pub offer_id: Uuid,
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub created_at_ms: UnixTimestampMillis,
+    pub expires_at_ms: UnixTimestampMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOfferDownloadReadyPayload {
+    pub download_id: Uuid,
+    pub download_url: String,
+    pub name: String,
+    pub size_bytes: u64,
+    pub expires_at_ms: UnixTimestampMillis,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionFileTransferChunkPayload {
     pub session_id: SessionId,
@@ -2160,6 +2189,15 @@ mod tests {
             ("POST", "/api/files/uploads/upload-id/abort".to_owned()),
             ("POST", "/api/files/downloads".to_owned()),
             ("GET", "/api/files/downloads/download-id".to_owned()),
+            ("GET", format!("/api/files/offers/{}", Uuid::new_v4())),
+            (
+                "POST",
+                format!("/api/files/offers/{}/downloads", Uuid::new_v4()),
+            ),
+            (
+                "GET",
+                format!("/api/files/offer-downloads/{}", Uuid::new_v4()),
+            ),
             ("GET", "/api/push/config".to_owned()),
             ("PUT", "/api/push/subscription".to_owned()),
             ("DELETE", "/api/push/subscription".to_owned()),
@@ -2191,6 +2229,8 @@ mod tests {
             "/api/files/upload/abort",
             "/api/files/download",
             "/api/files/download/extra",
+            "/api/files/offers/not-a-uuid",
+            "/v1/file-offers",
             "/api/push/config/extra",
             "/api/push/subscription/extra",
         ] {
@@ -2210,6 +2250,14 @@ mod tests {
             "/api/push/subscription"
         ));
         assert!(!is_http_tunnel_path_allowed("DELETE", "/api/push/config"));
+        assert!(!is_http_tunnel_path_allowed(
+            "POST",
+            "/api/files/offers/not-a-uuid/downloads"
+        ));
+        assert!(!is_http_tunnel_path_allowed(
+            "GET",
+            "/api/files/offers/not-a-uuid"
+        ));
     }
 
     #[test]

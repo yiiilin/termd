@@ -28,6 +28,7 @@ sha2 = "0.10"
 termd-proto = { path = "../proto" }
 terminstall = { path = "../terminstall" }
 termweb = { path = "../termweb" }
+tempfile = "3"
 thiserror.workspace = true
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
 tokio-rustls = "0.26"

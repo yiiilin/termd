@@ -187,7 +187,7 @@ run_pairing_cli_e2e() (
 
   # daemon 默认使用当前工作目录下的 daemon-state.json；QA 必须隔离到临时目录，
   # 避免恢复开发环境或上一次失败留下的持久 session。
-  daemon_pid="$(start_process_in_dir "$temp_dir" "$temp_dir/termd.log" "$(debug_binary_path termd)" --listen "127.0.0.1:${daemon_port}")"
+  daemon_pid="$(start_process_in_dir "$temp_dir" "$temp_dir/termd.log" "$(debug_binary_path termd)" --listen "127.0.0.1:${daemon_port}" --no-control-socket)"
 
   for _ in $(seq 1 200); do
     if ! kill -0 "$daemon_pid" 2>/dev/null; then
@@ -320,7 +320,7 @@ run_relay_runtime_e2e() (
   fi
 
   # relay runtime E2E 同样需要隔离 daemon 状态，避免旧 session 恢复影响本轮监听启动。
-  daemon_pid="$(start_process_in_dir "$temp_dir" "$temp_dir/termd-relay.log" "$(debug_binary_path termd)" --listen "127.0.0.1:${daemon_port}" --relay "ws://${relay_addr}" --relay-daemon-token-file "$daemon_token_file")"
+  daemon_pid="$(start_process_in_dir "$temp_dir" "$temp_dir/termd-relay.log" "$(debug_binary_path termd)" --listen "127.0.0.1:${daemon_port}" --no-control-socket --relay "ws://${relay_addr}" --relay-daemon-token-file "$daemon_token_file")"
 
   for _ in $(seq 1 200); do
     if ! kill -0 "$daemon_pid" 2>/dev/null; then

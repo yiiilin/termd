@@ -24,8 +24,7 @@ use web_push_native::{Auth, WebPushBuilder};
 
 use crate::state::StateError;
 use crate::state::web_push::{
-    PushNotificationLocale, PushNotificationMode, PushSubscription, StoredPushSubscription,
-    VapidIdentity, WebPushStore,
+    PushNotificationLocale, PushSubscription, StoredPushSubscription, VapidIdentity, WebPushStore,
 };
 
 const PUSH_EVENT_QUEUE_CAPACITY: usize = 32;
@@ -118,6 +117,11 @@ struct ActivityEvent {
     activity: SessionAiActivityPayload,
 }
 
+enum PushEvent {
+    Activity(ActivityEvent),
+    FileOffer { offer_id: uuid::Uuid },
+}
+
 #[derive(Default)]
 struct ActivityTracker {
     initialized: bool,
@@ -168,8 +172,8 @@ pub struct PushNotificationCoordinator {
     store: Option<Arc<Mutex<WebPushStore>>>,
     activity_tracker: Arc<Mutex<ActivityTracker>>,
     delivery: Arc<dyn PushDelivery>,
-    event_tx: mpsc::Sender<ActivityEvent>,
-    event_rx: Arc<Mutex<Option<mpsc::Receiver<ActivityEvent>>>>,
+    event_tx: mpsc::Sender<PushEvent>,
+    event_rx: Arc<Mutex<Option<mpsc::Receiver<PushEvent>>>>,
 }
 
 impl fmt::Debug for PushNotificationCoordinator {
@@ -279,10 +283,26 @@ impl PushNotificationCoordinator {
         let Some(event) = event else {
             return false;
         };
-        if self.event_tx.try_send(event).is_ok() {
+        if self.event_tx.try_send(PushEvent::Activity(event)).is_ok() {
             true
         } else {
             warn!("Web Push activity queue is full or closed");
+            false
+        }
+    }
+
+    pub fn observe_file_offer(&self, offer_id: uuid::Uuid) -> bool {
+        if !self.is_available() {
+            return false;
+        }
+        if self
+            .event_tx
+            .try_send(PushEvent::FileOffer { offer_id })
+            .is_ok()
+        {
+            true
+        } else {
+            warn!("Web Push File Offer queue is full or closed");
             false
         }
     }
@@ -295,7 +315,12 @@ impl PushNotificationCoordinator {
         let coordinator = self.clone();
         Some(tokio::spawn(async move {
             while let Some(event) = receiver.recv().await {
-                coordinator.deliver_activity_event(event).await;
+                match event {
+                    PushEvent::Activity(event) => coordinator.deliver_activity_event(event).await,
+                    PushEvent::FileOffer { offer_id } => {
+                        coordinator.deliver_file_offer_event(offer_id).await
+                    }
+                }
             }
         }))
     }
@@ -316,9 +341,6 @@ impl PushNotificationCoordinator {
         };
 
         for stored in subscriptions {
-            if !subscription_accepts_event(stored.subscription.mode, event.activity.state) {
-                continue;
-            }
             let endpoint = stored.subscription.endpoint.clone();
             let request =
                 match build_push_request(self.server_id, &identity, &stored.subscription, &event) {
@@ -345,6 +367,50 @@ impl PushNotificationCoordinator {
         }
     }
 
+    async fn deliver_file_offer_event(&self, offer_id: uuid::Uuid) {
+        let (identity, subscriptions) = match self.lock_store() {
+            Ok(store) => match store.delivery_material() {
+                Ok(material) => material,
+                Err(_) => {
+                    warn!("Web Push delivery state could not be read");
+                    return;
+                }
+            },
+            Err(_) => {
+                warn!("Web Push delivery state is unavailable");
+                return;
+            }
+        };
+
+        for stored in subscriptions {
+            let endpoint = stored.subscription.endpoint.clone();
+            let request = match build_file_offer_push_request(
+                self.server_id,
+                &identity,
+                &stored.subscription,
+                offer_id,
+            ) {
+                Ok(request) => request,
+                Err(()) => {
+                    warn!("Stored Web Push subscription is invalid");
+                    self.remove_subscription_if_current(&stored, &endpoint);
+                    continue;
+                }
+            };
+            match self.delivery.deliver(request).await {
+                Ok(response) if (200..300).contains(&response.status) => {}
+                Ok(response) if matches!(response.status, 404 | 410) => {
+                    self.remove_subscription_if_current(&stored, &endpoint);
+                }
+                Ok(response) => warn!(
+                    status = response.status,
+                    "Web Push provider rejected File Offer delivery"
+                ),
+                Err(_) => warn!("Web Push File Offer delivery failed"),
+            }
+        }
+    }
+
     fn remove_subscription_if_current(&self, stored: &StoredPushSubscription, endpoint: &str) {
         let result = self.lock_store().and_then(|mut store| {
             store
@@ -366,13 +432,6 @@ impl PushNotificationCoordinator {
     }
 }
 
-fn subscription_accepts_event(mode: PushNotificationMode, state: SessionActivityState) -> bool {
-    match mode {
-        PushNotificationMode::Attention => state == SessionActivityState::Attention,
-        PushNotificationMode::All => true,
-    }
-}
-
 #[derive(Serialize)]
 struct PushMessagePayload {
     version: u8,
@@ -386,11 +445,46 @@ struct PushMessagePayload {
     target_url: String,
 }
 
+#[derive(Serialize)]
+struct FileOfferPushPayload {
+    version: u8,
+    kind: &'static str,
+    server_id: ServerId,
+    offer_id: uuid::Uuid,
+}
+
 fn build_push_request(
     server_id: ServerId,
     identity: &VapidIdentity,
     subscription: &PushSubscription,
     event: &ActivityEvent,
+) -> Result<Request<Vec<u8>>, ()> {
+    let payload = push_message_payload(server_id, subscription.locale, event);
+    build_encrypted_push_request(identity, subscription, &payload)
+}
+
+fn build_file_offer_push_request(
+    server_id: ServerId,
+    identity: &VapidIdentity,
+    subscription: &PushSubscription,
+    offer_id: uuid::Uuid,
+) -> Result<Request<Vec<u8>>, ()> {
+    build_encrypted_push_request(
+        identity,
+        subscription,
+        &FileOfferPushPayload {
+            version: 1,
+            kind: "file_offer",
+            server_id,
+            offer_id,
+        },
+    )
+}
+
+fn build_encrypted_push_request(
+    identity: &VapidIdentity,
+    subscription: &PushSubscription,
+    payload: &impl Serialize,
 ) -> Result<Request<Vec<u8>>, ()> {
     let private_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&identity.private_key)
@@ -407,7 +501,6 @@ fn build_push_request(
         return Err(());
     }
     let auth = Auth::clone_from_slice(&auth);
-    let payload = push_message_payload(server_id, subscription.locale, event);
     let body = serde_json::to_vec(&payload).map_err(|_| ())?;
     if body.len() > PUSH_MESSAGE_MAX_BYTES {
         return Err(());
@@ -863,7 +956,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attention_mode_filters_completion_but_delivers_attention() {
+    async fn legacy_attention_mode_no_longer_filters_notifications() {
         let state_dir = TestStateDir::new("attention-mode");
         let delivery = Arc::new(FakeDelivery::new([]));
         let coordinator = PushNotificationCoordinator::open_with_delivery(
@@ -902,11 +995,47 @@ mod tests {
             SessionActivityState::Attention,
             4,
         )));
+        delivery.wait_for_requests(2).await;
+        for expected in ["completed", "attention"] {
+            let request = delivery.take_request();
+            let plaintext =
+                web_push_native::decrypt(request.into_body(), &ua_private, &auth).unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+            assert_eq!(payload["state"], expected);
+        }
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn file_offer_push_contains_only_generic_routing_identifiers() {
+        let state_dir = TestStateDir::new("file-offer");
+        let delivery = Arc::new(FakeDelivery::new([]));
+        let server_id = ServerId::new();
+        let coordinator = PushNotificationCoordinator::open_with_delivery(
+            server_id,
+            state_dir.state_path(),
+            delivery.clone(),
+        )
+        .unwrap();
+        let worker = coordinator.start_delivery_worker().unwrap();
+        let (subscription, ua_private, auth) = test_subscription(
+            "https://push.example.test/file-offer",
+            crate::state::web_push::PushNotificationMode::Attention,
+        );
+        coordinator
+            .upsert_subscription(DeviceId::new(), subscription)
+            .unwrap();
+        let offer_id = uuid::Uuid::new_v4();
+        assert!(coordinator.observe_file_offer(offer_id));
         delivery.wait_for_requests(1).await;
         let request = delivery.take_request();
         let plaintext = web_push_native::decrypt(request.into_body(), &ua_private, &auth).unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
-        assert_eq!(payload["state"], "attention");
+        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["kind"], "file_offer");
+        assert_eq!(payload["server_id"], server_id.0.to_string());
+        assert_eq!(payload["offer_id"], offer_id.to_string());
+        assert_eq!(payload.as_object().unwrap().len(), 4);
         worker.abort();
     }
 

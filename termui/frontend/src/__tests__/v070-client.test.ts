@@ -14,6 +14,131 @@ afterEach(() => {
 });
 
 describe("V070Client", () => {
+  it("delivers valid file offers once without mixing them into metadata state", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
+    const transport = {
+      onMetadata: undefined as ((data: unknown) => void) | undefined,
+      onTerminal: undefined as ((data: unknown) => void) | undefined,
+      connectMetadata: vi.fn(async () => undefined),
+      reconnectMetadata: vi.fn(async () => undefined),
+      openTerminal: vi.fn(async () => undefined),
+      closeTerminal: vi.fn(),
+      close: vi.fn(),
+      sendTerminal: vi.fn(),
+    };
+    const client = new V070Client(
+      {
+        server_id: "00000000-0000-0000-0000-000000000070",
+        daemon_public_key: "ed25519-v1:daemon",
+        url: "wss://relay.example/ws",
+        paired_at_ms: 1,
+        device_certificate: "device.certificate.signature",
+      },
+      device,
+      transport,
+    );
+    const offers: unknown[] = [];
+    const unsubscribe = client.watchFileOffers((offer) => offers.push(offer));
+    const offer = {
+      offer_id: "00000000-0000-4000-8000-000000000601",
+      name: "misleading.txt",
+      path: "/canonical/report.zip",
+      size_bytes: 1234,
+      created_at_ms: 1785144000000,
+      expires_at_ms: 1785230400000,
+    };
+
+    transport.onMetadata?.(JSON.stringify({ type: "file.offer", payload: offer }));
+    transport.onMetadata?.(JSON.stringify({
+      type: "metadata.snapshot",
+      payload: { revision: 1, state: { sessions: [], clients: [], daemon: {} } },
+    }));
+    unsubscribe();
+    transport.onMetadata?.(JSON.stringify({
+      type: "file.offer",
+      payload: { ...offer, offer_id: "00000000-0000-4000-8000-000000000602" },
+    }));
+    transport.onMetadata?.(JSON.stringify({
+      type: "file.offer",
+      payload: { ...offer, size_bytes: -1 },
+    }));
+
+    expect(offers).toEqual([offer]);
+  });
+
+  it("resolves and prepares file offers through authenticated HTTP routes", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
+    const transport = {
+      onMetadata: undefined as ((data: unknown) => void) | undefined,
+      onTerminal: undefined as ((data: unknown) => void) | undefined,
+      connectMetadata: vi.fn(async () => undefined),
+      reconnectMetadata: vi.fn(async () => undefined),
+      openTerminal: vi.fn(async () => undefined),
+      closeTerminal: vi.fn(),
+      close: vi.fn(),
+      sendTerminal: vi.fn(),
+    };
+    const httpRequest = vi.fn(async (path: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return Response.json({
+          download_id: "00000000-0000-4000-8000-000000000701",
+          download_url: "/api/files/offer-downloads/00000000-0000-4000-8000-000000000701?server_id=00000000-0000-0000-0000-000000000070",
+          name: "report.zip",
+          size_bytes: 1234,
+          expires_at_ms: 1785144060000,
+        });
+      }
+      return Response.json({
+        offer_id: "00000000-0000-4000-8000-000000000601",
+        name: "report.zip",
+        path: "/canonical/report.zip",
+        size_bytes: 1234,
+        created_at_ms: 1785144000000,
+        expires_at_ms: 1785230400000,
+      });
+    });
+    const client = new V070Client(
+      {
+        server_id: "00000000-0000-0000-0000-000000000070",
+        daemon_public_key: "ed25519-v1:daemon",
+        url: "wss://relay.example/ws",
+        paired_at_ms: 1,
+        device_certificate: "device.certificate.signature",
+      },
+      device,
+      transport,
+      undefined,
+      httpRequest,
+    );
+
+    await expect(client.resolveFileOffer("00000000-0000-4000-8000-000000000601")).resolves.toMatchObject({
+      path: "/canonical/report.zip",
+    });
+    const ready = await client.prepareFileOfferDownload("00000000-0000-4000-8000-000000000601");
+    expect(ready).toMatchObject({
+      download_id: "00000000-0000-4000-8000-000000000701",
+      download_url: "/api/files/offer-downloads/00000000-0000-4000-8000-000000000701?server_id=00000000-0000-0000-0000-000000000070",
+    });
+    expect(client.fileOfferDownloadUrl(ready)).toBe(
+      "https://relay.example/api/files/offer-downloads/00000000-0000-4000-8000-000000000701?server_id=00000000-0000-0000-0000-000000000070",
+    );
+    expect(httpRequest).toHaveBeenNthCalledWith(
+      1,
+      "/api/files/offers/00000000-0000-4000-8000-000000000601",
+      { method: "GET" },
+    );
+    expect(httpRequest).toHaveBeenNthCalledWith(
+      2,
+      "/api/files/offers/00000000-0000-4000-8000-000000000601/downloads",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+        credentials: "include",
+      },
+    );
+  });
+
   it("sends the source session id when creating in another session's cwd", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
     const sourceSessionId = "00000000-0000-0000-0000-000000000401";

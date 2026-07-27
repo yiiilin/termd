@@ -1,0 +1,5 @@
+# Reference offered files and snapshot only for download
+
+A File Offer records the source file's canonical path, identity metadata, and SHA-256 content digest without copying its bytes into persistent daemon storage. Digest calculation runs outside the protocol lock, so hashing a large file does not stall terminal traffic. A native download reopens the original regular file, copies it into a private unlinked temporary snapshot, requires the snapshot digest to match the offer, then validates the original identity again before returning `200`. The snapshot is removed automatically when the response ends. Removal, replacement, or content modification invalidates the offer and requires a new explicit `termd offer-file` call.
+
+This avoids retaining up to 64 large files for the 24-hour offer lifetime while preventing a download from mixing bytes read before and after a concurrent write. Offer creation reads the full source once to establish its digest. Each download can require temporary space equal to the offered file and does not begin streaming until the snapshot is complete.
