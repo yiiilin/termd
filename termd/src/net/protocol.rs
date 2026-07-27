@@ -41,13 +41,14 @@ use termd_proto::{
     METHOD_SESSION_FILES, METHOD_SESSION_GIT, METHOD_SESSION_GIT_ACTION, METHOD_SESSION_GIT_DIFF,
     METHOD_SESSION_RENAME, METHOD_SESSION_REORDER, METHOD_SESSION_SEARCH, MessageType, ServerId,
     SessionAttachPayload, SessionAttachedPayload, SessionClosePayload, SessionClosedPayload,
-    SessionCreatePayload, SessionCreatedPayload, SessionFileDeletePayload,
-    SessionFileDeletedPayload, SessionFileDownloadPreparePayload, SessionFileDownloadReadyPayload,
-    SessionFileDownloadStreamReadyPayload, SessionFileEntryPayload, SessionFileHttpDownloadPayload,
-    SessionFileHttpUploadReadyPayload, SessionFileHttpUploadStreamPayload, SessionFileKind,
-    SessionFileReadPayload, SessionFileReadResultPayload, SessionFileUploadPayload,
-    SessionFileUploadProgressPayload, SessionFileWritePayload, SessionFileWrittenPayload,
-    SessionFilesPayload, SessionFilesResultPayload, SessionGitActionKind, SessionGitActionPayload,
+    SessionCreateInSessionCwdPayload, SessionCreatePayload, SessionCreatedPayload,
+    SessionFileDeletePayload, SessionFileDeletedPayload, SessionFileDownloadPreparePayload,
+    SessionFileDownloadReadyPayload, SessionFileDownloadStreamReadyPayload,
+    SessionFileEntryPayload, SessionFileHttpDownloadPayload, SessionFileHttpUploadReadyPayload,
+    SessionFileHttpUploadStreamPayload, SessionFileKind, SessionFileReadPayload,
+    SessionFileReadResultPayload, SessionFileUploadPayload, SessionFileUploadProgressPayload,
+    SessionFileWritePayload, SessionFileWrittenPayload, SessionFilesPayload,
+    SessionFilesResultPayload, SessionGitActionKind, SessionGitActionPayload,
     SessionGitActionResultPayload, SessionGitDiffPayload, SessionGitDiffResultPayload,
     SessionGitFileChangePayload, SessionGitPayload, SessionGitResultPayload,
     SessionGitWorktreePayload, SessionId, SessionListPayload, SessionListResultPayload,
@@ -71,8 +72,8 @@ use crate::pty::supervisor::{
     SupervisorTerminalClientFrame, decode_supervisor_terminal_client_frame,
 };
 use crate::pty::{
-    CommandSpec, PtyAttachmentBootstrap, PtyBackend, PtyRestoreInfo, PtySize, PtySupervisorStatus,
-    PtyTerminalFrame, SessionActivityEvent,
+    CommandSpec, PinnedWorkingDirectory, PtyAttachmentBootstrap, PtyBackend, PtyRestoreInfo,
+    PtySize, PtySupervisorStatus, PtyTerminalFrame, SessionActivityEvent,
 };
 use crate::runtime::{RuntimeError, SessionRuntime};
 use crate::session::{
@@ -654,6 +655,8 @@ pub enum ProtocolError {
     PairingFailed,
     #[error("session was not found")]
     SessionNotFound,
+    #[error("session working directory is unavailable")]
+    SessionCwdUnavailable,
     #[error("runtime operation failed")]
     RuntimeFailed,
     #[error("daemon state persistence failed")]
@@ -669,6 +672,7 @@ impl ProtocolError {
             Self::AuthFailed => "auth_failed",
             Self::PairingFailed => "pairing_failed",
             Self::SessionNotFound => "session_not_found",
+            Self::SessionCwdUnavailable => "session_cwd_unavailable",
             Self::RuntimeFailed => "runtime_failed",
             Self::StateFailed => "state_failed",
         }
@@ -682,6 +686,7 @@ impl ProtocolError {
             Self::AuthFailed => "device authentication failed",
             Self::PairingFailed => "pairing failed",
             Self::SessionNotFound => "session was not found",
+            Self::SessionCwdUnavailable => "session working directory is unavailable",
             Self::RuntimeFailed => "runtime operation failed",
             Self::StateFailed => "daemon state persistence failed",
         }
@@ -727,7 +732,24 @@ pub struct DaemonProtocol<B: PtyBackend, V> {
 #[derive(Debug, Clone)]
 pub enum V070TerminalOpen {
     Create(SessionCreatePayload),
+    CreateInSessionCwd(SessionCreateInSessionCwdPayload),
     Attach(SessionAttachPayload),
+}
+
+pub(crate) fn parse_v070_terminal_open(command: Value) -> Result<V070TerminalOpen, ProtocolError> {
+    let payload = command.get("payload").cloned().unwrap_or(Value::Null);
+    match command.get("type").and_then(Value::as_str) {
+        Some("terminal.create") => serde_json::from_value(payload)
+            .map(V070TerminalOpen::Create)
+            .map_err(|_| ProtocolError::InvalidEnvelope),
+        Some("terminal.create_in_session_cwd") => serde_json::from_value(payload)
+            .map(V070TerminalOpen::CreateInSessionCwd)
+            .map_err(|_| ProtocolError::InvalidEnvelope),
+        Some("terminal.attach") => serde_json::from_value(payload)
+            .map(V070TerminalOpen::Attach)
+            .map_err(|_| ProtocolError::InvalidEnvelope),
+        _ => Err(ProtocolError::InvalidEnvelope),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1268,6 +1290,16 @@ where
                     .and_then(|response| decode_payload(response.payload))?;
                 (Some(created), None)
             }
+            V070TerminalOpen::CreateInSessionCwd(payload) => {
+                let responses =
+                    self.create_terminal_stream_session_in_session_cwd(connection, payload)?;
+                let created: SessionCreatedPayload = responses
+                    .into_iter()
+                    .find(|response| response.kind == MessageType::SessionCreated)
+                    .ok_or(ProtocolError::InvalidEnvelope)
+                    .and_then(|response| decode_payload(response.payload))?;
+                (Some(created), None)
+            }
             V070TerminalOpen::Attach(payload) => {
                 let responses = self.attach_terminal_session(connection, payload)?;
                 let attached: SessionAttachedPayload = responses
@@ -1417,18 +1449,45 @@ where
         connection: &mut ProtocolConnection,
         payload: SessionCreatePayload,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
-        self.create_session_inner(connection, payload, true)
+        self.create_session_inner(connection, payload, None, true)
+    }
+
+    fn create_terminal_stream_session_in_session_cwd(
+        &mut self,
+        connection: &mut ProtocolConnection,
+        payload: SessionCreateInSessionCwdPayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        self.create_session_inner(
+            connection,
+            SessionCreatePayload {
+                command: payload.command,
+                size: payload.size,
+            },
+            Some(payload.source_session_id),
+            true,
+        )
     }
 
     fn create_session_inner(
         &mut self,
         connection: &mut ProtocolConnection,
         payload: SessionCreatePayload,
+        cwd_source_session_id: Option<SessionId>,
         enqueue_terminal_snapshot: bool,
     ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
         let device_id = connection.authenticated_device_id()?;
-        let command = command_spec_from_payload(&payload.command, &self.config)?;
-        let session_root = session_root_from_command(&command)?;
+        let mut command = command_spec_from_payload(&payload.command, &self.config)?;
+        let (default_session_root, pinned_session_root) =
+            if let Some(source_session_id) = cwd_source_session_id {
+                let cwd = self.session_cwd_for_create(source_session_id)?;
+                let command_path = cwd
+                    .command_path()
+                    .ok_or(ProtocolError::SessionCwdUnavailable)?;
+                command = command.cwd(command_path);
+                (None, Some(cwd))
+            } else {
+                (Some(session_root_from_command(&command)?), None)
+            };
         let runtime_size = proto_size_to_runtime(payload.size);
         let wire_session_id = SessionId::new();
         let internal_session_id = wire_session_id.0.to_string();
@@ -1443,6 +1502,7 @@ where
         let attachment_id = connection.allocate_watched_attachment_id(wire_session_id);
         let response_name = session_name.clone();
         let client_history = &mut self.client_history;
+        let mut cwd_unavailable_during_prepare = false;
         let prepared = self.ownership.create(
             &mut self.runtime,
             &internal_session_id,
@@ -1468,6 +1528,19 @@ where
                     },
                 )
                 .map_err(|_| crate::session_ownership::OwnershipError::Preparation)?;
+                let session_root = if let Some(cwd) = pinned_session_root.as_ref() {
+                    match cwd.resolve_linked_path() {
+                        Some(path) => path,
+                        None => {
+                            cwd_unavailable_during_prepare = true;
+                            return Err(crate::session_ownership::OwnershipError::Preparation);
+                        }
+                    }
+                } else {
+                    default_session_root
+                        .clone()
+                        .ok_or(crate::session_ownership::OwnershipError::Preparation)?
+                };
                 client_history.record_session_created(
                     wire_session_id,
                     SessionState::Running,
@@ -1482,17 +1555,21 @@ where
                     payload.size,
                     now_ms,
                 )?;
-                Ok((response, attachment_id))
+                Ok((response, attachment_id, session_root))
             },
         );
-        let (response_envelope, attachment_id) = match prepared {
+        let (response_envelope, attachment_id, session_root) = match prepared {
             Ok(prepared) => prepared,
             Err(_) => {
                 let _ = self
                     .client_history
                     .record_session_closed(wire_session_id, current_unix_timestamp_millis());
                 let _ = self.client_history.prune_closed_session(wire_session_id);
-                return Err(ProtocolError::StateFailed);
+                return Err(if cwd_unavailable_during_prepare {
+                    ProtocolError::SessionCwdUnavailable
+                } else {
+                    ProtocolError::StateFailed
+                });
             }
         };
 
@@ -1513,6 +1590,31 @@ where
         self.notify_v070_metadata_changed();
         crate::session_ownership::test_crash_checkpoint("before_create_response");
         Ok(vec![response_envelope])
+    }
+
+    fn session_cwd_for_create(
+        &self,
+        source_session_id: SessionId,
+    ) -> Result<PinnedWorkingDirectory, ProtocolError> {
+        let internal_session_id = self
+            .session_index
+            .get(&source_session_id)
+            .ok_or(ProtocolError::SessionNotFound)?;
+        let state = self
+            .runtime
+            .state(internal_session_id)
+            .map_err(map_runtime_error)?;
+        if state != RuntimeSessionState::Running {
+            return Err(ProtocolError::SessionCwdUnavailable);
+        }
+        let cwd = self
+            .runtime
+            .pin_current_working_directory(internal_session_id)
+            .map_err(map_runtime_error)?
+            .ok_or(ProtocolError::SessionCwdUnavailable)?;
+        cwd.resolve_linked_path()
+            .ok_or(ProtocolError::SessionCwdUnavailable)?;
+        Ok(cwd)
     }
 
     pub(crate) fn attach_terminal_session(

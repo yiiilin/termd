@@ -457,6 +457,18 @@ label {
   min-height: 30px;
 }
 
+.protocol-error-dismiss {
+  width: 30px;
+  min-width: 30px;
+  min-height: 30px;
+  margin-left: auto;
+  padding: 0;
+}
+
+.protocol-error-refresh + .protocol-error-dismiss {
+  margin-left: 0;
+}
+
 .protocol-error-alert-detail {
   min-width: 0;
   display: flex;
@@ -1200,13 +1212,74 @@ label {
   text-transform: uppercase;
 }
 
+.session-create-control {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+}
+
 .session-create-button {
   width: 100%;
   min-height: 36px;
   border-color: var(--color-border-soft);
+  border-radius: 6px 0 0 6px;
   background: transparent;
   color: var(--color-text-strong);
   font-weight: 650;
+}
+
+.session-create-menu-trigger {
+  width: 36px;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0;
+  border-color: var(--color-border-soft);
+  border-left: 0;
+  border-radius: 0 6px 6px 0;
+  background: transparent;
+  color: var(--color-text-muted);
+}
+
+.session-create-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 80;
+  width: 220px;
+  display: grid;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid var(--color-border-control);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--color-surface-soft) 96%, transparent);
+  box-shadow: 0 12px 30px var(--color-popover-shadow);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  transform-origin: top right;
+  animation: popover-materialize 160ms var(--ease-out-ui) both;
+}
+
+.session-create-menu button {
+  width: 100%;
+  min-height: 32px;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  justify-content: start;
+  gap: 8px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text);
+  font-size: 12px;
+  text-align: left;
+}
+
+.session-create-menu button:hover:not(:disabled),
+.session-create-menu button:focus-visible {
+  outline: none;
+  background: var(--color-surface-hover);
 }
 
 .session-list {
@@ -2992,6 +3065,49 @@ label {
 
 .file-context-menu button.danger {
   color: var(--color-danger-text);
+}
+
+.session-context-menu {
+  --termd-session-menu-width: min(
+    220px,
+    calc(
+      var(--termd-layout-viewport-width, var(--termd-visual-viewport-width, 100dvw)) -
+      env(safe-area-inset-left, 0px) -
+      env(safe-area-inset-right, 0px) -
+      16px
+    )
+  );
+  width: var(--termd-session-menu-width);
+  max-width: none;
+  left: clamp(
+    calc(
+      var(--termd-visual-viewport-offset-left, 0px) +
+      env(safe-area-inset-left, 0px) +
+      8px
+    ),
+    var(--termd-session-menu-anchor-x, 8px),
+    calc(
+      var(--termd-visual-viewport-offset-left, 0px) +
+      var(--termd-layout-viewport-width, var(--termd-visual-viewport-width, 100dvw)) -
+      env(safe-area-inset-right, 0px) -
+      var(--termd-session-menu-width) -
+      8px
+    )
+  );
+  top: clamp(
+    calc(
+      var(--termd-visual-viewport-offset-top, 0px) +
+      env(safe-area-inset-top, 0px) +
+      8px
+    ),
+    var(--termd-session-menu-anchor-y, 8px),
+    calc(
+      var(--termd-visual-viewport-offset-top, 0px) +
+      var(--termd-layout-viewport-height, var(--termd-visual-viewport-height, 100dvh)) -
+      env(safe-area-inset-bottom, 0px) -
+      168px
+    )
+  );
 }
 
 .file-context-menu button span {
@@ -4836,6 +4952,24 @@ label {
     border-radius: 0;
   }
 
+  .mobile-sessions-panel .session-actions {
+    opacity: 1;
+    transform: none;
+  }
+
+  .mobile-sessions-panel .session-actions .session-actions-menu-button {
+    position: relative;
+    width: 36px;
+    min-width: 36px;
+    min-height: 36px;
+  }
+
+  .mobile-sessions-panel .session-actions .session-actions-menu-button::after {
+    content: "";
+    position: absolute;
+    inset: -4px;
+  }
+
   .mobile-files-panel .files-panel {
     grid-row: 1 / -1;
     position: relative;
@@ -5284,6 +5418,8 @@ label {
   .destructive-action-dialog,
   .unsaved-file-dialog,
   .mobile-menu-popover,
+  .session-create-menu,
+  .session-context-menu,
   .clients-popover .panel,
   .terminal-open-progress-popover {
     border-width: 2px;
@@ -5315,12 +5451,19 @@ label {
 
   .toolbar,
   .mobile-menu-popover,
+  .session-create-menu,
+  .session-context-menu,
   .terminal-direction-pad {
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
   }
 
   .mobile-menu-popover {
+    background: var(--color-surface);
+  }
+
+  .session-create-menu,
+  .session-context-menu {
     background: var(--color-surface);
   }
 
@@ -5355,6 +5498,8 @@ label {
   .mobile-menu-popover,
   .mobile-panel,
   .clients-popover,
+  .session-create-menu,
+  .session-context-menu,
   .terminal-open-progress-popover {
     animation: none;
     transform: none;

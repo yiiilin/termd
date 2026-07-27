@@ -263,6 +263,7 @@ pub const METHOD_CLIENT_HELLO: &str = "client.hello";
 pub const METHOD_SESSION_CREATE: &str = "session.create";
 pub const METHOD_SESSION_ATTACH: &str = "session.attach";
 pub const METHOD_TERMINAL_CREATE: &str = "terminal.create";
+pub const METHOD_TERMINAL_CREATE_IN_SESSION_CWD: &str = "terminal.create_in_session_cwd";
 pub const METHOD_TERMINAL_ATTACH: &str = "terminal.attach";
 pub const METHOD_TERMINAL_OUTPUT: &str = "terminal.output";
 pub const METHOD_SESSION_DATA: &str = "session.data";
@@ -609,6 +610,14 @@ impl Default for TerminalSize {
 /// 创建持久终端 session 的请求。空 command 表示使用 daemon 默认命令。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCreatePayload {
+    pub command: Vec<String>,
+    pub size: TerminalSize,
+}
+
+/// 基于一个运行中 session 的实时工作目录创建持久终端 session。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCreateInSessionCwdPayload {
+    pub source_session_id: SessionId,
     pub command: Vec<String>,
     pub size: TerminalSize,
 }
@@ -2288,6 +2297,29 @@ mod tests {
             command: vec!["/bin/sh".to_owned()],
             size,
         });
+        assert_roundtrip(SessionCreateInSessionCwdPayload {
+            source_session_id: session_id,
+            command: vec!["/bin/sh".to_owned()],
+            size,
+        });
+        let create_in_cwd = SessionCreateInSessionCwdPayload {
+            source_session_id: session_id,
+            command: vec!["/bin/sh".to_owned()],
+            size,
+        };
+        let create_in_cwd_json = serde_json::to_value(&create_in_cwd).unwrap();
+        assert_eq!(
+            create_in_cwd_json,
+            serde_json::json!({
+                "source_session_id": session_id,
+                "command": ["/bin/sh"],
+                "size": size,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionCreateInSessionCwdPayload>(create_in_cwd_json).unwrap(),
+            create_in_cwd
+        );
         assert_roundtrip(SessionCreatedPayload {
             session_id,
             name: Some("Ada".to_owned()),

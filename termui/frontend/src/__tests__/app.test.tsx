@@ -5034,6 +5034,95 @@ describe("termui web 工作台", () => {
     ).toHaveLength(0);
   });
 
+  it("可以在当前会话的实时目录新建并在成功后切换", async () => {
+    const user = userEvent.setup();
+    const sourceSession = {
+      session_id: "00000000-0000-0000-0000-000000000591",
+      name: "source",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [sourceSession],
+      attachOutput: "cwd-create-ready\n",
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("source");
+    await screen.findByText(/cwd-create-ready/);
+    await user.click(screen.getByRole("button", { name: "New session options" }));
+    await user.click(screen.getByRole("menuitem", { name: "New in current directory" }));
+
+    await waitFor(() => expect(daemon.createdFromSessionCwd).toEqual([sourceSession.session_id]));
+    await waitFor(() => expect(visibleSessionNames()).toHaveLength(2));
+    expect(visibleSessionNames()).toContain("source");
+    expect(
+      daemon.receivedPackets.filter(
+        (packet) => packet.kind === "stream_open" && packet.method === "terminal.create_in_session_cwd",
+      ),
+    ).toHaveLength(1);
+    expect(
+      daemon.receivedPackets.filter(
+        (packet) => packet.kind === "stream_open" && packet.method === "terminal.create",
+      ),
+    ).toHaveLength(0);
+
+    await waitFor(() => expect(daemon.v070MetadataConnections).toBeGreaterThanOrEqual(2));
+    const createdSessionId = "00000000-0000-0000-0000-000000000501";
+    daemon.setSessions([
+      {
+        session_id: createdSessionId,
+        name: fallbackSessionDisplayName(createdSessionId),
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+      { ...sourceSession, name: "source-after-create" },
+    ]);
+    await waitFor(() => expect(visibleSessionNames()).toContain("source-after-create"));
+  });
+
+  it("按当前目录新建失败时保留原终端并允许继续输入", async () => {
+    const user = userEvent.setup();
+    const sourceSession = {
+      session_id: "00000000-0000-0000-0000-000000000592",
+      name: "source",
+      state: "running",
+      size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+    } as const;
+    await daemon.stop();
+    daemon = await MockDaemon.start({
+      token: "secret-token",
+      sessions: [sourceSession],
+      attachOutput: "source-still-ready\n",
+      sessionCreateInCwdError: {
+        code: "session_cwd_unavailable",
+        message: "session working directory is unavailable",
+      },
+    });
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession("source");
+    await screen.findByText(/source-still-ready/);
+    await user.click(screen.getByRole("button", { name: "New session options" }));
+    await user.click(screen.getByRole("menuitem", { name: "New in current directory" }));
+
+    const alert = await screen.findByRole("alert", { name: "Couldn't create session" });
+    expect(alert).toHaveTextContent("the source session's current directory is unavailable");
+    expect(visibleSessionNames()).toEqual(["source"]);
+    expect(terminalText()).toContain("source-still-ready");
+    const terminalInput = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+    expect(terminalInput).not.toBeNull();
+    fireEvent.input(terminalInput!, { target: { value: "still-attached" } });
+    await waitFor(() => expect(daemon.sessionDataMessages).toContain("still-attached"));
+
+    await user.click(within(alert).getByRole("button", { name: "Dismiss error" }));
+    expect(screen.queryByRole("alert", { name: "Couldn't create session" })).toBeNull();
+  });
+
   it("空工作台新建 session 只新增一条 terminal WebSocket", async () => {
     const user = userEvent.setup();
     await daemon.stop();

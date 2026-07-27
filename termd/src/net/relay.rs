@@ -34,7 +34,9 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, trace, warn};
 
-use super::protocol::{JsonEnvelope, ProtocolConnection, ProtocolWireMessage, V070TerminalOpen};
+use super::protocol::{
+    JsonEnvelope, ProtocolConnection, ProtocolWireMessage, parse_v070_terminal_open,
+};
 use super::server::{SharedDaemonProtocol, handle_http_tunnel_stream_request};
 use crate::auth::current_unix_timestamp_millis;
 use crate::config::RelayReconnectConfig;
@@ -84,6 +86,12 @@ const RELAY_DATA_CONNECT_RETRY_POLICY: RelayDataConnectRetryPolicy = RelayDataCo
 
 enum RelayEstablishedDataOutcome {
     SocketClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayV070TerminalOutcome {
+    SocketClosed,
+    ErrorSent,
 }
 
 #[derive(Debug)]
@@ -1034,6 +1042,23 @@ async fn enqueue_v070_json(
     enqueue_relay_data_raw(write_tx, RelayOutKind::Response, Message::Text(raw)).await
 }
 
+async fn enqueue_v070_error(
+    write_tx: &mpsc::Sender<RelayDataWrite>,
+    code: &'static str,
+    message: &'static str,
+) -> Result<(), RelayConnectorError> {
+    enqueue_v070_json(
+        write_tx,
+        "error",
+        serde_json::json!({
+            "code": code,
+            "message": message,
+            "retryable": false,
+        }),
+    )
+    .await
+}
+
 async fn run_relay_v070_data_connection(
     relay_endpoint: String,
     protocol: SharedDaemonProtocol,
@@ -1061,7 +1086,7 @@ async fn run_relay_v070_data_connection(
         writer_stop_rx,
     ));
 
-    let result = match route_kind {
+    let flush_before_close = match route_kind {
         RelayRouteKind::Metadata => {
             run_relay_v070_metadata(
                 protocol,
@@ -1070,24 +1095,36 @@ async fn run_relay_v070_data_connection(
                 &write_tx,
                 &mut writer_failed_rx,
             )
-            .await
+            .await?;
+            false
         }
         RelayRouteKind::Terminal => {
-            run_relay_v070_terminal(
+            let outcome = run_relay_v070_terminal(
                 protocol,
                 device_id,
                 receiver,
                 &write_tx,
                 &mut writer_failed_rx,
             )
-            .await
+            .await?;
+            outcome == RelayV070TerminalOutcome::ErrorSent
         }
-        RelayRouteKind::Legacy | RelayRouteKind::Http => Err(RelayConnectorError::InvalidEnvelope),
+        RelayRouteKind::Legacy | RelayRouteKind::Http => {
+            return Err(RelayConnectorError::InvalidEnvelope);
+        }
     };
     drop(write_tx);
-    writer_task.abort();
-    let _ = writer_task.await;
-    result?;
+    if flush_before_close {
+        match timeout(RELAY_SEND_DEADLINE, writer_task).await {
+            Ok(Ok(RelayDataWriterOutcome::Reusable(_))) => {}
+            Ok(Ok(RelayDataWriterOutcome::Closed)) | Ok(Err(_)) | Err(_) => {
+                return Err(RelayConnectorError::SendFailed);
+            }
+        }
+    } else {
+        writer_task.abort();
+        let _ = writer_task.await;
+    }
     Ok(RelayEstablishedDataOutcome::SocketClosed)
 }
 
@@ -1159,7 +1196,7 @@ async fn run_relay_v070_terminal(
     receiver: &mut RelayReceiver,
     write_tx: &mpsc::Sender<RelayDataWrite>,
     writer_failed_rx: &mut mpsc::Receiver<()>,
-) -> Result<(), RelayConnectorError> {
+) -> Result<RelayV070TerminalOutcome, RelayConnectorError> {
     let first = timeout(Duration::from_secs(30), receiver.next())
         .await
         .map_err(|_| RelayConnectorError::ReceiveFailed)?
@@ -1170,25 +1207,30 @@ async fn run_relay_v070_terminal(
     };
     let command: serde_json::Value =
         serde_json::from_str(&raw).map_err(|_| RelayConnectorError::InvalidEnvelope)?;
-    let payload = command
-        .get("payload")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let open = match command.get("type").and_then(serde_json::Value::as_str) {
-        Some("terminal.create") => serde_json::from_value(payload)
-            .map(V070TerminalOpen::Create)
-            .map_err(|_| RelayConnectorError::InvalidEnvelope)?,
-        Some("terminal.attach") => serde_json::from_value(payload)
-            .map(V070TerminalOpen::Attach)
-            .map_err(|_| RelayConnectorError::InvalidEnvelope)?,
-        _ => return Err(RelayConnectorError::InvalidEnvelope),
+    let open = match parse_v070_terminal_open(command) {
+        Ok(open) => open,
+        Err(_) => {
+            enqueue_v070_error(
+                write_tx,
+                "invalid_terminal_open",
+                "terminal open command is invalid",
+            )
+            .await?;
+            return Ok(RelayV070TerminalOutcome::ErrorSent);
+        }
     };
     let mut connection = ProtocolConnection::authenticated_v070_terminal(device_id);
-    let opened = protocol
-        .lock()
-        .await
-        .open_v070_terminal(&mut connection, open)
-        .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
+    let opened = {
+        let mut guard = protocol.lock().await;
+        match guard.open_v070_terminal(&mut connection, open) {
+            Ok(opened) => opened,
+            Err(error) => {
+                drop(guard);
+                enqueue_v070_error(write_tx, error.code(), error.safe_message()).await?;
+                return Ok(RelayV070TerminalOutcome::ErrorSent);
+            }
+        }
+    };
     let session_id = opened.snapshot.session_id;
     if let Some(created) = opened.created {
         enqueue_v070_json(
@@ -1239,7 +1281,8 @@ async fn run_relay_v070_terminal(
         }
     };
     connection.close(&mut *protocol.lock().await);
-    result
+    result?;
+    Ok(RelayV070TerminalOutcome::SocketClosed)
 }
 
 async fn flush_relay_v070_terminal_frames(
@@ -2445,6 +2488,59 @@ fn authority_contains_credentials(authority: &str) -> bool {
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand_core::OsRng;
+    use termd_proto::{
+        AuthPayload, DeviceId, METHOD_SESSION_CLOSE, Nonce, PublicKey, SessionCreatePayload,
+        Signature, TerminalSize,
+    };
+
+    use crate::auth::AccessTokenProofInput;
+
+    async fn relay_access_token_for_test(protocol: &SharedDaemonProtocol) -> String {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let device_id = DeviceId::new();
+        let public_key = PublicKey(format!(
+            "ed25519-v1:{}",
+            base64::engine::general_purpose::STANDARD
+                .encode(signing_key.verifying_key().as_bytes())
+        ));
+        let now_ms = current_unix_timestamp_millis();
+        let mut guard = protocol.lock().await;
+        let (ticket, _) = guard.issue_pair_ticket_credential(now_ms).unwrap();
+        let certificate = guard
+            .pair_device_certificate(&ticket, device_id, public_key, now_ms)
+            .unwrap();
+        let challenge = guard
+            .issue_access_token_challenge(&certificate, device_id, now_ms)
+            .unwrap();
+        let mut payload = AuthPayload {
+            device_id,
+            challenge: challenge.challenge,
+            nonce: Nonce(format!("relay-v070-test-{}", ServerId::new().0)),
+            timestamp_ms: now_ms,
+            signature: Signature(String::new()),
+        };
+        payload.signature = Signature(format!(
+            "ed25519-v1:{}",
+            base64::engine::general_purpose::STANDARD.encode(
+                signing_key
+                    .sign(
+                        &AccessTokenProofInput {
+                            server_id: guard.server_id(),
+                            payload: &payload,
+                        }
+                        .to_bytes(),
+                    )
+                    .to_bytes(),
+            )
+        ));
+        guard
+            .exchange_access_token(&certificate, payload, now_ms)
+            .unwrap()
+            .0
+    }
 
     #[test]
     fn relay_data_connect_uses_configured_attempt_timeouts() {
@@ -2713,6 +2809,308 @@ mod tests {
         drop(protocol);
         std::fs::remove_dir_all(state_dir).unwrap();
         assert_eq!(echoed_timestamp_ms, Some(timestamp_ms));
+    }
+
+    #[tokio::test]
+    async fn relay_terminal_open_forwards_structured_protocol_error() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "termd-relay-terminal-error-{}-{}",
+            std::process::id(),
+            ServerId::new().0
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("daemon-state.json");
+        let protocol = crate::net::server::default_protocol(
+            crate::config::DaemonConfig::default_for_state_path(&state_path),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let missing_session_id = SessionId::new();
+        let relay_peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "terminal.create_in_session_cwd",
+                        "payload": {
+                            "source_session_id": missing_session_id,
+                            "command": [],
+                            "size": {
+                                "rows": 24,
+                                "cols": 80,
+                                "pixel_width": 0,
+                                "pixel_height": 0
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (_relay_sender, mut receiver) = socket.split();
+        let (write_tx, mut write_rx) = mpsc::channel(4);
+        let (_writer_failed_tx, mut writer_failed_rx) = mpsc::channel(1);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_relay_v070_terminal(
+                protocol.clone(),
+                termd_proto::DeviceId::new(),
+                &mut receiver,
+                &write_tx,
+                &mut writer_failed_rx,
+            ),
+        )
+        .await
+        .expect("terminal open should finish after sending the error")
+        .expect("terminal open error should stay an application response");
+        assert_eq!(outcome, RelayV070TerminalOutcome::ErrorSent);
+
+        let response = write_rx
+            .recv()
+            .await
+            .expect("terminal error should be queued");
+        let RelayDataWrite::Raw { message, .. } = response;
+        let response: serde_json::Value =
+            serde_json::from_str(&message.into_text().unwrap()).unwrap();
+        assert_eq!(response["type"], "error");
+        assert_eq!(response["payload"]["code"], "session_not_found");
+        assert_eq!(response["payload"]["retryable"], false);
+
+        relay_peer.abort();
+        drop(protocol);
+        std::fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_terminal_protocol_error_reaches_socket_before_pipe_closes() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "termd-relay-terminal-flush-{}-{}",
+            std::process::id(),
+            ServerId::new().0
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("daemon-state.json");
+        let protocol = crate::net::server::default_protocol(
+            crate::config::DaemonConfig::default_for_state_path(&state_path),
+        );
+        let access_token = relay_access_token_for_test(&protocol).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let missing_session_id = SessionId::new();
+        let relay_peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "terminal.create_in_session_cwd",
+                        "payload": {
+                            "source_session_id": missing_session_id,
+                            "command": [],
+                            "size": {
+                                "rows": 24,
+                                "cols": 80,
+                                "pixel_width": 0,
+                                "pixel_height": 0
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .expect("relay terminal response should arrive before pipe close")
+                .expect("relay pipe closed before forwarding the terminal error")
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&response.into_text().unwrap()).unwrap()
+        });
+
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (sender, mut receiver) = socket.split();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_relay_v070_data_connection(
+                "ws://relay.test".to_owned(),
+                protocol.clone(),
+                RelayClientId(99),
+                sender,
+                &mut receiver,
+                RelayRouteKind::Terminal,
+                Some(access_token),
+            ),
+        )
+        .await
+        .expect("relay terminal data pipe should close after flushing the error")
+        .expect("relay terminal application error should not fail the data pipe");
+        assert!(matches!(outcome, RelayEstablishedDataOutcome::SocketClosed));
+        drop(receiver);
+
+        let response = relay_peer.await.unwrap();
+        assert_eq!(response["type"], "error");
+        assert_eq!(response["payload"]["code"], "session_not_found");
+
+        drop(protocol);
+        std::fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(target_os = "linux")]
+    async fn relay_terminal_create_in_session_cwd_streams_and_persists_source_root() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "trcwd-{}-{}",
+            std::process::id(),
+            ServerId::new().0
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("daemon-state.json");
+        let protocol = crate::net::server::default_protocol(
+            crate::config::DaemonConfig::default_for_state_path(&state_path),
+        );
+        let size = TerminalSize::new(24, 80);
+        let source_session_id = {
+            let mut guard = protocol.lock().await;
+            let mut connection = ProtocolConnection::authenticated_v070_terminal(DeviceId::new());
+            let source = guard
+                .open_v070_terminal(
+                    &mut connection,
+                    crate::net::protocol::V070TerminalOpen::Create(SessionCreatePayload {
+                        command: vec!["sh".into()],
+                        size,
+                    }),
+                )
+                .unwrap()
+                .created
+                .unwrap();
+            connection.close(&mut guard);
+            source.session_id
+        };
+        let source_session_root: std::path::PathBuf = {
+            let sqlite = rusqlite::Connection::open(
+                crate::state::sqlite_state_path_for_state_path(&state_path),
+            )
+            .unwrap();
+            sqlite
+                .query_row(
+                    "SELECT root_path FROM daemon_sessions WHERE session_id = ?1",
+                    [source_session_id.0.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .map(std::path::PathBuf::from)
+                .unwrap()
+        };
+        let access_token = relay_access_token_for_test(&protocol).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let relay_peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "terminal.create_in_session_cwd",
+                        "payload": {
+                            "source_session_id": source_session_id,
+                            "command": ["sh"],
+                            "size": size,
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            let created = socket.next().await.unwrap().unwrap();
+            let snapshot = socket.next().await.unwrap().unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .expect("relay cwd terminal should stream an initial binary frame")
+                .unwrap()
+                .unwrap();
+            let _ = socket.close(None).await;
+            (
+                serde_json::from_str::<serde_json::Value>(&created.into_text().unwrap()).unwrap(),
+                serde_json::from_str::<serde_json::Value>(&snapshot.into_text().unwrap()).unwrap(),
+                frame.is_binary(),
+            )
+        });
+
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (sender, mut receiver) = socket.split();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_relay_v070_data_connection(
+                "ws://relay.test".to_owned(),
+                protocol.clone(),
+                RelayClientId(100),
+                sender,
+                &mut receiver,
+                RelayRouteKind::Terminal,
+                Some(access_token),
+            ),
+        )
+        .await
+        .expect("relay cwd terminal pipe should close after its peer")
+        .expect("relay cwd terminal success should not fail the data pipe");
+        assert!(matches!(outcome, RelayEstablishedDataOutcome::SocketClosed));
+        drop(receiver);
+
+        let (created, snapshot, has_binary_frame) = relay_peer.await.unwrap();
+        assert_eq!(created["type"], "terminal.created");
+        assert_eq!(snapshot["type"], "terminal.snapshot");
+        assert!(has_binary_frame);
+        let created_session_id = SessionId(
+            uuid::Uuid::parse_str(created["payload"]["session_id"].as_str().unwrap()).unwrap(),
+        );
+        let sqlite =
+            rusqlite::Connection::open(crate::state::sqlite_state_path_for_state_path(&state_path))
+                .unwrap();
+        let persisted_root: String = sqlite
+            .query_row(
+                "SELECT root_path FROM daemon_sessions WHERE session_id = ?1",
+                [created_session_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(persisted_root),
+            source_session_root
+        );
+        drop(sqlite);
+
+        {
+            let mut guard = protocol.lock().await;
+            for session_id in [created_session_id, source_session_id] {
+                let mut connection = ProtocolConnection::authenticated_http(DeviceId::new());
+                guard
+                    .restore_http_control_scope(&mut connection, session_id)
+                    .unwrap();
+                connection
+                    .dispatch_v070_http_control(
+                        &mut guard,
+                        METHOD_SESSION_CLOSE,
+                        serde_json::json!({ "session_id": session_id }),
+                    )
+                    .unwrap();
+                connection.close(&mut guard);
+            }
+        }
+        drop(protocol);
+        std::fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]

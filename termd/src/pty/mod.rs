@@ -20,6 +20,49 @@ use tracing::warn;
 /// PTY 模块统一使用的 Result 类型。
 pub type PtyResult<T> = Result<T, PtyError>;
 
+/// 操作期间固定到同一个目录 inode 的工作目录句柄。
+#[derive(Debug)]
+pub struct PinnedWorkingDirectory {
+    handle: std::fs::File,
+}
+
+impl PinnedWorkingDirectory {
+    /// 返回可交给子进程 `chdir` 的稳定路径。句柄存活期间 rename/recreate 不会改变目标 inode。
+    pub(crate) fn command_path(&self) -> Option<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            return Some(PathBuf::from(format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                self.handle.as_raw_fd()
+            )));
+        }
+        #[cfg(not(target_os = "linux"))]
+        None
+    }
+
+    /// 在创建提交点解析当前名称；已删除或不再可解析的目录视为不可用。
+    pub(crate) fn resolve_linked_path(&self) -> Option<PathBuf> {
+        #[cfg(not(target_os = "linux"))]
+        return None;
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let before = self.handle.metadata().ok()?;
+            if !before.is_dir() || before.nlink() == 0 {
+                return None;
+            }
+            let path = self.command_path()?.canonicalize().ok()?;
+            let after = self.handle.metadata().ok()?;
+            (after.is_dir() && after.nlink() > 0).then_some(path)
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionActivityEvent {
     pub session_id: String,
@@ -672,6 +715,12 @@ pub trait PtySession: Send {
     fn current_working_directory(&self) -> Option<PathBuf> {
         None
     }
+
+    /// 固定 PTY 主进程当前目录，供需要跨进程启动且不能接受路径替换竞态的调用方使用。
+    fn pin_current_working_directory(&self) -> Option<PinnedWorkingDirectory> {
+        self.process_id()
+            .and_then(pin_current_working_directory_for_pid)
+    }
 }
 
 mod base64_bytes {
@@ -699,6 +748,31 @@ mod base64_bytes {
 /// Linux 上通过 `/proc/<pid>/cwd` 读取 shell 当前目录；其他平台先降级为不可用。
 pub(crate) fn current_working_directory_for_pid(pid: u32) -> Option<PathBuf> {
     platform_current_working_directory_for_pid(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_working_directory_for_pid(pid: u32) -> Option<PinnedWorkingDirectory> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+
+    let path = CString::new(format!("/proc/{pid}/cwd")).ok()?;
+    // O_PATH 只要求目录可遍历，不额外要求读取目录内容。
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let handle = unsafe { std::fs::File::from_raw_fd(fd) };
+    Some(PinnedWorkingDirectory { handle })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_working_directory_for_pid(_pid: u32) -> Option<PinnedWorkingDirectory> {
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -762,6 +836,62 @@ mod tests {
             command.validate(),
             Err(PtyError::InvalidCommand(_))
         ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pinned_working_directory_survives_rename_and_path_replacement() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        let root = std::env::temp_dir().join(format!(
+            "termd-pinned-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let original = root.join("original");
+        let renamed = root.join("renamed");
+        std::fs::create_dir_all(&original).unwrap();
+
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "cd \"$1\" && printf 'ready\\n' && exec sleep 60",
+                "termd-test",
+            ])
+            .arg(&original)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+
+        let pinned = pin_current_working_directory_for_pid(child.id()).unwrap();
+        std::fs::rename(&original, &renamed).unwrap();
+        std::fs::create_dir(&original).unwrap();
+
+        let expected = renamed.canonicalize().unwrap();
+        let resolved = pinned.resolve_linked_path().unwrap();
+        let spawned_pwd = Command::new("pwd")
+            .current_dir(pinned.command_path().unwrap())
+            .output()
+            .unwrap();
+        let spawned_pwd = PathBuf::from(String::from_utf8(spawned_pwd.stdout).unwrap().trim_end());
+
+        let _ = child.kill();
+        let _ = child.wait();
+        std::fs::remove_dir(&original).unwrap();
+        std::fs::remove_dir(&renamed).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+
+        assert_eq!(resolved, expected);
+        assert_eq!(spawned_pwd, expected);
     }
 
     #[test]

@@ -49,9 +49,11 @@ use crate::pty::supervisor::SupervisorPtyBackend;
 use crate::state::web_push::{PushNotificationLocale, PushNotificationMode, PushSubscription};
 use crate::state::{StateError, StateStore};
 
+#[cfg(test)]
+use super::protocol::V070TerminalOpen;
 use super::protocol::{
-    DaemonProtocol, ProtocolConnection, ProtocolError, V070TerminalOpen,
-    cleanup_persisted_session_file_http_uploads,
+    DaemonProtocol, ProtocolConnection, ProtocolError, cleanup_persisted_session_file_http_uploads,
+    parse_v070_terminal_open,
 };
 use super::signature::Ed25519SignatureVerifier;
 use recovery::warn_about_orphaned_supervisors;
@@ -718,16 +720,7 @@ async fn run_terminal_websocket(
         Ok(command) => command,
         Err(_) => return,
     };
-    let payload = command.get("payload").cloned().unwrap_or(Value::Null);
-    let open: Result<V070TerminalOpen, ()> = match command.get("type").and_then(Value::as_str) {
-        Some("terminal.create") => serde_json::from_value(payload)
-            .map(V070TerminalOpen::Create)
-            .map_err(|_| ()),
-        Some("terminal.attach") => serde_json::from_value(payload)
-            .map(V070TerminalOpen::Attach)
-            .map_err(|_| ()),
-        _ => Err(()),
-    };
+    let open = parse_v070_terminal_open(command);
     let Ok(open) = open else {
         let _ = send_v070_socket_error(
             &mut socket,
@@ -1971,11 +1964,12 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::ops::{Deref, DerefMut};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use termd_proto::{
-        DeviceId, Nonce, PublicKey, SessionCreatePayload, Signature, TerminalSize,
-        UnixTimestampMillis,
+        DeviceId, METHOD_SESSION_FILES, Nonce, PublicKey, SessionCreateInSessionCwdPayload,
+        SessionCreatePayload, SessionFilesPayload, SessionFilesResultPayload, Signature,
+        TerminalSize, UnixTimestampMillis,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::Duration;
@@ -2111,6 +2105,106 @@ mod tests {
 
     fn test_protocol(name: &str) -> TestProtocolFixture {
         test_config(name).into_protocol()
+    }
+
+    fn wait_for_session_path(
+        protocol: &mut DefaultDaemonProtocol,
+        connection: &mut ProtocolConnection,
+        session_id: SessionId,
+        expected: &Path,
+    ) {
+        for _ in 0..100 {
+            let payload = serde_json::to_value(SessionFilesPayload {
+                session_id,
+                path: None,
+            })
+            .unwrap();
+            if let Ok(result) =
+                connection.dispatch_v070_http_control(protocol, METHOD_SESSION_FILES, payload)
+            {
+                let result: SessionFilesResultPayload = serde_json::from_value(result).unwrap();
+                if Path::new(&result.path) == expected {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "session {session_id:?} did not reach expected cwd {}",
+            expected.display()
+        );
+    }
+
+    fn session_storage_counts(state_path: &Path) -> (i64, i64) {
+        let connection =
+            rusqlite::Connection::open(crate::state::sqlite_state_path_for_state_path(state_path))
+                .unwrap();
+        let history = connection
+            .query_row("SELECT COUNT(*) FROM daemon_sessions", [], |row| row.get(0))
+            .unwrap();
+        let ownership = connection
+            .query_row("SELECT COUNT(*) FROM session_ownership", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        (history, ownership)
+    }
+
+    fn persisted_session_root(state_path: &Path, session_id: SessionId) -> PathBuf {
+        let connection =
+            rusqlite::Connection::open(crate::state::sqlite_state_path_for_state_path(state_path))
+                .unwrap();
+        connection
+            .query_row(
+                "SELECT root_path FROM daemon_sessions WHERE session_id = ?1",
+                [session_id.0.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .map(PathBuf::from)
+            .unwrap()
+    }
+
+    #[test]
+    fn v070_terminal_open_parses_legacy_and_cwd_create_commands() {
+        let source_session_id = SessionId::new();
+        let size = TerminalSize::new(24, 80);
+
+        let legacy = parse_v070_terminal_open(serde_json::json!({
+            "type": "terminal.create",
+            "payload": { "command": ["sh"], "size": size },
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            V070TerminalOpen::Create(SessionCreatePayload { command, size: parsed_size })
+                if command == ["sh"] && parsed_size == size
+        ));
+
+        let create_in_cwd = parse_v070_terminal_open(serde_json::json!({
+            "type": "terminal.create_in_session_cwd",
+            "payload": {
+                "source_session_id": source_session_id,
+                "command": ["sh"],
+                "size": size,
+            },
+        }))
+        .unwrap();
+        assert!(matches!(
+            create_in_cwd,
+            V070TerminalOpen::CreateInSessionCwd(SessionCreateInSessionCwdPayload {
+                source_session_id: parsed_source,
+                command,
+                size: parsed_size,
+            }) if parsed_source == source_session_id && command == ["sh"] && parsed_size == size
+        ));
+
+        assert!(
+            parse_v070_terminal_open(serde_json::json!({
+                "type": "terminal.create_somewhere",
+                "payload": { "command": ["sh"], "size": size },
+            }))
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -3220,6 +3314,11 @@ mod tests {
             serde_json::from_str(&terminal.next().await.unwrap().unwrap().into_text().unwrap())
                 .unwrap();
         assert_eq!(created["type"], "terminal.created");
+        let source_session_id = SessionId(
+            uuid::Uuid::parse_str(created["payload"]["session_id"].as_str().unwrap()).unwrap(),
+        );
+        let source_session_root =
+            persisted_session_root(&fixture._state_dir.state_path, source_session_id);
         let snapshot: serde_json::Value =
             serde_json::from_str(&terminal.next().await.unwrap().unwrap().into_text().unwrap())
                 .unwrap();
@@ -3245,6 +3344,68 @@ mod tests {
             1
         );
 
+        let mut cwd_terminal_request = format!("ws://{addr}/ws/terminal")
+            .into_client_request()
+            .unwrap();
+        cwd_terminal_request.headers_mut().insert(
+            "sec-websocket-protocol",
+            format!("termd.v0.7, {access_token}").parse().unwrap(),
+        );
+        let (mut cwd_terminal, _) = tokio_tungstenite::connect_async(cwd_terminal_request)
+            .await
+            .expect("cwd terminal websocket should upgrade");
+        cwd_terminal
+            .send(ClientWsMessage::Text(
+                serde_json::json!({
+                    "type": "terminal.create_in_session_cwd",
+                    "payload": {
+                        "source_session_id": source_session_id,
+                        "command": ["sh"],
+                        "size": TerminalSize::new(24, 80),
+                    },
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let cwd_created: serde_json::Value = serde_json::from_str(
+            &cwd_terminal
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cwd_created["type"], "terminal.created");
+        let created_session_id = SessionId(
+            uuid::Uuid::parse_str(cwd_created["payload"]["session_id"].as_str().unwrap()).unwrap(),
+        );
+        let cwd_snapshot: serde_json::Value = serde_json::from_str(
+            &cwd_terminal
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cwd_snapshot["type"], "terminal.snapshot");
+        let first_terminal_frame =
+            tokio::time::timeout(Duration::from_secs(1), cwd_terminal.next())
+                .await
+                .expect("cwd terminal should stream its initial binary frame")
+                .unwrap()
+                .unwrap();
+        assert!(first_terminal_frame.is_binary());
+        assert_eq!(
+            persisted_session_root(&fixture._state_dir.state_path, created_session_id),
+            source_session_root
+        );
+
+        let _ = cwd_terminal.close(None).await;
         let _ = terminal.close(None).await;
         let _ = metadata.close(None).await;
         server.abort();
@@ -3341,6 +3502,154 @@ mod tests {
         assert!((1..=opened.snapshot.size.rows).contains(&opened.snapshot.cursor.row));
         assert!((1..=opened.snapshot.size.cols).contains(&opened.snapshot.cursor.col));
         connection.close(&mut protocol);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn v070_terminal_create_in_session_cwd_uses_live_source_cwd() {
+        let fixture = test_protocol("terminal-create-in-session-cwd");
+        let source_cwd = fixture._state_dir.state_dir.join("source-cwd");
+        fs::create_dir(&source_cwd).unwrap();
+        let source_cwd = source_cwd.canonicalize().unwrap();
+        let state_path = fixture._state_dir.state_path.clone();
+        let mut protocol = fixture.protocol.blocking_lock();
+        let device_id = DeviceId::new();
+        let size = TerminalSize::new(24, 80);
+
+        let mut source_connection = ProtocolConnection::authenticated_v070_terminal(device_id);
+        let source = protocol
+            .open_v070_terminal(
+                &mut source_connection,
+                V070TerminalOpen::Create(SessionCreatePayload {
+                    command: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "cd \"$1\" && exec sleep 60".into(),
+                        "termd-test".into(),
+                        source_cwd.to_string_lossy().into_owned(),
+                    ],
+                    size,
+                }),
+            )
+            .unwrap()
+            .created
+            .unwrap();
+        wait_for_session_path(
+            &mut protocol,
+            &mut source_connection,
+            source.session_id,
+            &source_cwd,
+        );
+        source_connection.close(&mut protocol);
+
+        let mut target_connection =
+            ProtocolConnection::authenticated_v070_terminal(DeviceId::new());
+        let target = protocol
+            .open_v070_terminal(
+                &mut target_connection,
+                V070TerminalOpen::CreateInSessionCwd(SessionCreateInSessionCwdPayload {
+                    source_session_id: source.session_id,
+                    command: vec!["sh".into(), "-c".into(), "exec sleep 60".into()],
+                    size,
+                }),
+            )
+            .unwrap()
+            .created
+            .unwrap();
+
+        wait_for_session_path(
+            &mut protocol,
+            &mut target_connection,
+            target.session_id,
+            &source_cwd,
+        );
+        assert_eq!(
+            persisted_session_root(&state_path, target.session_id),
+            source_cwd
+        );
+        assert_eq!(protocol.snapshot_state().sessions.len(), 2);
+        assert_eq!(session_storage_counts(&state_path), (2, 2));
+        target_connection.close(&mut protocol);
+    }
+
+    #[test]
+    fn v070_terminal_create_in_session_cwd_rejects_missing_source_without_side_effects() {
+        let fixture = test_protocol("terminal-create-in-missing-session-cwd");
+        let state_path = fixture._state_dir.state_path.clone();
+        let mut protocol = fixture.protocol.blocking_lock();
+        let mut connection = ProtocolConnection::authenticated_v070_terminal(DeviceId::new());
+
+        let error = protocol
+            .open_v070_terminal(
+                &mut connection,
+                V070TerminalOpen::CreateInSessionCwd(SessionCreateInSessionCwdPayload {
+                    source_session_id: SessionId::new(),
+                    command: vec!["sh".into()],
+                    size: TerminalSize::new(24, 80),
+                }),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code(), "session_not_found");
+        assert!(protocol.snapshot_state().sessions.is_empty());
+        assert_eq!(session_storage_counts(&state_path), (0, 0));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn v070_terminal_create_in_session_cwd_does_not_fallback_to_deleted_cached_cwd() {
+        let fixture = test_protocol("cwd-delete");
+        let source_cwd = fixture._state_dir.state_dir.join("cwd");
+        fs::create_dir(&source_cwd).unwrap();
+        let source_cwd = source_cwd.canonicalize().unwrap();
+        let state_path = fixture._state_dir.state_path.clone();
+        let mut protocol = fixture.protocol.blocking_lock();
+        let device_id = DeviceId::new();
+        let size = TerminalSize::new(24, 80);
+
+        let mut source_connection = ProtocolConnection::authenticated_v070_terminal(device_id);
+        let source = protocol
+            .open_v070_terminal(
+                &mut source_connection,
+                V070TerminalOpen::Create(SessionCreatePayload {
+                    command: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "cd \"$1\" && exec sleep 60".into(),
+                        "termd-test".into(),
+                        source_cwd.to_string_lossy().into_owned(),
+                    ],
+                    size,
+                }),
+            )
+            .unwrap()
+            .created
+            .unwrap();
+        wait_for_session_path(
+            &mut protocol,
+            &mut source_connection,
+            source.session_id,
+            &source_cwd,
+        );
+        source_connection.close(&mut protocol);
+        fs::remove_dir(&source_cwd).unwrap();
+
+        let mut target_connection =
+            ProtocolConnection::authenticated_v070_terminal(DeviceId::new());
+        let error = protocol
+            .open_v070_terminal(
+                &mut target_connection,
+                V070TerminalOpen::CreateInSessionCwd(SessionCreateInSessionCwdPayload {
+                    source_session_id: source.session_id,
+                    command: vec!["sh".into()],
+                    size,
+                }),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code(), "session_cwd_unavailable");
+        assert_eq!(protocol.snapshot_state().sessions.len(), 1);
+        assert_eq!(session_storage_counts(&state_path), (1, 1));
     }
 
     #[tokio::test]

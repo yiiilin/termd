@@ -14,6 +14,54 @@ afterEach(() => {
 });
 
 describe("V070Client", () => {
+  it("sends the source session id when creating in another session's cwd", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
+    const sourceSessionId = "00000000-0000-0000-0000-000000000401";
+    const size = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+    const transport = {
+      onMetadata: undefined as ((data: unknown) => void) | undefined,
+      onTerminal: undefined as ((data: unknown) => void) | undefined,
+      connectMetadata: vi.fn(async () => undefined),
+      reconnectMetadata: vi.fn(async () => undefined),
+      openTerminal: vi.fn(async () => undefined),
+      closeTerminal: vi.fn(),
+      close: vi.fn(),
+      sendTerminal: vi.fn(),
+    };
+    const client = new V070Client(
+      {
+        server_id: "00000000-0000-0000-0000-000000000070",
+        daemon_public_key: "ed25519-v1:daemon",
+        url: "wss://relay.example/ws",
+        paired_at_ms: 1,
+        device_certificate: "device.certificate.signature",
+      },
+      device,
+      transport,
+    );
+
+    const created = client.createSession([], size, { cwdSourceSessionId: sourceSessionId });
+    await Promise.resolve();
+    expect(transport.openTerminal).toHaveBeenCalledWith({
+      type: "terminal.create_in_session_cwd",
+      payload: { source_session_id: sourceSessionId, command: [], size },
+    });
+    transport.onTerminal?.(JSON.stringify({
+      type: "terminal.created",
+      payload: {
+        session_id: "00000000-0000-0000-0000-000000000501",
+        name: "new shell",
+        role: "operator",
+        state: "running",
+        size,
+      },
+    }));
+
+    await expect(created).resolves.toMatchObject({
+      session_id: "00000000-0000-0000-0000-000000000501",
+    });
+  });
+
   it("closes only the terminal socket attached to the session being closed", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
     const transport = {

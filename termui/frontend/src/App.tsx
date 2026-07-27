@@ -2,8 +2,10 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type
 import packageMetadata from "../package.json";
 import {
   Cable,
+  ChevronDown,
   CircleAlert,
   Folder,
+  FolderPlus,
   MonitorUp,
   Menu,
   PanelLeftClose,
@@ -413,6 +415,8 @@ export default function App() {
   const pendingSessionReorderRef = useRef(false);
   const terminalCreateOwnsAttachRef = useRef(false);
   const [newOutputSessionIds, setNewOutputSessionIds] = useState<Set<UUID>>(() => new Set());
+  const [sessionCreateMenuOpen, setSessionCreateMenuOpen] = useState(false);
+  const [sessionCreateError, setSessionCreateError] = useState<SafeError | undefined>();
   const [daemonClients, setDaemonClients] = useState<DaemonClientSummaryPayload[]>([]);
   const [clientsOpen, setClientsOpen] = useState(false);
   const [daemonStatus, setDaemonStatus] = useState<DaemonStatusResultPayload | undefined>();
@@ -895,6 +899,8 @@ export default function App() {
   const showConnectionStatus = hasPairedServer && !error && status !== "pairing";
   // session 列表刷新只是旁路请求，不能把正在显示的 xterm 卸载成 disconnected。
   const connectionReady = showConnectionStatus && status !== "idle" && status !== "connecting";
+  const workspaceError = error ?? sessionCreateError;
+  const workspaceErrorTitle = error ? t("protocolError.title") : t("sessions.createFailed");
   useEffect(() => {
     recordTermdDiagnostic("app_connection_state", {
       status,
@@ -919,6 +925,7 @@ export default function App() {
     () => sessions.find((session) => session.session_id === attachedSessionId),
     [attachedSessionId, sessions],
   );
+  const canCreateInAttachedSessionCwd = attachedSession?.state === "running" && status !== "creating";
   const toolbarSession = useMemo(
     () =>
       attachedSession ?? sessions.find((session) => session.session_id === selectedSessionId),
@@ -1000,6 +1007,16 @@ export default function App() {
       open: showMobileWorkspaceMenu && mobileMenuOpen,
       onClose: () => setMobileMenuOpen(false),
     });
+  const { triggerRef: sessionCreateMenuTriggerRef, popoverRef: sessionCreateMenuPopoverRef } =
+    useDismissiblePopover<HTMLButtonElement, HTMLDivElement>({
+      open: connectionReady && !isMobileLayout && sessionCreateMenuOpen,
+      onClose: () => setSessionCreateMenuOpen(false),
+    });
+  useEffect(() => {
+    if (!connectionReady || isMobileLayout) {
+      setSessionCreateMenuOpen(false);
+    }
+  }, [connectionReady, isMobileLayout]);
   const { triggerRef: clientsTriggerRef, popoverRef: clientsPopoverRef } =
     useDismissiblePopover<HTMLButtonElement, HTMLDivElement>({
       open: connectionReady && !isMobileLayout && clientsOpen,
@@ -1015,6 +1032,7 @@ export default function App() {
   }, []);
 
   const setSafeError = useCallback((caught: unknown) => {
+    setSessionCreateError(undefined);
     setSessionOpenProgress((current) => current?.status === "opening"
       ? failSessionOpenProgress(current, current.attemptId)
       : current);
@@ -1518,6 +1536,8 @@ export default function App() {
     setDaemonNetworkLatencyMs(undefined);
     daemonNetworkSampleRef.current = undefined;
     setDaemonStatusError(undefined);
+    setSessionCreateError(undefined);
+    setSessionCreateMenuOpen(false);
     selectSession(undefined);
     renamingSessionIdRef.current = undefined;
     setRenamingSessionId(undefined);
@@ -2671,7 +2691,8 @@ export default function App() {
     void handleAttach(sessionId, { closeMobilePanel: false });
   }, [activeSurface, connectionReady, handleAttach, hasLiveAttachedTransport, isTerminalRecoveryInProgress, selectedSessionId, status]);
 
-  const performCreateSession = useCallback(async () => {
+  const performCreateSession = useCallback(async (cwdSourceSessionId?: UUID) => {
+    const createInSessionCwd = cwdSourceSessionId !== undefined;
     userDetachedRef.current = false;
     // 中文注释：`terminal.create` 自己就会建立并接管 watched terminal stream。
     // 在它完成接管前，任何自动 attach 都属于重复链路，只会把 create stream cancel 掉。
@@ -2679,8 +2700,12 @@ export default function App() {
     const createRequestId = sessionCreateRequestIdRef.current + 1;
     sessionCreateRequestIdRef.current = createRequestId;
     setError(undefined);
-    disconnectAttach();
-    const resetVersion = clearTerminalOutput();
+    setSessionCreateError(undefined);
+    let resetVersion: number | undefined;
+    if (!createInSessionCwd) {
+      disconnectAttach();
+      resetVersion = clearTerminalOutput();
+    }
     setStatus("creating");
     let outputClient: V070Client | undefined;
     let attachAbortController: AbortController | undefined;
@@ -2688,7 +2713,9 @@ export default function App() {
       const isCurrentCreateRequest = () => sessionCreateRequestIdRef.current === createRequestId;
       attachAbortController = new AbortController();
       pendingTerminalAttachAbortControllerRef.current = attachAbortController;
-      outputClient = await authenticatedWorkspaceClient(ATTACH_CONNECTION_TIMEOUT_MS);
+      outputClient = createInSessionCwd
+        ? await authenticatedClient(ATTACH_CONNECTION_TIMEOUT_MS, attachAbortController.signal)
+        : await authenticatedWorkspaceClient(ATTACH_CONNECTION_TIMEOUT_MS);
       if (!isCurrentCreateRequest()) {
         if (outputClient !== attachClientRef.current) {
           outputClient.close();
@@ -2696,13 +2723,25 @@ export default function App() {
         outputClient = undefined;
         return;
       }
-      pendingAttachClientRef.current = outputClient;
+      if (!createInSessionCwd) {
+        pendingAttachClientRef.current = outputClient;
+      }
       // Web 只创建完整的默认 shell 会话，避免把 session 误导成一次性命令执行。
-      const created = await outputClient.createSession([], DEFAULT_SESSION_SIZE);
+      const created = cwdSourceSessionId !== undefined
+        ? await outputClient.createSession([], DEFAULT_SESSION_SIZE, { cwdSourceSessionId })
+        : await outputClient.createSession([], DEFAULT_SESSION_SIZE);
       if (!isCurrentCreateRequest()) {
         outputClient.detachSession(created.session_id);
         outputClient = undefined;
         return;
+      }
+      if (createInSessionCwd) {
+        // 来源创建用独立连接保留旧 PTY；只有 daemon 确认创建成功后才切换 terminal。
+        closeMetadataClient();
+        disconnectAttach();
+        closeWorkspaceMetadataClient();
+        resetVersion = clearTerminalOutput();
+        pendingAttachClientRef.current = outputClient;
       }
       // 中文注释：terminal.create 本身已经创建并 attach 了 terminal stream。
       // 不能再立刻 terminal.attach 第二条 stream；慢 relay 下第一条 stream 的输出会把
@@ -2717,6 +2756,10 @@ export default function App() {
         pendingTerminalAttachAbortControllerRef.current = undefined;
       }
       claimAttachClient(attachedClient);
+      if (createInSessionCwd) {
+        // metadata effect 不依赖 attach client identity；切换到新 client 后显式重建订阅。
+        setMetadataRetryNonce((current) => current + 1);
+      }
       attachedSessionRef.current = created.session_id;
       confirmedSessionSizesRef.current.set(created.session_id, created.size);
       selectSession(created.session_id);
@@ -2736,7 +2779,7 @@ export default function App() {
       // create stream 的 snapshot/output 可能已经在 V070Client 队列里；必须等
       // TerminalPane 确认旧实例清理、新实例 ready 后再启动 receive loop，否则首屏
       // 可能写进旧实例或跨后续切换被重复回放，表现成切回时多一个 shell 回显。
-      await waitForTerminalOutputResetApplied(resetVersion);
+      await waitForTerminalOutputResetApplied(resetVersion!);
       if (!isCurrentCreateRequest() || userDetachedRef.current || attachClientRef.current !== attachedClient) {
         attachedClient.detachSession(created.session_id);
         return;
@@ -2752,7 +2795,12 @@ export default function App() {
       );
     } catch (caught) {
       if (sessionCreateRequestIdRef.current === createRequestId) {
-        setSafeError(caught);
+        if (createInSessionCwd) {
+          setSessionCreateError(toSafeError(caught));
+          setStatus(attachedSessionRef.current ? "attached" : "ready");
+        } else {
+          setSafeError(caught);
+        }
       }
     } finally {
       if (
@@ -2775,7 +2823,10 @@ export default function App() {
     clearNewOutputMark,
     clearTerminalOutput,
     authenticatedWorkspaceClient,
+    authenticatedClient,
     claimAttachClient,
+    closeMetadataClient,
+    closeWorkspaceMetadataClient,
     disconnectAttach,
     loadSessionFiles,
     selectSession,
@@ -2788,6 +2839,23 @@ export default function App() {
   const handleCreateSession = useCallback(() => {
     requestFileEditorAction(performCreateSession);
   }, [performCreateSession, requestFileEditorAction]);
+
+  const handleCreateSessionInCwd = useCallback((sessionId: UUID) => {
+    const sourceSession = sessionsRef.current.find((session) => session.session_id === sessionId);
+    if (sourceSession?.state !== "running" || status === "creating") {
+      return;
+    }
+    requestFileEditorAction(() => performCreateSession(sessionId));
+  }, [performCreateSession, requestFileEditorAction, status]);
+
+  const handleCreateSessionInCurrentCwd = useCallback(() => {
+    const sourceSessionId = attachedSessionRef.current;
+    setSessionCreateMenuOpen(false);
+    setMobileMenuOpen(false);
+    if (sourceSessionId) {
+      handleCreateSessionInCwd(sourceSessionId);
+    }
+  }, [handleCreateSessionInCwd]);
 
   const handleRetryConnection = useCallback(async () => {
     if (isTerminalTransportPaused()) {
@@ -4292,16 +4360,48 @@ export default function App() {
                 </button>
               </div>
               {!isMobileLayout && connectionReady ? (
-                <button
-                  type="button"
-                  className="session-create-button"
-                  aria-label={t("app.newSession")}
-                  onClick={handleCreateSession}
-                  disabled={status === "creating"}
-                >
-                  <Plus size={16} aria-hidden="true" />
-                  {t("app.newSession")}
-                </button>
+                <div className="session-create-control">
+                  <button
+                    type="button"
+                    className="session-create-button"
+                    aria-label={t("app.newSession")}
+                    onClick={handleCreateSession}
+                    disabled={status === "creating"}
+                  >
+                    <Plus size={16} aria-hidden="true" />
+                    {t("app.newSession")}
+                  </button>
+                  <button
+                    ref={sessionCreateMenuTriggerRef}
+                    type="button"
+                    className="session-create-menu-trigger"
+                    aria-label={t("app.newSessionOptions")}
+                    aria-haspopup="menu"
+                    aria-expanded={sessionCreateMenuOpen}
+                    onClick={() => setSessionCreateMenuOpen((open) => !open)}
+                    disabled={status === "creating"}
+                  >
+                    <ChevronDown size={15} aria-hidden="true" />
+                  </button>
+                  {sessionCreateMenuOpen ? (
+                    <div
+                      ref={sessionCreateMenuPopoverRef}
+                      className="session-create-menu"
+                      role="menu"
+                      aria-label={t("app.newSessionOptions")}
+                    >
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={handleCreateSessionInCurrentCwd}
+                        disabled={!canCreateInAttachedSessionCwd}
+                      >
+                        <FolderPlus size={15} aria-hidden="true" />
+                        <span>{t("app.newInCurrentDirectory")}</span>
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
               ) : null}
             </div>
             {!isMobileLayout && connectionReady ? (
@@ -4315,6 +4415,7 @@ export default function App() {
                   renameDraft={renameDraft}
                   canSaveRename={canSaveRename}
                   onAttach={handleAttach}
+                  onCreateInSessionCwd={handleCreateSessionInCwd}
                   onStartRename={handleStartRename}
                   onRenameDraftChange={setRenameDraft}
                   onSaveRename={handleSaveRename}
@@ -4364,13 +4465,13 @@ export default function App() {
                 <MonitorUp size={16} aria-hidden="true" />
                 <span className="toolbar-session-name">{toolbarSessionName}</span>
               </span>
-              {isMobileLayout && error ? (
+              {isMobileLayout && workspaceError ? (
                 <small
                   className="toolbar-connection-anomaly"
-                  aria-label={`${t("protocolError.title")}: ${translateSafeErrorMessage(error, t)}`}
-                  title={`${t("protocolError.title")}: ${translateSafeErrorMessage(error, t)}`}
+                  aria-label={`${workspaceErrorTitle}: ${translateSafeErrorMessage(workspaceError, t)}`}
+                  title={`${workspaceErrorTitle}: ${translateSafeErrorMessage(workspaceError, t)}`}
                 >
-                  {t("protocolError.title")}
+                  {workspaceErrorTitle}
                 </small>
               ) : (
                 <>
@@ -4394,13 +4495,13 @@ export default function App() {
             <div className="toolbar-title">
               <MonitorUp size={16} aria-hidden="true" />
               <span className="toolbar-session-name">{toolbarSessionName}</span>
-              {isMobileLayout && error ? (
+              {isMobileLayout && workspaceError ? (
                 <small
                   className="toolbar-connection-anomaly"
-                  aria-label={`${t("protocolError.title")}: ${translateSafeErrorMessage(error, t)}`}
-                  title={`${t("protocolError.title")}: ${translateSafeErrorMessage(error, t)}`}
+                  aria-label={`${workspaceErrorTitle}: ${translateSafeErrorMessage(workspaceError, t)}`}
+                  title={`${workspaceErrorTitle}: ${translateSafeErrorMessage(workspaceError, t)}`}
                 >
-                  {t("protocolError.title")}
+                  {workspaceErrorTitle}
                 </small>
               ) : (
                 <>
@@ -4480,7 +4581,7 @@ export default function App() {
                 : filesPanelOpen
                   ? "workspace-body"
                   : "workspace-body files-panel-hidden",
-              error ? "has-error" : "",
+              workspaceError ? "has-error" : "",
             ]
               .filter(Boolean)
               .join(" ")
@@ -4488,10 +4589,12 @@ export default function App() {
           style={desktopWorkspaceStyle}
           inert={showMobileSessionsPanel || showMobileFilesPanel}
         >
-          {error ? (
+          {workspaceError ? (
             <ProtocolErrorAlert
-              error={error}
-              onRefresh={hasPairedServer ? handleForcedRetryConnection : undefined}
+              error={workspaceError}
+              title={workspaceErrorTitle}
+              onRefresh={error && hasPairedServer ? handleForcedRetryConnection : undefined}
+              onDismiss={sessionCreateError && !error ? () => setSessionCreateError(undefined) : undefined}
               refreshing={status === "attaching" || status === "connecting" || status === "listing"}
             />
           ) : null}
@@ -4587,6 +4690,14 @@ export default function App() {
               <Plus size={16} aria-hidden="true" />
               {t("app.new")}
             </button>
+            <button
+              type="button"
+              onClick={handleCreateSessionInCurrentCwd}
+              disabled={!canCreateInAttachedSessionCwd}
+            >
+              <FolderPlus size={16} aria-hidden="true" />
+              {t("app.newInCurrentDirectory")}
+            </button>
             <button type="button" onClick={() => setSettingsOpen(true)}>
               <Settings size={16} aria-hidden="true" />
               {t("app.settings")}
@@ -4634,12 +4745,14 @@ export default function App() {
                 renameDraft={renameDraft}
                 canSaveRename={canSaveRename}
                 onAttach={handleAttach}
+                onCreateInSessionCwd={handleCreateSessionInCwd}
                 onStartRename={handleStartRename}
                 onRenameDraftChange={setRenameDraft}
                 onSaveRename={handleSaveRename}
                 onCancelRename={handleCancelRename}
                 onClose={handleCloseSession}
                 onReorder={handleReorderSessions}
+                mobile
               />
             </div>
           </div>
@@ -4776,15 +4889,18 @@ export default function App() {
 
 function ProtocolErrorAlert(props: {
   error: SafeError;
+  title?: string;
   onRefresh?: () => void;
+  onDismiss?: () => void;
   refreshing?: boolean;
 }) {
   const { t } = useI18n();
+  const title = props.title ?? t("protocolError.title");
   return (
-    <section className="protocol-error-alert" role="alert" aria-label={t("protocolError.title")}>
+    <section className="protocol-error-alert" role="alert" aria-label={title}>
       <div className="protocol-error-alert-title">
         <CircleAlert size={17} aria-hidden="true" />
-        <span>{t("protocolError.title")}</span>
+        <span>{title}</span>
         {props.onRefresh ? (
           <button
             type="button"
@@ -4794,6 +4910,17 @@ function ProtocolErrorAlert(props: {
           >
             <RefreshCcw size={15} aria-hidden="true" />
             {t("protocolError.retry")}
+          </button>
+        ) : null}
+        {props.onDismiss ? (
+          <button
+            type="button"
+            className="icon-button protocol-error-dismiss"
+            aria-label={t("protocolError.dismiss")}
+            title={t("protocolError.dismiss")}
+            onClick={props.onDismiss}
+          >
+            <X size={15} aria-hidden="true" />
           </button>
         ) : null}
       </div>

@@ -193,6 +193,12 @@ export interface SessionCreatePayload {
   size: TerminalSize;
 }
 
+export interface SessionCreateInSessionCwdPayload {
+  source_session_id: UUID;
+  command: string[];
+  size: TerminalSize;
+}
+
 export interface SessionCreatedPayload {
   session_id: UUID;
   name?: string | null;

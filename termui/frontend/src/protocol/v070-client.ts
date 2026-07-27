@@ -211,7 +211,17 @@ export class V070Client {
     return promise;
   }
 
-  async createSession(command: string[], size: TerminalSize): Promise<SessionCreatedPayload> {
+  async createSession(
+    command: string[],
+    size: TerminalSize,
+    options: { cwdSourceSessionId?: UUID } = {},
+  ): Promise<SessionCreatedPayload> {
+    if (options.cwdSourceSessionId) {
+      return this.openTerminal({
+        type: "terminal.create_in_session_cwd",
+        payload: { source_session_id: options.cwdSourceSessionId, command, size },
+      });
+    }
     return this.openTerminal({ type: "terminal.create", payload: { command, size } });
   }
 

@@ -14,7 +14,7 @@ interface TokenProvider {
 }
 
 export interface WorkspaceCommand {
-  type: "terminal.create" | "terminal.attach";
+  type: "terminal.create" | "terminal.create_in_session_cwd" | "terminal.attach";
   payload: unknown;
 }
 

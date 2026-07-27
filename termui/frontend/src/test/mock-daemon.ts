@@ -89,6 +89,7 @@ interface MockDaemonOptions {
   attachDelayMs?: number;
   terminalAttachMetadataDelayMs?: number;
   sessionCreateDelayMs?: number;
+  sessionCreateInCwdError?: ErrorPayload;
   routePreludeError?: ErrorPayload;
   routeReadyDelayMs?: number;
   routeReadyDelayOnceMs?: number;
@@ -228,6 +229,7 @@ export class MockDaemon {
   public readonly pairingTokens: string[] = [];
   public readonly sentPacketLog: Array<{ connection_id: number; packet: ProtocolPacket }> = [];
   public readonly createdCommands: string[][] = [];
+  public readonly createdFromSessionCwd: UUID[] = [];
   public readonly sessionDataMessages: string[] = [];
   public readonly attachedSessions: UUID[] = [];
   public readonly attachRequests: Array<{ session_id: UUID; watch_updates?: boolean; last_terminal_seq?: number | null }> = [];
@@ -865,8 +867,13 @@ export class MockDaemon {
         let sessionId = this.v070TerminalSockets.get(socket);
         if (!isBinary) {
         const command = JSON.parse(raw.toString()) as {
-          type?: "terminal.create" | "terminal.attach";
-          payload?: { session_id?: UUID; command?: string[]; size?: TerminalSize };
+          type?: "terminal.create" | "terminal.create_in_session_cwd" | "terminal.attach";
+          payload?: {
+            session_id?: UUID;
+            source_session_id?: UUID;
+            command?: string[];
+            size?: TerminalSize;
+          };
         };
         const streamId = `v070-terminal-${connectionId}` as PacketStreamId;
         this.v070TerminalStreamIds.set(socket, streamId);
@@ -882,11 +889,30 @@ export class MockDaemon {
         await this.waitForV070TerminalRoute();
         if (socket.readyState !== socket.OPEN) return;
         const size = command.payload?.size ?? { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
-        if (command.type === "terminal.create") {
+        const isCreate = command.type === "terminal.create" || command.type === "terminal.create_in_session_cwd";
+        if (isCreate) {
           if (this.options.sessionCreateDelayMs) {
             await new Promise((resolve) => setTimeout(resolve, this.options.sessionCreateDelayMs));
           }
           if (socket.readyState !== socket.OPEN) return;
+          if (command.type === "terminal.create_in_session_cwd") {
+            if (this.options.sessionCreateInCwdError) {
+              socket.send(JSON.stringify({ type: "error", payload: this.options.sessionCreateInCwdError }));
+              return;
+            }
+            if (!command.payload?.source_session_id) {
+              socket.send(JSON.stringify({
+                type: "error",
+                payload: {
+                  code: "session_cwd_unavailable",
+                  message: "source session cwd was unavailable",
+                  retryable: false,
+                },
+              }));
+              return;
+            }
+            this.createdFromSessionCwd.push(command.payload.source_session_id);
+          }
           this.createdSessionCounter += 1;
           sessionId = `00000000-0000-0000-0000-${String(500 + this.createdSessionCounter).padStart(12, "0")}`;
           const created: SessionCreatedPayload = {
@@ -957,7 +983,7 @@ export class MockDaemon {
             type: "terminal.snapshot",
             payload: { session_id: attachedSessionId, size: session.size, cursor: { row: 1, col: 1 } },
           }));
-          if (!this.options.createOutputBeforeResponse || command.type !== "terminal.create") {
+          if (!this.options.createOutputBeforeResponse || !isCreate) {
             this.sendV070AttachSync(socket, attachedSessionId, session.size);
           }
         });

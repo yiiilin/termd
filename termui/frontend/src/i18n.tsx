@@ -15,6 +15,8 @@ const enUS = {
   "app.noDaemon": "No daemon",
   "app.termd": "Termd",
   "app.newSession": "New session",
+  "app.newSessionOptions": "New session options",
+  "app.newInCurrentDirectory": "New in current directory",
   "app.clients": "Clients",
   "app.daemons": "Daemons",
   "app.sessions": "Sessions",
@@ -38,6 +40,7 @@ const enUS = {
   "app.connectionChecking": "Checking connection",
   "protocolError.title": "Connection error",
   "protocolError.retry": "Refresh",
+  "protocolError.dismiss": "Dismiss error",
   "operators.empty": "no operators",
   "operators.aria": "session operators",
   "operators.client": "Client",
@@ -139,6 +142,9 @@ const enUS = {
   "sessions.selectNewOutput": "Select {name}, new output",
   "sessions.name": "Session name",
   "sessions.actions": "Session actions",
+  "sessions.actionsFor": "Actions for {name}",
+  "sessions.createFailed": "Couldn't create session",
+  "sessions.newInDirectory": "New in this directory",
   "sessions.saveName": "Save session name",
   "sessions.cancelRename": "Cancel rename",
   "sessions.rename": "Rename session",
@@ -266,6 +272,8 @@ const enUS = {
   "error.invalidFileData": "invalid file data",
   "error.fileReadFailed": "file read failed",
   "error.downloadCancelled": "download was cancelled",
+  "error.sourceCwdUnavailable": "the source session's current directory is unavailable",
+  "error.createInCwdUnsupported": "this daemon does not support creating a session from another session's directory",
 
   "terminal.mobileShortcuts": "mobile terminal shortcuts",
   "terminal.quickKeys.expand": "Expand terminal keys",
@@ -352,6 +360,8 @@ const zhCN: Record<TranslationKey, string> = {
   "app.noDaemon": "无守护进程",
   "app.termd": "Termd",
   "app.newSession": "新建会话",
+  "app.newSessionOptions": "新建会话选项",
+  "app.newInCurrentDirectory": "在当前目录新建",
   "app.clients": "客户端",
   "app.daemons": "守护进程",
   "app.sessions": "会话",
@@ -375,6 +385,7 @@ const zhCN: Record<TranslationKey, string> = {
   "app.connectionChecking": "检查连接中",
   "protocolError.title": "连接错误",
   "protocolError.retry": "刷新",
+  "protocolError.dismiss": "关闭错误提示",
   "operators.empty": "没有操作者",
   "operators.aria": "会话操作者",
   "operators.client": "客户端",
@@ -476,6 +487,9 @@ const zhCN: Record<TranslationKey, string> = {
   "sessions.selectNewOutput": "选择 {name}，有新输出",
   "sessions.name": "会话名称",
   "sessions.actions": "会话操作",
+  "sessions.actionsFor": "{name} 的操作",
+  "sessions.createFailed": "无法创建会话",
+  "sessions.newInDirectory": "在此目录新建",
   "sessions.saveName": "保存会话名称",
   "sessions.cancelRename": "取消重命名",
   "sessions.rename": "重命名会话",
@@ -603,6 +617,8 @@ const zhCN: Record<TranslationKey, string> = {
   "error.invalidFileData": "文件数据无效",
   "error.fileReadFailed": "文件读取失败",
   "error.downloadCancelled": "下载已取消",
+  "error.sourceCwdUnavailable": "来源会话的当前目录不可用",
+  "error.createInCwdUnsupported": "当前守护进程不支持从其他会话目录创建会话",
 
   "terminal.mobileShortcuts": "移动端终端快捷键",
   "terminal.quickKeys.expand": "展开终端快捷键",
@@ -739,6 +755,10 @@ export function translateSafeErrorMessage(error: SafeError, t: Translate): strin
       return t("error.invalidFileChunk");
     case "download_cancelled":
       return t("error.downloadCancelled");
+    case "session_cwd_unavailable":
+      return t("error.sourceCwdUnavailable");
+    case "invalid_terminal_open":
+      return t("error.createInCwdUnsupported");
     case "client_error":
       if (error.message === "invalid_file_data") {
         return t("error.invalidFileData");

@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { CSSProperties } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { CollapsedSessionButton, SessionList } from "./SessionList";
 
@@ -343,6 +344,207 @@ describe("SessionList", () => {
 
     expect(onAttach).toHaveBeenCalledOnce();
     expect(onAttach).toHaveBeenCalledWith("00000000-0000-0000-0000-000000000401");
+  });
+
+  it("桌面右键菜单可以基于对应会话目录新建", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000401";
+    const onCreateInSessionCwd = vi.fn();
+    render(
+      <SessionList
+        sessions={[
+          {
+            session_id: sessionId,
+            name: "alpha",
+            state: "running",
+            size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+          },
+        ]}
+        renameDraft=""
+        canSaveRename={false}
+        onAttach={vi.fn()}
+        onCreateInSessionCwd={onCreateInSessionCwd}
+        onStartRename={vi.fn()}
+        onRenameDraftChange={vi.fn()}
+        onSaveRename={vi.fn()}
+        onCancelRename={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const row = screen.getByRole("button", { name: "Open alpha" }).closest(".session-row") as HTMLElement;
+    fireEvent.contextMenu(row, { clientX: 120, clientY: 80 });
+
+    const menu = screen.getByRole("menu", { name: "Actions for alpha" });
+    await user.click(within(menu).getByRole("menuitem", { name: "New in this directory" }));
+
+    expect(onCreateInSessionCwd).toHaveBeenCalledOnce();
+    expect(onCreateInSessionCwd).toHaveBeenCalledWith(sessionId);
+  });
+
+  it("键盘关闭桌面会话菜单后把焦点还给打开菜单的按钮", async () => {
+    const user = userEvent.setup();
+    render(
+      <SessionList
+        sessions={[
+          {
+            session_id: "00000000-0000-0000-0000-000000000401",
+            name: "alpha",
+            state: "running",
+            size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+          },
+        ]}
+        renameDraft=""
+        canSaveRename={false}
+        onAttach={vi.fn()}
+        onCreateInSessionCwd={vi.fn()}
+        onStartRename={vi.fn()}
+        onRenameDraftChange={vi.fn()}
+        onSaveRename={vi.fn()}
+        onCancelRename={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const openButton = screen.getByRole("button", { name: "Open alpha" });
+    openButton.focus();
+    fireEvent.keyDown(openButton, { key: "F10", shiftKey: true });
+    expect(screen.getByRole("menu", { name: "Actions for alpha" })).toBeVisible();
+
+    await user.keyboard("{Escape}");
+    expect(openButton).toHaveFocus();
+  });
+
+  it("移动端把会话操作收进单个 More 菜单", async () => {
+    const user = userEvent.setup();
+    const sessionId = "00000000-0000-0000-0000-000000000401";
+    const onCreateInSessionCwd = vi.fn();
+    render(
+      <SessionList
+        mobile
+        sessions={[
+          {
+            session_id: sessionId,
+            name: "alpha",
+            state: "running",
+            size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+          },
+        ]}
+        renameDraft=""
+        canSaveRename={false}
+        onAttach={vi.fn()}
+        onCreateInSessionCwd={onCreateInSessionCwd}
+        onStartRename={vi.fn()}
+        onRenameDraftChange={vi.fn()}
+        onSaveRename={vi.fn()}
+        onCancelRename={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Rename session" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Close session" })).toBeNull();
+    const moreButton = screen.getByRole("button", { name: "Actions for alpha" });
+    await user.click(moreButton);
+
+    const menu = screen.getByRole("menu", { name: "Actions for alpha" });
+    expect(within(menu).queryByRole("menuitem", { name: "Open alpha" })).toBeNull();
+    await user.keyboard("{Escape}");
+    expect(moreButton).toHaveFocus();
+
+    await user.click(moreButton);
+    const reopenedMenu = screen.getByRole("menu", { name: "Actions for alpha" });
+    await user.click(within(reopenedMenu).getByRole("menuitem", { name: "New in this directory" }));
+
+    expect(onCreateInSessionCwd).toHaveBeenCalledWith(sessionId);
+  });
+
+  it("移动端菜单在应用壳层内保留 viewport 变量并传递 fixed 定位锚点", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <main
+        className="app-shell"
+        style={{
+          "--termd-layout-viewport-width": "390px",
+          "--termd-layout-viewport-height": "460px",
+          "--termd-visual-viewport-offset-left": "3px",
+          "--termd-visual-viewport-offset-top": "20px",
+        } as CSSProperties}
+      >
+        <SessionList
+          mobile
+          sessions={[
+            {
+              session_id: "00000000-0000-0000-0000-000000000401",
+              name: "alpha",
+              state: "running",
+              size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+            },
+          ]}
+          renameDraft=""
+          canSaveRename={false}
+          onAttach={vi.fn()}
+          onCreateInSessionCwd={vi.fn()}
+          onStartRename={vi.fn()}
+          onRenameDraftChange={vi.fn()}
+          onSaveRename={vi.fn()}
+          onCancelRename={vi.fn()}
+          onClose={vi.fn()}
+        />
+      </main>,
+    );
+
+    const shell = container.querySelector(".app-shell") as HTMLElement;
+    const moreButton = screen.getByRole("button", { name: "Actions for alpha" });
+    vi.spyOn(moreButton, "getBoundingClientRect").mockReturnValue({
+      left: 330,
+      right: 366,
+      top: 390,
+      bottom: 426,
+      width: 36,
+      height: 36,
+      x: 330,
+      y: 390,
+      toJSON: () => ({}),
+    });
+
+    await user.click(moreButton);
+
+    const menu = screen.getByRole("menu", { name: "Actions for alpha" });
+    expect(menu.parentElement).toBe(shell);
+    expect(menu.style.getPropertyValue("--termd-session-menu-anchor-x")).toBe("154px");
+    expect(menu.style.getPropertyValue("--termd-session-menu-anchor-y")).toBe("430px");
+  });
+
+  it("移动端停止会话菜单把焦点交给第一个可用操作", async () => {
+    const user = userEvent.setup();
+    render(
+      <SessionList
+        mobile
+        sessions={[
+          {
+            session_id: "00000000-0000-0000-0000-000000000402",
+            name: "stopped",
+            state: "closed",
+            size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+          },
+        ]}
+        renameDraft=""
+        canSaveRename={false}
+        onAttach={vi.fn()}
+        onCreateInSessionCwd={vi.fn()}
+        onStartRename={vi.fn()}
+        onRenameDraftChange={vi.fn()}
+        onSaveRename={vi.fn()}
+        onCancelRename={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Actions for stopped" }));
+    const menu = screen.getByRole("menu", { name: "Actions for stopped" });
+    expect(within(menu).getByRole("menuitem", { name: "New in this directory" })).toBeDisabled();
+    expect(within(menu).getByRole("menuitem", { name: "Rename session" })).toHaveFocus();
   });
 
   it("在折叠 rail 展示完成状态并保留新输出标记", () => {

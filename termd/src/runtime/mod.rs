@@ -14,9 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 
 use crate::pty::{
-    CommandSpec, PtyAttachment, PtyAttachmentBootstrap, PtyBackend, PtyError, PtyRestoreInfo,
-    PtySession, PtySize, PtySnapshot, PtySupervisorStatus, PtyTerminalFrame, SessionActivityEvent,
-    SessionActivitySignal,
+    CommandSpec, PinnedWorkingDirectory, PtyAttachment, PtyAttachmentBootstrap, PtyBackend,
+    PtyError, PtyRestoreInfo, PtySession, PtySize, PtySnapshot, PtySupervisorStatus,
+    PtyTerminalFrame, SessionActivityEvent, SessionActivitySignal,
 };
 use crate::session::{AttachRole, SessionError, SessionManager, SessionState, TerminalSize};
 use crate::state::SessionStateRecord;
@@ -697,6 +697,18 @@ impl<B: PtyBackend> SessionRuntime<B> {
             .runtime_session(session_id)?
             .pty
             .current_working_directory())
+    }
+
+    /// 固定底层交互进程当前目录，避免后续启动期间路径被 rename/recreate 后指向其他 inode。
+    pub fn pin_current_working_directory(
+        &self,
+        session_id: &str,
+    ) -> RuntimeResult<Option<PinnedWorkingDirectory>> {
+        self.ensure_open_session(session_id)?;
+        Ok(self
+            .runtime_session(session_id)?
+            .pty
+            .pin_current_working_directory())
     }
 
     /// 读取 supervisor 的最近快照。

@@ -1,10 +1,28 @@
-import { Check, CircleAlert, CircleCheck, LoaderCircle, Pencil, Trash2, X } from "lucide-react";
-import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { flushSync } from "react-dom";
+import {
+  Check,
+  CircleAlert,
+  CircleCheck,
+  FolderPlus,
+  LoaderCircle,
+  MonitorUp,
+  MoreHorizontal,
+  Pencil,
+  Trash2,
+  X,
+} from "lucide-react";
+import {
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
+import { createPortal, flushSync } from "react-dom";
 import type { SessionAiActivityPayload, SessionSummaryPayload, UUID } from "../protocol/types";
 import { sessionDisplayName } from "../session-names";
 import { useI18n, type Translate } from "../i18n";
 import { SessionIdenticonAvatar } from "./SessionIdenticonAvatar";
+import { useDismissiblePopover } from "./useDismissiblePopover";
 
 export function sessionActivityClassName(activity?: SessionAiActivityPayload | null): string {
   return activity ? `activity-${activity.state}` : "";
@@ -115,7 +133,9 @@ interface SessionListProps {
   renamingSessionId?: UUID;
   renameDraft: string;
   canSaveRename: boolean;
+  mobile?: boolean;
   onAttach: (sessionId: UUID) => void;
+  onCreateInSessionCwd?: (sessionId: UUID) => void;
   onStartRename: (sessionId: UUID, currentName: string) => void;
   onRenameDraftChange: (name: string) => void;
   onSaveRename: (sessionId: UUID, nextName: string) => void;
@@ -126,11 +146,22 @@ interface SessionListProps {
 
 const SESSION_DRAG_THRESHOLD_PX = 5;
 
+type SessionMenuStyle = CSSProperties & {
+  "--termd-session-menu-anchor-x": string;
+  "--termd-session-menu-anchor-y": string;
+};
+
 export function SessionList(props: SessionListProps) {
   const [draggingSessionId, setDraggingSessionId] = useState<UUID | undefined>();
   const [dragInsertionIndex, setDragInsertionIndex] = useState<number | undefined>();
+  const [sessionMenu, setSessionMenu] = useState<{ sessionId: UUID; x: number; y: number } | undefined>();
   const { t } = useI18n();
   const rowRefs = useRef(new Map<UUID, HTMLDivElement>());
+  const { triggerRef: sessionMenuTriggerRef, popoverRef: sessionMenuRef } =
+    useDismissiblePopover<HTMLElement, HTMLDivElement>({
+      open: Boolean(sessionMenu),
+      onClose: () => setSessionMenu(undefined),
+    });
   const suppressClickUntilRef = useRef(0);
   const pointerDragRef = useRef<{
     pointerId: number;
@@ -238,6 +269,20 @@ export function SessionList(props: SessionListProps) {
     setDragInsertionIndex(undefined);
   };
 
+  const openSessionMenu = (sessionId: UUID, x: number, y: number, trigger: HTMLElement) => {
+    sessionMenuTriggerRef.current = trigger;
+    setSessionMenu({ sessionId, x, y });
+  };
+
+  const openSessionMenuFromRow = (
+    sessionId: UUID,
+    row: HTMLDivElement,
+    trigger: HTMLElement = row,
+  ) => {
+    const rect = row.getBoundingClientRect();
+    openSessionMenu(sessionId, rect.right - 212, rect.bottom + 4, trigger);
+  };
+
   const dropCandidates = draggingSessionId
     ? props.sessions.filter((session) => session.session_id !== draggingSessionId)
     : [];
@@ -247,6 +292,86 @@ export function SessionList(props: SessionListProps) {
   const dropAfterSessionId = dragInsertionIndex === dropCandidates.length
     ? dropCandidates.at(-1)?.session_id
     : undefined;
+  const menuSession = sessionMenu
+    ? props.sessions.find((session) => session.session_id === sessionMenu.sessionId)
+    : undefined;
+  const menuSessionName = menuSession ? sessionDisplayName(menuSession) : "";
+  const menuActions = menuSession
+    ? [
+        ...(!props.mobile
+          ? [{
+              key: "open",
+              label: t("sessions.open", { name: menuSessionName }),
+              icon: <MonitorUp size={14} aria-hidden="true" />,
+              disabled: false,
+              danger: false,
+              onSelect: () => props.onAttach(menuSession.session_id),
+            }]
+          : []),
+        {
+          key: "create-in-cwd",
+          label: t("sessions.newInDirectory"),
+          icon: <FolderPlus size={14} aria-hidden="true" />,
+          disabled: menuSession.state !== "running" || !props.onCreateInSessionCwd,
+          danger: false,
+          onSelect: () => props.onCreateInSessionCwd?.(menuSession.session_id),
+        },
+        {
+          key: "rename",
+          label: t("sessions.rename"),
+          icon: <Pencil size={14} aria-hidden="true" />,
+          disabled: false,
+          danger: false,
+          onSelect: () => props.onStartRename(menuSession.session_id, menuSessionName),
+        },
+        {
+          key: "close",
+          label: t("sessions.close"),
+          icon: <Trash2 size={14} aria-hidden="true" />,
+          disabled: false,
+          danger: true,
+          onSelect: () => props.onClose(menuSession.session_id),
+        },
+      ]
+    : [];
+  const sessionMenuStyle: SessionMenuStyle | undefined = sessionMenu
+    ? {
+        "--termd-session-menu-anchor-x": `${sessionMenu.x}px`,
+        "--termd-session-menu-anchor-y": `${sessionMenu.y}px`,
+      }
+    : undefined;
+  const sessionMenuPortalTarget =
+    sessionMenuTriggerRef.current?.closest<HTMLElement>(".app-shell") ?? document.body;
+  const firstEnabledMenuActionIndex = menuActions.findIndex((action) => !action.disabled);
+
+  const handleSessionMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      setSessionMenu(undefined);
+      sessionMenuTriggerRef.current?.focus();
+      return;
+    }
+    if (!(event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Home" || event.key === "End")) {
+      return;
+    }
+    const menuItems = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)'),
+    );
+    if (menuItems.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    const currentIndex = menuItems.indexOf(document.activeElement as HTMLButtonElement);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? menuItems.length - 1
+        : event.key === "ArrowUp"
+          ? (currentIndex <= 0 ? menuItems.length : currentIndex) - 1
+          : (currentIndex + 1) % menuItems.length;
+    menuItems[nextIndex]?.focus();
+  };
 
   return (
     <section className="session-list" aria-label={t("sessions.aria")}>
@@ -278,6 +403,7 @@ export function SessionList(props: SessionListProps) {
               .filter(Boolean)
               .join(" ")}
             key={session.session_id}
+            tabIndex={-1}
             ref={(node) => {
               if (node) {
                 rowRefs.current.set(session.session_id, node);
@@ -293,13 +419,35 @@ export function SessionList(props: SessionListProps) {
               event.stopPropagation();
               suppressClickUntilRef.current = 0;
             }}
+            onContextMenu={(event) => {
+              if (isRenaming || props.mobile) {
+                return;
+              }
+              event.preventDefault();
+              openSessionMenu(session.session_id, event.clientX, event.clientY, event.currentTarget);
+            }}
+            onKeyDown={(event) => {
+              if (
+                isRenaming ||
+                props.mobile ||
+                !(event.key === "ContextMenu" || (event.shiftKey && event.key === "F10"))
+              ) {
+                return;
+              }
+              event.preventDefault();
+              openSessionMenuFromRow(
+                session.session_id,
+                event.currentTarget,
+                event.target instanceof HTMLElement ? event.target : event.currentTarget,
+              );
+            }}
             onPointerDown={(event: ReactPointerEvent<HTMLDivElement>) => {
               const target = event.target as Element;
               if (
                 !isReorderable ||
                 event.button > 0 ||
                 pointerDragRef.current ||
-                target.closest("input, textarea, select, [contenteditable='true']")
+                target.closest("button, input, textarea, select, [contenteditable='true']")
               ) {
                 return;
               }
@@ -404,30 +552,87 @@ export function SessionList(props: SessionListProps) {
                     </button>
                   </>
                 ) : (
-                  <>
+                  props.mobile ? (
                     <button
                       type="button"
-                      className="icon-button"
-                      aria-label={t("sessions.rename")}
-                      onClick={() => props.onStartRename(session.session_id, displayName)}
+                      className="icon-button session-actions-menu-button"
+                      aria-label={t("sessions.actionsFor", { name: displayName })}
+                      aria-haspopup="menu"
+                      aria-expanded={sessionMenu?.sessionId === session.session_id}
+                      onClick={(event) => {
+                        if (sessionMenu?.sessionId === session.session_id) {
+                          setSessionMenu(undefined);
+                          return;
+                        }
+                        const rect = event.currentTarget.getBoundingClientRect();
+                        openSessionMenu(
+                          session.session_id,
+                          rect.right - 212,
+                          rect.bottom + 4,
+                          event.currentTarget,
+                        );
+                      }}
                     >
-                      <Pencil size={15} aria-hidden="true" />
+                      <MoreHorizontal size={17} aria-hidden="true" />
                     </button>
-                    <button
-                      type="button"
-                      className="icon-button danger"
-                      aria-label={t("sessions.close")}
-                      onClick={() => props.onClose(session.session_id)}
-                    >
-                      <Trash2 size={15} aria-hidden="true" />
-                    </button>
-                  </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className="icon-button"
+                        aria-label={t("sessions.rename")}
+                        onClick={() => props.onStartRename(session.session_id, displayName)}
+                      >
+                        <Pencil size={15} aria-hidden="true" />
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-button danger"
+                        aria-label={t("sessions.close")}
+                        onClick={() => props.onClose(session.session_id)}
+                      >
+                        <Trash2 size={15} aria-hidden="true" />
+                      </button>
+                    </>
+                  )
                 )}
               </div>
             </div>
           </div>
         );
       })}
+      {sessionMenu && menuSession
+        ? createPortal(
+            <div
+              ref={sessionMenuRef}
+              className="file-context-menu session-context-menu"
+              role="menu"
+              aria-label={t("sessions.actionsFor", { name: menuSessionName })}
+              style={sessionMenuStyle}
+              onContextMenu={(event) => event.preventDefault()}
+              onKeyDown={handleSessionMenuKeyDown}
+            >
+              {menuActions.map((action, index) => (
+                <button
+                  key={action.key}
+                  type="button"
+                  role="menuitem"
+                  tabIndex={index === firstEnabledMenuActionIndex ? 0 : -1}
+                  className={action.danger ? "danger" : undefined}
+                  disabled={action.disabled}
+                  onClick={() => {
+                    setSessionMenu(undefined);
+                    action.onSelect();
+                  }}
+                >
+                  {action.icon}
+                  <span>{action.label}</span>
+                </button>
+              ))}
+            </div>,
+            sessionMenuPortalTarget,
+          )
+        : null}
     </section>
   );
 }

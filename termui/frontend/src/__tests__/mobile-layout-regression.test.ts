@@ -141,6 +141,27 @@ describe("mobile layout regressions", () => {
     expect(metricLabelRule).toContain("white-space: nowrap;");
   });
 
+  it("clamps portaled session menus to the visual viewport and safe area", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const menuRule = css.match(/\.session-context-menu \{[\s\S]+?\n\}/)?.[0] ?? "";
+
+    expect(menuRule).toContain(
+      "var(--termd-layout-viewport-width, var(--termd-visual-viewport-width, 100dvw))",
+    );
+    expect(menuRule).toContain("var(--termd-visual-viewport-offset-left, 0px)");
+    expect(menuRule).toContain("var(--termd-session-menu-anchor-x, 8px)");
+    expect(menuRule).toContain("env(safe-area-inset-left, 0px)");
+    expect(menuRule).toContain("env(safe-area-inset-right, 0px)");
+    expect(menuRule).toContain(
+      "var(--termd-layout-viewport-height, var(--termd-visual-viewport-height, 100dvh))",
+    );
+    expect(menuRule).toContain("var(--termd-visual-viewport-offset-top, 0px)");
+    expect(menuRule).toContain("var(--termd-session-menu-anchor-y, 8px)");
+    expect(menuRule).toContain("env(safe-area-inset-top, 0px)");
+    expect(menuRule).toContain("env(safe-area-inset-bottom, 0px)");
+    expect(menuRule).not.toContain("100vh");
+  });
+
   it("honors contrast, transparency, motion, and immediate press preferences", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
 
@@ -162,7 +183,9 @@ describe("mobile layout regressions", () => {
     const transparencyBlock = cssPreferenceBlock(css, "prefers-reduced-transparency: reduce");
     expect(transparencyBlock).toContain("--color-bg-shell: #191d20;");
     expect(transparencyBlock).toContain("--color-floating-gradient: linear-gradient(90deg, #191e21, #30383d 16px);");
-    expect(transparencyBlock).toContain(".toolbar,\n  .mobile-menu-popover,\n  .terminal-direction-pad {\n    backdrop-filter: none;");
+    expect(transparencyBlock).toMatch(
+      /\.toolbar,\s*\.mobile-menu-popover,\s*\.session-create-menu,\s*\.session-context-menu,\s*\.terminal-direction-pad\s*\{\s*backdrop-filter:\s*none;/,
+    );
     expect(transparencyBlock).toContain(".terminal-direction-pad {\n    backdrop-filter: none;");
     const motionBlock = cssPreferenceBlock(css, "prefers-reduced-motion: reduce");
     expect(motionBlock).toContain("transition-duration: 0.01ms !important;");
