@@ -33,11 +33,11 @@ impl PinnedWorkingDirectory {
         {
             use std::os::fd::AsRawFd;
 
-            return Some(PathBuf::from(format!(
+            Some(PathBuf::from(format!(
                 "/proc/{}/fd/{}",
                 std::process::id(),
                 self.handle.as_raw_fd()
-            )));
+            )))
         }
         #[cfg(not(target_os = "linux"))]
         None
