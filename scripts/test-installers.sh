@@ -96,7 +96,11 @@ for component in termd termctl termrelay; do
   grep -Fq "${component}-linux-amd64" "${ROOT_DIR}/.github/workflows/release.yml"
   grep -Fq "${component}-linux-arm64" "${ROOT_DIR}/.github/workflows/release.yml"
 done
-grep -Fq 'needs: [validate, package]' "${ROOT_DIR}/.github/workflows/release.yml"
+for arch in amd64 arm64; do
+  grep -Fq "termd-browser-runtime-linux-${arch}.json" "${ROOT_DIR}/.github/workflows/release.yml"
+  grep -Fq "termd-browser-runtime-linux-${arch}.tar.gz" "${ROOT_DIR}/.github/workflows/release.yml"
+done
+grep -Fq 'needs: [validate, package, browser-runtime]' "${ROOT_DIR}/.github/workflows/release.yml"
 grep -Fq 'merge-multiple: true' "${ROOT_DIR}/.github/workflows/release.yml"
 grep -Fq 'Validate exact release asset set' "${ROOT_DIR}/.github/workflows/release.yml"
 ! grep -Fq 'Build release archives' "${ROOT_DIR}/.github/workflows/release.yml"
