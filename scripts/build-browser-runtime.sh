@@ -30,7 +30,7 @@ case "$(uname -m):${asset_arch}" in
     ;;
 esac
 
-for command in autoreconf cmake curl jq make patch pkg-config readelf sha256sum tar xkbcomp; do
+for command in automake autoreconf cmake curl jq make patch pkg-config readelf sha256sum tar xkbcomp; do
   command -v "$command" >/dev/null || {
     printf 'required build command is missing: %s\n' "$command" >&2
     exit 1
@@ -149,6 +149,9 @@ install -m 0755 "$(command -v xkbcomp)" "${runtime_dir}/bin/xkbcomp"
 
 (
   cd "$openbox_source"
+  automake_libdir="$(automake --print-libdir)"
+  install -m 0755 "${automake_libdir}/config.guess" config.guess
+  install -m 0755 "${automake_libdir}/config.sub" config.sub
   ./configure \
     --prefix=/usr \
     --disable-nls \

@@ -82,21 +82,11 @@ impl Ord for DownloadDiskEntry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct BrowserDownloadTracker {
     pending: HashMap<PathBuf, FileIdentity>,
     handled: HashSet<BrowserDownloadCandidate>,
     inspected: HashMap<BrowserDownloadCandidate, InspectedFileOffer>,
-}
-
-impl Default for BrowserDownloadTracker {
-    fn default() -> Self {
-        Self {
-            pending: HashMap::new(),
-            handled: HashSet::new(),
-            inspected: HashMap::new(),
-        }
-    }
 }
 
 impl BrowserDownloadTracker {
