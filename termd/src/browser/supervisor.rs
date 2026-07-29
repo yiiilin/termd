@@ -16,6 +16,7 @@ use tokio::signal::unix::{Signal, SignalKind};
 use tokio::time::{Instant, sleep, timeout};
 
 use super::BrowserError;
+use super::automation::{ChromiumCdpPipes, bind_automation_socket};
 use super::download::BROWSER_DOWNLOAD_FILE_MAX_BYTES;
 
 const XVNC_START_TIMEOUT: Duration = Duration::from_secs(20);
@@ -48,6 +49,7 @@ pub struct BrowserSupervisorArgs {
     pub openbox: PathBuf,
     pub chromium: PathBuf,
     pub rfb_socket: PathBuf,
+    pub automation_socket: PathBuf,
     pub ready_file: PathBuf,
     pub start_file: PathBuf,
     pub profile_dir: PathBuf,
@@ -134,6 +136,14 @@ pub async fn run_browser_supervisor(args: BrowserSupervisorArgs) -> Result<(), B
         return Err(BrowserError::SupervisorStartFailed);
     }
 
+    let cdp_pipes = match ChromiumCdpPipes::new() {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            shutdown_child(&mut openbox).await;
+            shutdown_child(&mut xvnc).await;
+            return Err(error);
+        }
+    };
     let mut chromium_command = Command::new(&args.chromium);
     chromium_command
         .arg(format!("--user-data-dir={}", args.profile_dir.display()))
@@ -144,17 +154,23 @@ pub async fn run_browser_supervisor(args: BrowserSupervisorArgs) -> Result<(), B
             "--disable-gpu",
             "--ozone-platform=x11",
             "--start-maximized",
+            "--remote-debugging-pipe",
         ])
         .arg(format!("--window-size={},{}", args.width, args.height))
         .arg("--new-window")
-        .arg(&args.url);
-    configure_chromium_child(
+        .arg("about:blank");
+    if let Err(error) = configure_chromium_child(
         &mut chromium_command,
         &args,
         &display,
         &xauthority,
         chromium_identity,
-    )?;
+    ) {
+        shutdown_child(&mut openbox).await;
+        shutdown_child(&mut xvnc).await;
+        return Err(error);
+    }
+    cdp_pipes.configure_child(&mut chromium_command);
     let mut chromium = match chromium_command.spawn() {
         Ok(child) => child,
         Err(_) => {
@@ -173,18 +189,41 @@ pub async fn run_browser_supervisor(args: BrowserSupervisorArgs) -> Result<(), B
         shutdown_child(&mut xvnc).await;
         return Err(BrowserError::SupervisorStartFailed);
     }
+    let mut cdp = cdp_pipes.into_connection();
+    if cdp.initialize(&args.download_dir, &args.url).await.is_err() {
+        shutdown_child(&mut chromium).await;
+        shutdown_child(&mut openbox).await;
+        shutdown_child(&mut xvnc).await;
+        remove_owned_socket(&args.rfb_socket);
+        return Err(BrowserError::SupervisorStartFailed);
+    }
+    let automation_listener = match bind_automation_socket(&args.automation_socket) {
+        Ok(listener) => listener,
+        Err(error) => {
+            shutdown_child(&mut chromium).await;
+            shutdown_child(&mut openbox).await;
+            shutdown_child(&mut xvnc).await;
+            remove_owned_socket(&args.rfb_socket);
+            remove_owned_socket(&args.automation_socket);
+            return Err(error);
+        }
+    };
     if let Err(error) = write_ready_file(&args.ready_file, args.session_id) {
         shutdown_child(&mut chromium).await;
         shutdown_child(&mut openbox).await;
         shutdown_child(&mut xvnc).await;
         remove_owned_socket(&args.rfb_socket);
+        remove_owned_socket(&args.automation_socket);
         return Err(error);
     }
 
+    let automation = super::automation::serve(automation_listener, cdp);
+    tokio::pin!(automation);
     tokio::select! {
         _ = xvnc.wait() => {}
         _ = openbox.wait() => {}
         _ = chromium.wait() => {}
+        _ = &mut automation => {}
         _ = terminate.recv() => {}
         _ = interrupt.recv() => {}
     }
@@ -194,6 +233,7 @@ pub async fn run_browser_supervisor(args: BrowserSupervisorArgs) -> Result<(), B
     shutdown_child(&mut xvnc).await;
     remove_owned_regular_file(&args.ready_file);
     remove_owned_socket(&args.rfb_socket);
+    remove_owned_socket(&args.automation_socket);
     Ok(())
 }
 
@@ -206,10 +246,16 @@ fn validate_args(args: &BrowserSupervisorArgs) -> Result<(), BrowserError> {
         || !args.openbox.is_file()
         || !args.chromium.is_file()
         || args.rfb_socket.file_name().and_then(|name| name.to_str()) != Some("rfb.sock")
+        || args
+            .automation_socket
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some("cdp.sock")
         || args.ready_file.file_name().and_then(|name| name.to_str()) != Some("ready")
         || args.start_file.file_name().and_then(|name| name.to_str()) != Some("start")
         || args.ready_file.parent() != args.rfb_socket.parent()
         || args.start_file.parent() != args.rfb_socket.parent()
+        || args.automation_socket.parent() != args.rfb_socket.parent()
         || args.profile_dir.file_name().and_then(|name| name.to_str())
             != Some(expected_profile_name.as_str())
         || args.download_dir.file_name().and_then(|name| name.to_str())
@@ -296,6 +342,7 @@ fn prepare_paths(
     }
     remove_owned_regular_file(&args.ready_file);
     remove_owned_socket(&args.rfb_socket);
+    remove_owned_socket(&args.automation_socket);
     Ok(())
 }
 
@@ -660,6 +707,38 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn supervisor_args(root: &Path) -> BrowserSupervisorArgs {
+        let session_id = uuid::Uuid::new_v4();
+        let run_dir = root.join("run");
+        let xvnc = root.join("Xvnc");
+        let openbox = root.join("openbox");
+        let chromium = root.join("chromium");
+        for executable in [&xvnc, &openbox, &chromium] {
+            fs::write(executable, []).unwrap();
+        }
+        BrowserSupervisorArgs {
+            session_id,
+            display: 100,
+            width: 1280,
+            height: 800,
+            url: "https://example.com/".to_owned(),
+            xvnc,
+            openbox,
+            chromium,
+            rfb_socket: run_dir.join("rfb.sock"),
+            automation_socket: run_dir.join("cdp.sock"),
+            ready_file: run_dir.join("ready"),
+            start_file: run_dir.join("start"),
+            profile_dir: root.join("profiles").join(session_id.to_string()),
+            download_dir: root.join("downloads").join(session_id.to_string()),
+            openbox_config: root.join("openbox.xml"),
+            runtime_library_path: None,
+            xkb_root: None,
+            runtime_data_root: None,
+            runtime_bin_root: None,
+        }
+    }
+
     #[test]
     fn chromium_identity_never_keeps_root_uid_or_gid() {
         let identity = resolve_chromium_identity().unwrap();
@@ -755,5 +834,19 @@ mod tests {
         assert!(!start_file_matches(&start_file, uuid::Uuid::new_v4()));
         fs::set_permissions(&start_file, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(!start_file_matches(&start_file, session_id));
+    }
+
+    #[test]
+    fn supervisor_control_files_must_share_the_socket_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let args = supervisor_args(root.path());
+        assert_eq!(validate_args(&args), Ok(()));
+
+        let mut misplaced = args;
+        misplaced.start_file = root.path().join("other").join("start");
+        assert_eq!(
+            validate_args(&misplaced),
+            Err(BrowserError::SupervisorArgumentsInvalid)
+        );
     }
 }

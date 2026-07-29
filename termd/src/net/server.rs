@@ -266,6 +266,34 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
 pub fn daemon_control_router(protocol: SharedDaemonProtocol) -> Router {
     Router::new()
         .route("/v1/file-offers", post(control_file_offer_create))
+        .route(
+            "/v1/browser/sessions",
+            get(control_browser_sessions_list).merge(post(control_browser_session_create)),
+        )
+        .route(
+            "/v1/browser/sessions/:browser_id",
+            delete(control_browser_session_close),
+        )
+        .route(
+            "/v1/browser/sessions/:browser_id/navigate",
+            post(control_browser_navigate),
+        )
+        .route(
+            "/v1/browser/sessions/:browser_id/snapshot",
+            get(control_browser_snapshot),
+        )
+        .route(
+            "/v1/browser/sessions/:browser_id/click",
+            post(control_browser_click),
+        )
+        .route(
+            "/v1/browser/sessions/:browser_id/fill",
+            post(control_browser_fill),
+        )
+        .route(
+            "/v1/browser/sessions/:browser_id/wait-download",
+            post(control_browser_wait_download),
+        )
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(|| async {
             api_error(
@@ -276,6 +304,151 @@ pub fn daemon_control_router(protocol: SharedDaemonProtocol) -> Router {
             )
         })
         .with_state(protocol)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserNavigateRequest {
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserClickRequest {
+    selector: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserFillRequest {
+    selector: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserWaitDownloadRequest {
+    #[serde(default = "default_browser_download_wait_ms")]
+    timeout_ms: u64,
+}
+
+const fn default_browser_download_wait_ms() -> u64 {
+    30_000
+}
+
+async fn control_browser_sessions_list(State(protocol): State<SharedDaemonProtocol>) -> Response {
+    match protocol.browser().list().await {
+        Ok(sessions) => {
+            (StatusCode::OK, Json(BrowserSessionsResponse { sessions })).into_response()
+        }
+        Err(error) => browser_operation_error(error),
+    }
+}
+
+async fn control_browser_session_create(
+    State(protocol): State<SharedDaemonProtocol>,
+    request: Result<Json<BrowserCreateRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return invalid_json_error(),
+    };
+    match protocol.browser().create(request).await {
+        Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
+        Err(error) => browser_operation_error(error),
+    }
+}
+
+async fn control_browser_session_close(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(browser_id): Path<BrowserSessionId>,
+) -> Response {
+    match protocol.browser().close(browser_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => browser_operation_error(error),
+    }
+}
+
+async fn control_browser_navigate(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(browser_id): Path<BrowserSessionId>,
+    request: Result<Json<BrowserNavigateRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return invalid_json_error(),
+    };
+    match protocol.browser().navigate(browser_id, &request.url).await {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(error) => browser_operation_error(error),
+    }
+}
+
+async fn control_browser_snapshot(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(browser_id): Path<BrowserSessionId>,
+) -> Response {
+    match protocol.browser().snapshot(browser_id).await {
+        Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
+        Err(error) => browser_operation_error(error),
+    }
+}
+
+async fn control_browser_click(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(browser_id): Path<BrowserSessionId>,
+    request: Result<Json<BrowserClickRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return invalid_json_error(),
+    };
+    match protocol
+        .browser()
+        .click(browser_id, &request.selector)
+        .await
+    {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(error) => browser_operation_error(error),
+    }
+}
+
+async fn control_browser_fill(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(browser_id): Path<BrowserSessionId>,
+    request: Result<Json<BrowserFillRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return invalid_json_error(),
+    };
+    match protocol
+        .browser()
+        .fill(browser_id, &request.selector, &request.value)
+        .await
+    {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(error) => browser_operation_error(error),
+    }
+}
+
+async fn control_browser_wait_download(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(browser_id): Path<BrowserSessionId>,
+    request: Result<Json<BrowserWaitDownloadRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return invalid_json_error(),
+    };
+    match protocol
+        .browser()
+        .wait_download(browser_id, request.timeout_ms)
+        .await
+    {
+        Ok(download) => (StatusCode::OK, Json(download)).into_response(),
+        Err(error) => browser_operation_error(error),
+    }
 }
 
 async fn api_or_plain_not_found(uri: OriginalUri) -> Response {
@@ -442,10 +615,15 @@ async fn browser_session_close(
 
 fn browser_operation_error(error: BrowserError) -> Response {
     let status = match error {
-        BrowserError::InvalidUrl | BrowserError::InvalidViewport => StatusCode::BAD_REQUEST,
+        BrowserError::InvalidUrl
+        | BrowserError::InvalidViewport
+        | BrowserError::AutomationRequestInvalid => StatusCode::BAD_REQUEST,
         BrowserError::CapacityExceeded => StatusCode::TOO_MANY_REQUESTS,
-        BrowserError::SessionNotFound => StatusCode::NOT_FOUND,
-        BrowserError::SessionNotRunning => StatusCode::CONFLICT,
+        BrowserError::SessionNotFound | BrowserError::AutomationTargetNotFound => {
+            StatusCode::NOT_FOUND
+        }
+        BrowserError::SessionNotRunning | BrowserError::AutomationBusy => StatusCode::CONFLICT,
+        BrowserError::AutomationTimeout => StatusCode::GATEWAY_TIMEOUT,
         BrowserError::StorageUnavailable
         | BrowserError::StateInvalid
         | BrowserError::StateWriteFailed => StatusCode::INTERNAL_SERVER_ERROR,
@@ -460,7 +638,9 @@ fn browser_operation_error(error: BrowserError) -> Response {
         | BrowserError::SupervisorStartFailed
         | BrowserError::SupervisorStartTimeout
         | BrowserError::SupervisorStopFailed
-        | BrowserError::RfbUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        | BrowserError::RfbUnavailable
+        | BrowserError::AutomationUnavailable
+        | BrowserError::AutomationFailed => StatusCode::SERVICE_UNAVAILABLE,
     };
     api_error(
         status,
@@ -4439,6 +4619,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn daemon_control_browser_routes_are_local_and_preserve_action_errors() {
+        let fixture = test_protocol("browser-control-routes");
+        let control = daemon_control_router(fixture.protocol.clone());
+
+        let list = control
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/browser/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let list: serde_json::Value =
+            serde_json::from_slice(&to_bytes(list.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(list["sessions"], serde_json::json!([]));
+
+        let invalid_open = control
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/browser/sessions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"url": "file:///etc/passwd", "width": 1280, "height": 800})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_open.status(), StatusCode::BAD_REQUEST);
+
+        let browser_id = BrowserSessionId::new();
+        let missing_snapshot = control
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/v1/browser/sessions/{browser_id}/snapshot"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_snapshot.status(), StatusCode::NOT_FOUND);
+        let missing_snapshot: serde_json::Value = serde_json::from_slice(
+            &to_bytes(missing_snapshot.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(missing_snapshot["error"]["code"], "browser_not_found");
+
+        let invalid_click = control
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/v1/browser/sessions/{browser_id}/click"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"selector":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_click.status(), StatusCode::BAD_REQUEST);
+        let invalid_click: serde_json::Value = serde_json::from_slice(
+            &to_bytes(invalid_click.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(invalid_click["error"]["code"], "browser_automation_invalid");
+
+        let busy = browser_operation_error(BrowserError::AutomationBusy);
+        assert_eq!(busy.status(), StatusCode::CONFLICT);
+        let busy: serde_json::Value =
+            serde_json::from_slice(&to_bytes(busy.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(busy["error"]["code"], "browser_automation_busy");
     }
 
     #[tokio::test(flavor = "multi_thread")]

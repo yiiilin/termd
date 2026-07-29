@@ -14,13 +14,17 @@ use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose};
 use qrcode::{Color as QrColor, QrCode, render::unicode};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use termd::agent_skill::{
-    Agent as SkillAgent, InstallAction, SkillState, UninstallAction, bundled_skill, install_auto,
-    installation_status, uninstall as uninstall_skill,
+    Agent as SkillAgent, InstallAction, SkillState, UninstallAction, bundled_skill,
+    install_all_auto, installation_status_all, uninstall_all as uninstall_all_skills,
 };
 #[cfg(unix)]
 use termd::browser::supervisor::{BrowserSupervisorArgs, run_browser_supervisor};
+use termd::browser::{
+    BROWSER_DOWNLOAD_WAIT_MAX_MS, BrowserCreateRequest, BrowserDownload, BrowserPage,
+    BrowserSession, BrowserSessionId, BrowserSnapshot,
+};
 use termd::config::{
     DaemonConfig, SecretString, normalize_relay_endpoints, normalize_relay_proxy_url,
 };
@@ -38,7 +42,6 @@ use termd_proto::{
     FileOfferPayload, PairingQrPayload, PairingToken, PublicKey, ServerId, UnixTimestampMillis,
 };
 use tokio::task::JoinHandle;
-#[cfg(unix)]
 use uuid::Uuid;
 
 mod installer_helper;
@@ -49,7 +52,16 @@ const LOCAL_PAIRING_TOKEN_PATH: &str = "/local/pairing-token";
 const LOCAL_PAIRING_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const CONTROL_SOCKET_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const CONTROL_SOCKET_HTTP_RESPONSE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg(unix)]
+const BROWSER_CONTROL_HTTP_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(unix)]
+const BROWSER_OPEN_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
 const CONTROL_SOCKET_ENV: &str = "TERMD_SOCKET";
+const DEFAULT_BROWSER_WIDTH: u16 = 1440;
+const DEFAULT_BROWSER_HEIGHT: u16 = 900;
+const DEFAULT_BROWSER_DOWNLOAD_WAIT_SECONDS: u64 = 30;
 const DEDICATED_RELAY_PROXY_ENV_VARS: [&str; 2] = ["TERMD_RELAY_PROXY_URL", "TERMD_RELAY_PROXY"];
 const COMMON_WS_PROXY_ENV_VARS: [&str; 4] = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
 const COMMON_WSS_PROXY_ENV_VARS: [&str; 6] = [
@@ -71,6 +83,7 @@ const HELP_TEXT: &str = concat!(
     "  termd [OPTIONS]\n",
     "  termd pair [OPTIONS]\n",
     "  termd offer-file <PATH> [--socket <PATH>] [--json]\n",
+    "  termd browser <list|open|navigate|snapshot|click|fill|wait-download|close> [OPTIONS]\n",
     "  termd skill <install|status|print|uninstall> [OPTIONS]\n",
     "  termd install [OPTIONS]\n",
     "  termd uninstall [OPTIONS]\n",
@@ -107,6 +120,8 @@ const HELP_TEXT: &str = concat!(
     "  termd pair --url http://127.0.0.1:8765\n",
     "  termd pair --qr\n",
     "  termd offer-file ./report.zip\n",
+    "  termd browser open https://example.com --json\n",
+    "  termd browser snapshot <BROWSER_ID> --json\n",
     "  termd skill install --agent auto\n",
 );
 
@@ -196,6 +211,7 @@ async fn runtime_main() -> Result<(), Box<dyn Error>> {
                 );
             }
         }
+        CliCommand::Browser(command) => run_browser_command(command)?,
         CliCommand::Skill(command) => run_skill_command(command)?,
         CliCommand::SessionSupervisor(args) => run_session_supervisor(args).await?,
         #[cfg(unix)]
@@ -555,6 +571,7 @@ enum CliCommand {
         socket: Option<PathBuf>,
         json: bool,
     },
+    Browser(BrowserCommand),
     Skill(SkillCommand),
     SessionSupervisor(SessionSupervisorArgs),
     #[cfg(unix)]
@@ -567,6 +584,54 @@ enum SkillCommand {
     Status,
     Print,
     Uninstall { agent: SkillAgent },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrowserCommand {
+    List {
+        options: BrowserCommandOptions,
+    },
+    Open {
+        url: String,
+        width: u16,
+        height: u16,
+        options: BrowserCommandOptions,
+    },
+    Navigate {
+        browser_id: BrowserSessionId,
+        url: String,
+        options: BrowserCommandOptions,
+    },
+    Snapshot {
+        browser_id: BrowserSessionId,
+        options: BrowserCommandOptions,
+    },
+    Click {
+        browser_id: BrowserSessionId,
+        selector: String,
+        options: BrowserCommandOptions,
+    },
+    Fill {
+        browser_id: BrowserSessionId,
+        selector: String,
+        value: String,
+        options: BrowserCommandOptions,
+    },
+    WaitDownload {
+        browser_id: BrowserSessionId,
+        timeout_ms: u64,
+        options: BrowserCommandOptions,
+    },
+    Close {
+        browser_id: BrowserSessionId,
+        options: BrowserCommandOptions,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BrowserCommandOptions {
+    socket: Option<PathBuf>,
+    json: bool,
 }
 
 impl fmt::Debug for CliCommand {
@@ -607,6 +672,7 @@ impl fmt::Debug for CliCommand {
                 .field("socket", socket)
                 .field("json", json)
                 .finish(),
+            Self::Browser(command) => formatter.debug_tuple("Browser").field(command).finish(),
             Self::Skill(command) => formatter.debug_tuple("Skill").field(command).finish(),
             Self::SessionSupervisor(args) => formatter
                 .debug_tuple("SessionSupervisor")
@@ -641,6 +707,7 @@ impl CliCommand {
             "-V" | "--version" | "version" => Ok(Self::Version),
             "pair" => parse_pair_args(args),
             "offer-file" => parse_offer_file_args(args),
+            "browser" => parse_browser_args(args),
             "skill" => parse_skill_args(args),
             "__session-supervisor" => parse_session_supervisor_args(args),
             #[cfg(unix)]
@@ -852,6 +919,192 @@ fn parse_offer_file_args(mut args: impl Iterator<Item = String>) -> Result<CliCo
     Ok(CliCommand::OfferFile { path, socket, json })
 }
 
+#[derive(Debug, Default)]
+struct ParsedBrowserArgs {
+    positional: Vec<String>,
+    options: BrowserCommandOptions,
+    width: Option<u16>,
+    height: Option<u16>,
+    timeout_seconds: Option<u64>,
+}
+
+fn parse_browser_args(mut args: impl Iterator<Item = String>) -> Result<CliCommand, CliError> {
+    let Some(command) = args.next() else {
+        return Err(CliError::MissingBrowserCommand);
+    };
+    if matches!(command.as_str(), "-h" | "--help") {
+        ensure_no_remaining_args(args)?;
+        return Ok(CliCommand::Help);
+    }
+    let parsed = parse_browser_operation_args(args)?;
+    let options = parsed.options.clone();
+    let command = match command.as_str() {
+        "list" => {
+            require_browser_shape(&parsed.positional, 0, &parsed, false, false, false)?;
+            BrowserCommand::List { options }
+        }
+        "open" => {
+            require_browser_shape(&parsed.positional, 1, &parsed, true, true, false)?;
+            BrowserCommand::Open {
+                url: parsed.positional[0].clone(),
+                width: parsed.width.unwrap_or(DEFAULT_BROWSER_WIDTH),
+                height: parsed.height.unwrap_or(DEFAULT_BROWSER_HEIGHT),
+                options,
+            }
+        }
+        "navigate" => {
+            require_browser_shape(&parsed.positional, 2, &parsed, false, false, false)?;
+            BrowserCommand::Navigate {
+                browser_id: parse_browser_id(&parsed.positional[0])?,
+                url: parsed.positional[1].clone(),
+                options,
+            }
+        }
+        "snapshot" => {
+            require_browser_shape(&parsed.positional, 1, &parsed, false, false, false)?;
+            BrowserCommand::Snapshot {
+                browser_id: parse_browser_id(&parsed.positional[0])?,
+                options,
+            }
+        }
+        "click" => {
+            require_browser_shape(&parsed.positional, 2, &parsed, false, false, false)?;
+            BrowserCommand::Click {
+                browser_id: parse_browser_id(&parsed.positional[0])?,
+                selector: parsed.positional[1].clone(),
+                options,
+            }
+        }
+        "fill" => {
+            require_browser_shape(&parsed.positional, 3, &parsed, false, false, false)?;
+            BrowserCommand::Fill {
+                browser_id: parse_browser_id(&parsed.positional[0])?,
+                selector: parsed.positional[1].clone(),
+                value: parsed.positional[2].clone(),
+                options,
+            }
+        }
+        "wait-download" => {
+            require_browser_shape(&parsed.positional, 1, &parsed, false, false, true)?;
+            let timeout_seconds = parsed
+                .timeout_seconds
+                .unwrap_or(DEFAULT_BROWSER_DOWNLOAD_WAIT_SECONDS);
+            let timeout_ms = timeout_seconds
+                .checked_mul(1000)
+                .filter(|timeout| *timeout <= BROWSER_DOWNLOAD_WAIT_MAX_MS)
+                .ok_or(CliError::InvalidBrowserTimeout)?;
+            if timeout_ms == 0 {
+                return Err(CliError::InvalidBrowserTimeout);
+            }
+            BrowserCommand::WaitDownload {
+                browser_id: parse_browser_id(&parsed.positional[0])?,
+                timeout_ms,
+                options,
+            }
+        }
+        "close" => {
+            require_browser_shape(&parsed.positional, 1, &parsed, false, false, false)?;
+            BrowserCommand::Close {
+                browser_id: parse_browser_id(&parsed.positional[0])?,
+                options,
+            }
+        }
+        _ => return Err(CliError::UnknownBrowserCommand(command)),
+    };
+    Ok(CliCommand::Browser(command))
+}
+
+fn parse_browser_operation_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<ParsedBrowserArgs, CliError> {
+    let mut parsed = ParsedBrowserArgs::default();
+    let mut positional_only = false;
+    while let Some(argument) = args.next() {
+        if positional_only {
+            parsed.positional.push(argument);
+            continue;
+        }
+        match argument.as_str() {
+            "--" => positional_only = true,
+            "--json" => parsed.options.json = true,
+            "--socket" => {
+                if parsed.options.socket.is_some() {
+                    return Err(CliError::UnexpectedArgument(argument));
+                }
+                let value = args.next().ok_or(CliError::MissingBrowserOptionValue)?;
+                if value.is_empty() {
+                    return Err(CliError::MissingBrowserOptionValue);
+                }
+                parsed.options.socket = Some(PathBuf::from(value));
+            }
+            "--width" => {
+                if parsed.width.is_some() {
+                    return Err(CliError::UnexpectedArgument(argument));
+                }
+                parsed.width = Some(
+                    args.next()
+                        .ok_or(CliError::MissingBrowserOptionValue)?
+                        .parse()
+                        .map_err(|_| CliError::InvalidBrowserViewport)?,
+                );
+            }
+            "--height" => {
+                if parsed.height.is_some() {
+                    return Err(CliError::UnexpectedArgument(argument));
+                }
+                parsed.height = Some(
+                    args.next()
+                        .ok_or(CliError::MissingBrowserOptionValue)?
+                        .parse()
+                        .map_err(|_| CliError::InvalidBrowserViewport)?,
+                );
+            }
+            "--timeout" => {
+                if parsed.timeout_seconds.is_some() {
+                    return Err(CliError::UnexpectedArgument(argument));
+                }
+                parsed.timeout_seconds = Some(
+                    args.next()
+                        .ok_or(CliError::MissingBrowserOptionValue)?
+                        .parse()
+                        .map_err(|_| CliError::InvalidBrowserTimeout)?,
+                );
+            }
+            value if value.starts_with('-') => {
+                return Err(CliError::UnexpectedArgument(argument));
+            }
+            _ => parsed.positional.push(argument),
+        }
+    }
+    Ok(parsed)
+}
+
+fn require_browser_shape(
+    positional: &[String],
+    expected: usize,
+    parsed: &ParsedBrowserArgs,
+    allow_width: bool,
+    allow_height: bool,
+    allow_timeout: bool,
+) -> Result<(), CliError> {
+    if positional.len() != expected {
+        return Err(CliError::InvalidBrowserArguments);
+    }
+    if (!allow_width && parsed.width.is_some())
+        || (!allow_height && parsed.height.is_some())
+        || (!allow_timeout && parsed.timeout_seconds.is_some())
+    {
+        return Err(CliError::InvalidBrowserArguments);
+    }
+    Ok(())
+}
+
+fn parse_browser_id(value: &str) -> Result<BrowserSessionId, CliError> {
+    Uuid::parse_str(value)
+        .map(BrowserSessionId)
+        .map_err(|_| CliError::InvalidBrowserId)
+}
+
 fn parse_skill_args(mut args: impl Iterator<Item = String>) -> Result<CliCommand, CliError> {
     let Some(command) = args.next() else {
         return Err(CliError::MissingSkillCommand);
@@ -917,17 +1170,22 @@ fn ensure_no_remaining_args(mut args: impl Iterator<Item = String>) -> Result<()
 fn run_skill_command(command: SkillCommand) -> Result<(), Box<dyn Error>> {
     match command {
         SkillCommand::Install { force } => {
-            for report in install_auto(force)? {
+            for report in install_all_auto(force)? {
                 let action = match report.action {
                     InstallAction::Installed => "installed",
                     InstallAction::AlreadyCurrent => "already current",
                     InstallAction::Replaced => "replaced",
                 };
-                println!("{}: {action} ({})", report.agent, report.path.display());
+                println!(
+                    "{}/{}: {action} ({})",
+                    report.agent,
+                    report.skill_name,
+                    report.path.display()
+                );
             }
         }
         SkillCommand::Status => {
-            for status in installation_status()? {
+            for status in installation_status_all()? {
                 let state = match status.state {
                     SkillState::ConfigurationMissing => "agent configuration not detected",
                     SkillState::NotInstalled => "not installed",
@@ -935,19 +1193,30 @@ fn run_skill_command(command: SkillCommand) -> Result<(), Box<dyn Error>> {
                     SkillState::Modified => "modified",
                 };
                 match status.path {
-                    Some(path) => println!("{}: {state} ({})", status.agent, path.display()),
-                    None => println!("{}: {state}", status.agent),
+                    Some(path) => println!(
+                        "{}/{}: {state} ({})",
+                        status.agent,
+                        status.skill_name,
+                        path.display()
+                    ),
+                    None => println!("{}/{}: {state}", status.agent, status.skill_name),
                 }
             }
         }
         SkillCommand::Print => print!("{}", bundled_skill()),
         SkillCommand::Uninstall { agent } => {
-            let report = uninstall_skill(agent)?;
-            let action = match report.action {
-                UninstallAction::Removed => "removed",
-                UninstallAction::AlreadyAbsent => "already absent",
-            };
-            println!("{}: {action} ({})", report.agent, report.path.display());
+            for report in uninstall_all_skills(agent)? {
+                let action = match report.action {
+                    UninstallAction::Removed => "removed",
+                    UninstallAction::AlreadyAbsent => "already absent",
+                };
+                println!(
+                    "{}/{}: {action} ({})",
+                    report.agent,
+                    report.skill_name,
+                    report.path.display()
+                );
+            }
         }
     }
     Ok(())
@@ -1245,11 +1514,269 @@ struct ControlErrorPayload {
     message: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct BrowserSessionListResponse {
+    sessions: Vec<BrowserSession>,
+}
+
 #[cfg(unix)]
-fn offer_file_over_control_socket(
-    path: &std::path::Path,
-    explicit_socket: Option<&std::path::Path>,
-) -> Result<FileOfferPayload, CliError> {
+fn run_browser_command(command: BrowserCommand) -> Result<(), CliError> {
+    match command {
+        BrowserCommand::List { options } => {
+            let response = control_http_request(
+                "GET",
+                "/v1/browser/sessions",
+                None,
+                options.socket.as_deref(),
+                BROWSER_CONTROL_HTTP_TIMEOUT,
+            )?;
+            let response: BrowserSessionListResponse =
+                parse_control_json_response(&response, 200, "browser list")?;
+            if options.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&response.sessions).map_err(|_| CliError::InvalidJson)?
+                );
+            } else if response.sessions.is_empty() {
+                println!("No Browser Sessions.");
+            } else {
+                for session in response.sessions {
+                    println!(
+                        "{}\t{}\t{}",
+                        session.browser_id,
+                        format!("{:?}", session.state).to_lowercase(),
+                        terminal_safe_browser_text(&session.display_url)
+                    );
+                }
+            }
+        }
+        BrowserCommand::Open {
+            url,
+            width,
+            height,
+            options,
+        } => {
+            let body = serde_json::to_vec(&BrowserCreateRequest { url, width, height })
+                .map_err(|_| CliError::InvalidJson)?;
+            let response = control_http_request(
+                "POST",
+                "/v1/browser/sessions",
+                Some(&body),
+                options.socket.as_deref(),
+                BROWSER_OPEN_HTTP_TIMEOUT,
+            )?;
+            let session: BrowserSession =
+                parse_control_json_response(&response, 201, "browser open")?;
+            if options.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&session).map_err(|_| CliError::InvalidJson)?
+                );
+            } else {
+                println!(
+                    "Browser session opened: {} ({})",
+                    session.browser_id,
+                    terminal_safe_browser_text(&session.display_url)
+                );
+            }
+        }
+        BrowserCommand::Navigate {
+            browser_id,
+            url,
+            options,
+        } => {
+            let body = serde_json::to_vec(&serde_json::json!({"url": url}))
+                .map_err(|_| CliError::InvalidJson)?;
+            let page = browser_page_control_request(
+                browser_id,
+                "navigate",
+                &body,
+                &options,
+                BROWSER_CONTROL_HTTP_TIMEOUT,
+            )?;
+            print_browser_page(&page, options.json)?;
+        }
+        BrowserCommand::Snapshot {
+            browser_id,
+            options,
+        } => {
+            let path = format!("/v1/browser/sessions/{browser_id}/snapshot");
+            let response = control_http_request(
+                "GET",
+                &path,
+                None,
+                options.socket.as_deref(),
+                BROWSER_CONTROL_HTTP_TIMEOUT,
+            )?;
+            let snapshot: BrowserSnapshot =
+                parse_control_json_response(&response, 200, "browser snapshot")?;
+            let rendered = if options.json {
+                serde_json::to_string(&snapshot)
+            } else {
+                serde_json::to_string_pretty(&snapshot)
+            }
+            .map_err(|_| CliError::InvalidJson)?;
+            println!("{rendered}");
+        }
+        BrowserCommand::Click {
+            browser_id,
+            selector,
+            options,
+        } => {
+            let body = serde_json::to_vec(&serde_json::json!({"selector": selector}))
+                .map_err(|_| CliError::InvalidJson)?;
+            let page = browser_page_control_request(
+                browser_id,
+                "click",
+                &body,
+                &options,
+                BROWSER_CONTROL_HTTP_TIMEOUT,
+            )?;
+            print_browser_page(&page, options.json)?;
+        }
+        BrowserCommand::Fill {
+            browser_id,
+            selector,
+            value,
+            options,
+        } => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "selector": selector,
+                "value": value
+            }))
+            .map_err(|_| CliError::InvalidJson)?;
+            let page = browser_page_control_request(
+                browser_id,
+                "fill",
+                &body,
+                &options,
+                BROWSER_CONTROL_HTTP_TIMEOUT,
+            )?;
+            print_browser_page(&page, options.json)?;
+        }
+        BrowserCommand::WaitDownload {
+            browser_id,
+            timeout_ms,
+            options,
+        } => {
+            let body = serde_json::to_vec(&serde_json::json!({"timeout_ms": timeout_ms}))
+                .map_err(|_| CliError::InvalidJson)?;
+            let path = format!("/v1/browser/sessions/{browser_id}/wait-download");
+            let request_timeout =
+                Duration::from_millis(timeout_ms).saturating_add(BROWSER_CONTROL_HTTP_TIMEOUT);
+            let response = control_http_request(
+                "POST",
+                &path,
+                Some(&body),
+                options.socket.as_deref(),
+                request_timeout,
+            )?;
+            let download: BrowserDownload =
+                parse_control_json_response(&response, 200, "browser wait-download")?;
+            if options.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&download).map_err(|_| CliError::InvalidJson)?
+                );
+            } else if let Some(total_bytes) = download.total_bytes {
+                println!(
+                    "Browser download completed: {} ({} bytes)",
+                    terminal_safe_browser_text(&download.suggested_filename),
+                    total_bytes
+                );
+            } else {
+                println!(
+                    "Browser download completed: {}",
+                    terminal_safe_browser_text(&download.suggested_filename)
+                );
+            }
+        }
+        BrowserCommand::Close {
+            browser_id,
+            options,
+        } => {
+            let path = format!("/v1/browser/sessions/{browser_id}");
+            let response = control_http_request(
+                "DELETE",
+                &path,
+                None,
+                options.socket.as_deref(),
+                BROWSER_CONTROL_HTTP_TIMEOUT,
+            )?;
+            parse_control_empty_response(&response, 204, "browser close")?;
+            if options.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"browser_id": browser_id, "closed": true})
+                );
+            } else {
+                println!("Browser session closed: {browser_id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_browser_command(_command: BrowserCommand) -> Result<(), CliError> {
+    Err(CliError::ControlSocketUnsupported)
+}
+
+#[cfg(unix)]
+fn browser_page_control_request(
+    browser_id: BrowserSessionId,
+    action: &str,
+    body: &[u8],
+    options: &BrowserCommandOptions,
+    request_timeout: Duration,
+) -> Result<BrowserPage, CliError> {
+    let path = format!("/v1/browser/sessions/{browser_id}/{action}");
+    let response = control_http_request(
+        "POST",
+        &path,
+        Some(body),
+        options.socket.as_deref(),
+        request_timeout,
+    )?;
+    parse_control_json_response(&response, 200, "browser action")
+}
+
+fn print_browser_page(page: &BrowserPage, json: bool) -> Result<(), CliError> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(page).map_err(|_| CliError::InvalidJson)?
+        );
+    } else if page.title.is_empty() {
+        println!("Browser page: {}", terminal_safe_browser_text(&page.url));
+    } else {
+        println!(
+            "Browser page: {} ({})",
+            terminal_safe_browser_text(&page.title),
+            terminal_safe_browser_text(&page.url)
+        );
+    }
+    Ok(())
+}
+
+fn terminal_safe_browser_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(1024)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+#[cfg(unix)]
+fn control_socket_path(explicit_socket: Option<&std::path::Path>) -> Result<PathBuf, CliError> {
     let socket = explicit_socket
         .map(PathBuf::from)
         .or_else(|| std::env::var_os(CONTROL_SOCKET_ENV).map(PathBuf::from))
@@ -1257,6 +1784,55 @@ fn offer_file_over_control_socket(
     if socket.as_os_str().is_empty() {
         return Err(CliError::InvalidControlSocketPath);
     }
+    Ok(socket)
+}
+
+#[cfg(unix)]
+fn control_http_request(
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    explicit_socket: Option<&std::path::Path>,
+    request_timeout: Duration,
+) -> Result<Vec<u8>, CliError> {
+    let socket = control_socket_path(explicit_socket)?;
+    let mut stream =
+        UnixStream::connect(&socket).map_err(|_| CliError::ControlSocketUnavailable)?;
+    stream
+        .set_read_timeout(Some(request_timeout))
+        .map_err(|_| CliError::LocalIo)?;
+    stream
+        .set_write_timeout(Some(CONTROL_SOCKET_HTTP_TIMEOUT))
+        .map_err(|_| CliError::LocalIo)?;
+    let body = body.unwrap_or_default();
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    if !body.is_empty() {
+        request.push_str("Content-Type: application/json\r\n");
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.write_all(body))
+        .map_err(|_| CliError::SendFailed)?;
+    let mut response = Vec::new();
+    stream
+        .take(CONTROL_SOCKET_HTTP_RESPONSE_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut response)
+        .map_err(|_| CliError::ReceiveFailed)?;
+    if response.len() as u64 > CONTROL_SOCKET_HTTP_RESPONSE_MAX_BYTES {
+        return Err(CliError::InvalidHttpResponse);
+    }
+    Ok(response)
+}
+
+#[cfg(unix)]
+fn offer_file_over_control_socket(
+    path: &std::path::Path,
+    explicit_socket: Option<&std::path::Path>,
+) -> Result<FileOfferPayload, CliError> {
     let absolute_path = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1269,27 +1845,14 @@ fn offer_file_over_control_socket(
         .ok_or(CliError::InvalidOfferFilePath)?;
     let body = serde_json::to_vec(&serde_json::json!({"path": absolute_path}))
         .map_err(|_| CliError::InvalidJson)?;
-    let mut stream =
-        UnixStream::connect(&socket).map_err(|_| CliError::ControlSocketUnavailable)?;
-    stream
-        .set_read_timeout(Some(CONTROL_SOCKET_HTTP_TIMEOUT))
-        .map_err(|_| CliError::LocalIo)?;
-    stream
-        .set_write_timeout(Some(CONTROL_SOCKET_HTTP_TIMEOUT))
-        .map_err(|_| CliError::LocalIo)?;
-    let request = format!(
-        "POST /v1/file-offers HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream
-        .write_all(request.as_bytes())
-        .and_then(|_| stream.write_all(&body))
-        .map_err(|_| CliError::SendFailed)?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|_| CliError::ReceiveFailed)?;
-    parse_file_offer_http_response(&response)
+    let response = control_http_request(
+        "POST",
+        "/v1/file-offers",
+        Some(&body),
+        explicit_socket,
+        CONTROL_SOCKET_HTTP_TIMEOUT,
+    )?;
+    parse_control_json_response(&response, 201, "file offer")
 }
 
 #[cfg(not(unix))]
@@ -1300,17 +1863,51 @@ fn offer_file_over_control_socket(
     Err(CliError::ControlSocketUnsupported)
 }
 
+#[cfg(test)]
 fn parse_file_offer_http_response(response: &[u8]) -> Result<FileOfferPayload, CliError> {
+    parse_control_json_response(response, 201, "file offer")
+}
+
+fn parse_control_json_response<T: DeserializeOwned>(
+    response: &[u8],
+    success_status: u16,
+    operation: &'static str,
+) -> Result<T, CliError> {
     let raw = std::str::from_utf8(response).map_err(|_| CliError::InvalidHttpResponse)?;
     let (head, body) = raw
         .split_once("\r\n\r\n")
         .ok_or(CliError::InvalidHttpResponse)?;
     let status = parse_http_status(head)?;
-    if status == 201 {
+    if status == success_status {
         return serde_json::from_str(body).map_err(|_| CliError::InvalidJson);
     }
     if let Ok(error) = serde_json::from_str::<ControlErrorEnvelope>(body) {
         return Err(CliError::ControlRequestRejected {
+            operation,
+            status,
+            code: error.error.code,
+            message: error.error.message,
+        });
+    }
+    Err(CliError::HttpStatus { status })
+}
+
+fn parse_control_empty_response(
+    response: &[u8],
+    success_status: u16,
+    operation: &'static str,
+) -> Result<(), CliError> {
+    let raw = std::str::from_utf8(response).map_err(|_| CliError::InvalidHttpResponse)?;
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or(CliError::InvalidHttpResponse)?;
+    let status = parse_http_status(head)?;
+    if status == success_status {
+        return Ok(());
+    }
+    if let Ok(error) = serde_json::from_str::<ControlErrorEnvelope>(body) {
+        return Err(CliError::ControlRequestRejected {
+            operation,
             status,
             code: error.error.code,
             message: error.error.message,
@@ -1391,10 +1988,18 @@ enum CliError {
     MissingOfferSocketValue,
     InvalidControlSocketPath,
     InvalidOfferFilePath,
+    MissingBrowserCommand,
+    UnknownBrowserCommand(String),
+    MissingBrowserOptionValue,
+    InvalidBrowserArguments,
+    InvalidBrowserId,
+    InvalidBrowserViewport,
+    InvalidBrowserTimeout,
     ControlSocketUnavailable,
     #[cfg(not(unix))]
     ControlSocketUnsupported,
     ControlRequestRejected {
+        operation: &'static str,
         status: u16,
         code: String,
         message: String,
@@ -1438,7 +2043,7 @@ enum CliError {
 
 impl CliError {
     fn usage() -> &'static str {
-        "usage: termd [DAEMON_OPTIONS] | pair [OPTIONS] | offer-file <PATH> [--socket <PATH>] [--json] | skill <COMMAND>\ntry `termd --help` for full help"
+        "usage: termd [DAEMON_OPTIONS] | pair [OPTIONS] | offer-file <PATH> [--socket <PATH>] [--json] | browser <COMMAND> | skill <COMMAND>\ntry `termd --help` for full help"
     }
 }
 
@@ -1504,6 +2109,27 @@ impl fmt::Display for CliError {
             Self::InvalidOfferFilePath => {
                 write!(f, "offered file path is not valid UTF-8")
             }
+            Self::MissingBrowserCommand => write!(
+                f,
+                "`termd browser` requires list, open, navigate, snapshot, click, fill, wait-download, or close\n{}",
+                Self::usage()
+            ),
+            Self::UnknownBrowserCommand(_) => {
+                write!(f, "unknown `termd browser` command\n{}", Self::usage())
+            }
+            Self::MissingBrowserOptionValue => {
+                write!(f, "browser option requires a value\n{}", Self::usage())
+            }
+            Self::InvalidBrowserArguments => {
+                write!(f, "invalid `termd browser` arguments\n{}", Self::usage())
+            }
+            Self::InvalidBrowserId => write!(f, "browser id is invalid"),
+            Self::InvalidBrowserViewport => write!(f, "browser viewport is invalid"),
+            Self::InvalidBrowserTimeout => write!(
+                f,
+                "browser download timeout must be between 1 and {} seconds",
+                BROWSER_DOWNLOAD_WAIT_MAX_MS / 1000
+            ),
             Self::ControlSocketUnavailable => write!(
                 f,
                 "daemon control socket is unavailable; check TERMD_SOCKET or pass --socket"
@@ -1513,12 +2139,15 @@ impl fmt::Display for CliError {
                 write!(f, "daemon control sockets are supported only on Unix")
             }
             Self::ControlRequestRejected {
+                operation,
                 status,
                 code,
                 message,
             } => write!(
                 f,
-                "daemon rejected file offer (HTTP {status}, {code}): {message}"
+                "daemon rejected {operation} (HTTP {status}, {}): {}",
+                terminal_safe_browser_text(code),
+                terminal_safe_browser_text(message)
             ),
             Self::MissingSkillCommand => write!(
                 f,
@@ -1752,6 +2381,128 @@ mod tests {
             CliCommand::Skill(SkillCommand::Uninstall {
                 agent: SkillAgent::Codex,
             })
+        );
+    }
+
+    #[test]
+    fn parses_browser_commands_with_agent_friendly_options() {
+        let browser_id = BrowserSessionId::new();
+        let socket = PathBuf::from("/run/custom.sock");
+        assert_eq!(
+            CliCommand::parse([
+                "browser".to_owned(),
+                "open".to_owned(),
+                "https://example.com".to_owned(),
+                "--width".to_owned(),
+                "1280".to_owned(),
+                "--height".to_owned(),
+                "800".to_owned(),
+                "--socket".to_owned(),
+                socket.display().to_string(),
+                "--json".to_owned(),
+            ])
+            .unwrap(),
+            CliCommand::Browser(BrowserCommand::Open {
+                url: "https://example.com".to_owned(),
+                width: 1280,
+                height: 800,
+                options: BrowserCommandOptions {
+                    socket: Some(socket.clone()),
+                    json: true,
+                },
+            })
+        );
+        assert_eq!(
+            CliCommand::parse([
+                "browser".to_owned(),
+                "fill".to_owned(),
+                browser_id.to_string(),
+                "#message".to_owned(),
+                "hello world".to_owned(),
+                "--json".to_owned(),
+            ])
+            .unwrap(),
+            CliCommand::Browser(BrowserCommand::Fill {
+                browser_id,
+                selector: "#message".to_owned(),
+                value: "hello world".to_owned(),
+                options: BrowserCommandOptions {
+                    socket: None,
+                    json: true,
+                },
+            })
+        );
+        assert_eq!(
+            CliCommand::parse([
+                "browser".to_owned(),
+                "wait-download".to_owned(),
+                browser_id.to_string(),
+                "--timeout".to_owned(),
+                "45".to_owned(),
+            ])
+            .unwrap(),
+            CliCommand::Browser(BrowserCommand::WaitDownload {
+                browser_id,
+                timeout_ms: 45_000,
+                options: BrowserCommandOptions::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn browser_parser_rejects_invalid_ids_shapes_and_timeouts() {
+        assert!(matches!(
+            CliCommand::parse(["browser".to_owned()]).unwrap_err(),
+            CliError::MissingBrowserCommand
+        ));
+        assert!(matches!(
+            CliCommand::parse([
+                "browser".to_owned(),
+                "snapshot".to_owned(),
+                "not-a-uuid".to_owned(),
+            ])
+            .unwrap_err(),
+            CliError::InvalidBrowserId
+        ));
+        assert!(matches!(
+            CliCommand::parse([
+                "browser".to_owned(),
+                "list".to_owned(),
+                "unexpected".to_owned(),
+            ])
+            .unwrap_err(),
+            CliError::InvalidBrowserArguments
+        ));
+        assert!(matches!(
+            CliCommand::parse([
+                "browser".to_owned(),
+                "wait-download".to_owned(),
+                BrowserSessionId::new().to_string(),
+                "--timeout".to_owned(),
+                "121".to_owned(),
+            ])
+            .unwrap_err(),
+            CliError::InvalidBrowserTimeout
+        ));
+    }
+
+    #[test]
+    fn browser_human_output_strips_terminal_control_characters() {
+        assert_eq!(
+            terminal_safe_browser_text("safe\u{1b}[31m\npage"),
+            "safe [31m page"
+        );
+        assert_eq!(terminal_safe_browser_text("\n\t"), "");
+
+        let error = CliError::ControlRequestRejected {
+            operation: "browser action",
+            status: 400,
+            code: "bad\u{1b}[31m".to_owned(),
+            message: "unsafe\nmessage".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "daemon rejected browser action (HTTP 400, bad [31m): unsafe message"
         );
     }
 

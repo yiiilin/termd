@@ -1,3 +1,4 @@
+mod automation;
 mod download;
 mod runtime;
 pub mod supervisor;
@@ -27,16 +28,24 @@ use crate::file_offer::{FileOfferError, InspectedFileOffer};
 
 pub use termd_proto::BrowserSessionId;
 
+pub use automation::{BrowserDownload, BrowserPage, BrowserSnapshot, BrowserSnapshotElement};
+
 pub(crate) use download::BrowserDownloadCandidate;
 use download::{BrowserDownloadTracker, cleanup_incomplete_downloads, scan_downloads};
 use runtime::{BrowserRuntimeManager, BrowserRuntimePaths, resolve_chromium};
 use supervisor::BrowserSupervisorArgs;
 
+use self::automation::{AUTOMATION_SOCKET_FILE_NAME, AutomationRequest, AutomationResult};
+
 const BROWSER_STORE_SCHEMA: u32 = 1;
 const BROWSER_STORE_MAX_BYTES: u64 = 1024 * 1024;
 const BROWSER_SESSION_LIMIT: usize = 4;
 const BROWSER_URL_MAX_BYTES: usize = 2048;
-const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(25);
+const BROWSER_SELECTOR_MAX_BYTES: usize = 4096;
+const BROWSER_FILL_VALUE_MAX_BYTES: usize = 64 * 1024;
+const BROWSER_DOWNLOAD_WAIT_MIN_MS: u64 = 100;
+pub const BROWSER_DOWNLOAD_WAIT_MAX_MS: u64 = 120_000;
+const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(60);
 const BROWSER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
 const BROWSER_SESSION_ENV: &str = "TERMD_BROWSER_SESSION_ID";
@@ -68,7 +77,7 @@ pub struct BrowserSession {
     pub created_at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserCreateRequest {
     pub url: String,
@@ -118,6 +127,18 @@ pub enum BrowserError {
     SupervisorStopFailed,
     #[error("browser RFB socket is unavailable")]
     RfbUnavailable,
+    #[error("browser automation request is invalid")]
+    AutomationRequestInvalid,
+    #[error("browser automation target was not found")]
+    AutomationTargetNotFound,
+    #[error("browser automation timed out")]
+    AutomationTimeout,
+    #[error("browser automation is busy")]
+    AutomationBusy,
+    #[error("browser automation is unavailable")]
+    AutomationUnavailable,
+    #[error("browser automation failed")]
+    AutomationFailed,
 }
 
 impl BrowserError {
@@ -144,6 +165,12 @@ impl BrowserError {
             | Self::SupervisorStartTimeout => "browser_start_failed",
             Self::SupervisorStopFailed => "browser_stop_failed",
             Self::RfbUnavailable => "browser_rfb_unavailable",
+            Self::AutomationRequestInvalid => "browser_automation_invalid",
+            Self::AutomationTargetNotFound => "browser_automation_target_not_found",
+            Self::AutomationTimeout => "browser_automation_timeout",
+            Self::AutomationBusy => "browser_automation_busy",
+            Self::AutomationUnavailable => "browser_automation_unavailable",
+            Self::AutomationFailed => "browser_automation_failed",
         }
     }
 
@@ -167,6 +194,12 @@ impl BrowserError {
             | Self::SupervisorStartTimeout => "browser session could not be started",
             Self::SupervisorStopFailed => "browser session could not be stopped",
             Self::RfbUnavailable => "browser display is not ready",
+            Self::AutomationRequestInvalid => "browser automation request is invalid",
+            Self::AutomationTargetNotFound => "browser selector or page target was not found",
+            Self::AutomationTimeout => "browser automation timed out",
+            Self::AutomationBusy => "another browser automation action is still running",
+            Self::AutomationUnavailable => "browser automation is unavailable for this session",
+            Self::AutomationFailed => "browser automation could not complete the action",
             Self::StorageUnavailable | Self::StateInvalid | Self::StateWriteFailed => {
                 "browser workspace storage is unavailable"
             }
@@ -182,6 +215,10 @@ impl BrowserError {
                 | Self::SupervisorStartTimeout
                 | Self::SupervisorStopFailed
                 | Self::RfbUnavailable
+                | Self::AutomationTimeout
+                | Self::AutomationBusy
+                | Self::AutomationUnavailable
+                | Self::AutomationFailed
         )
     }
 }
@@ -350,6 +387,7 @@ impl BrowserWorkspace {
         create_private_dir(&download_dir)?;
         write_openbox_config(&openbox_config)?;
         let rfb_socket = run_dir.join("rfb.sock");
+        let automation_socket = run_dir.join(AUTOMATION_SOCKET_FILE_NAME);
         let ready_file = run_dir.join("ready");
         let start_file = run_dir.join("start");
         let runtime_library_path = runtime.library_path();
@@ -370,6 +408,7 @@ impl BrowserWorkspace {
             openbox: runtime.openbox,
             chromium,
             rfb_socket: rfb_socket.clone(),
+            automation_socket: automation_socket.clone(),
             ready_file: ready_file.clone(),
             start_file: start_file.clone(),
             profile_dir: profile_dir.clone(),
@@ -435,6 +474,7 @@ impl BrowserWorkspace {
             browser_id,
             &mut handle,
             &state.sessions[&browser_id],
+            &automation_socket,
         )
         .await;
         if let Err(error) = started {
@@ -495,6 +535,116 @@ impl BrowserWorkspace {
         UnixStream::connect(socket)
             .await
             .map_err(|_| BrowserError::RfbUnavailable)
+    }
+
+    pub async fn navigate(
+        &self,
+        id: BrowserSessionId,
+        url: &str,
+    ) -> Result<BrowserPage, BrowserError> {
+        let url = validate_browser_url(url)?;
+        match self
+            .automate(id, AutomationRequest::Navigate { url })
+            .await?
+        {
+            AutomationResult::Page(page) => Ok(page),
+            _ => Err(BrowserError::AutomationFailed),
+        }
+    }
+
+    pub async fn snapshot(&self, id: BrowserSessionId) -> Result<BrowserSnapshot, BrowserError> {
+        match self.automate(id, AutomationRequest::Snapshot).await? {
+            AutomationResult::Snapshot(snapshot) => Ok(snapshot),
+            _ => Err(BrowserError::AutomationFailed),
+        }
+    }
+
+    pub async fn click(
+        &self,
+        id: BrowserSessionId,
+        selector: &str,
+    ) -> Result<BrowserPage, BrowserError> {
+        validate_selector(selector)?;
+        match self
+            .automate(
+                id,
+                AutomationRequest::Click {
+                    selector: selector.to_owned(),
+                },
+            )
+            .await?
+        {
+            AutomationResult::Page(page) => Ok(page),
+            _ => Err(BrowserError::AutomationFailed),
+        }
+    }
+
+    pub async fn fill(
+        &self,
+        id: BrowserSessionId,
+        selector: &str,
+        value: &str,
+    ) -> Result<BrowserPage, BrowserError> {
+        validate_selector(selector)?;
+        if value.len() > BROWSER_FILL_VALUE_MAX_BYTES {
+            return Err(BrowserError::AutomationRequestInvalid);
+        }
+        match self
+            .automate(
+                id,
+                AutomationRequest::Fill {
+                    selector: selector.to_owned(),
+                    value: value.to_owned(),
+                },
+            )
+            .await?
+        {
+            AutomationResult::Page(page) => Ok(page),
+            _ => Err(BrowserError::AutomationFailed),
+        }
+    }
+
+    pub async fn wait_download(
+        &self,
+        id: BrowserSessionId,
+        timeout_ms: u64,
+    ) -> Result<BrowserDownload, BrowserError> {
+        if !(BROWSER_DOWNLOAD_WAIT_MIN_MS..=BROWSER_DOWNLOAD_WAIT_MAX_MS).contains(&timeout_ms) {
+            return Err(BrowserError::AutomationRequestInvalid);
+        }
+        match self
+            .automate(id, AutomationRequest::WaitDownload { timeout_ms })
+            .await?
+        {
+            AutomationResult::Download(download) => Ok(download),
+            _ => Err(BrowserError::AutomationFailed),
+        }
+    }
+
+    async fn automate(
+        &self,
+        id: BrowserSessionId,
+        request: AutomationRequest,
+    ) -> Result<AutomationResult, BrowserError> {
+        let socket = {
+            let _operation = self.inner.operation.lock().await;
+            let mut guard = self.inner.state.lock().await;
+            let state = state_mut(&mut guard)?;
+            self.reconcile(state).await?;
+            let record = state
+                .sessions
+                .get(&id)
+                .ok_or(BrowserError::SessionNotFound)?;
+            if record.session.state != BrowserSessionState::Running {
+                return Err(BrowserError::SessionNotRunning);
+            }
+            record
+                .rfb_socket
+                .parent()
+                .ok_or(BrowserError::StateInvalid)?
+                .join(AUTOMATION_SOCKET_FILE_NAME)
+        };
+        automation::request(&socket, request).await
     }
 
     pub(crate) async fn completed_downloads(
@@ -932,6 +1082,16 @@ fn validate_viewport(width: u16, height: u16) -> Result<(), BrowserError> {
     Ok(())
 }
 
+fn validate_selector(selector: &str) -> Result<(), BrowserError> {
+    if selector.trim().is_empty()
+        || selector.len() > BROWSER_SELECTOR_MAX_BYTES
+        || selector.contains('\0')
+    {
+        return Err(BrowserError::AutomationRequestInvalid);
+    }
+    Ok(())
+}
+
 fn allocate_display(
     paths: &BrowserPaths,
     state: &BrowserWorkspaceState,
@@ -955,10 +1115,17 @@ async fn wait_for_browser_ready(
     id: BrowserSessionId,
     handle: &mut BrowserLaunchHandle,
     record: &BrowserSessionRecord,
+    automation_socket: &Path,
 ) -> Result<(), BrowserError> {
     let deadline = Instant::now() + BROWSER_START_TIMEOUT;
     loop {
-        if browser_record_is_ready(id, record) && launcher.is_alive(record.supervisor_pid, id) {
+        let automation_ready = fs::symlink_metadata(automation_socket)
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false);
+        if browser_record_is_ready(id, record)
+            && automation_ready
+            && launcher.is_alive(record.supervisor_pid, id)
+        {
             return Ok(());
         }
         if let Some(child) = &mut handle.child
@@ -1484,10 +1651,13 @@ mod tests {
             }
             let listener = UnixListener::bind(&args.rfb_socket)
                 .map_err(|_| BrowserError::SupervisorStartFailed)?;
+            let automation_listener = UnixListener::bind(&args.automation_socket)
+                .map_err(|_| BrowserError::SupervisorStartFailed)?;
             fs::write(&args.ready_file, id.to_string())
                 .map_err(|_| BrowserError::SupervisorStartFailed)?;
             let alive = Arc::clone(&self.alive);
             listener.set_nonblocking(true).unwrap();
+            automation_listener.set_nonblocking(true).unwrap();
             thread::spawn(move || {
                 while alive.load(Ordering::Acquire) {
                     match listener.accept() {
@@ -1495,6 +1665,11 @@ mod tests {
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(5));
                         }
+                        Err(_) => break,
+                    }
+                    match automation_listener.accept() {
+                        Ok((_stream, _)) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(_) => break,
                     }
                 }
@@ -1594,6 +1769,31 @@ mod tests {
                 Err(BrowserError::InvalidUrl)
             ));
         }
+    }
+
+    #[test]
+    fn browser_automation_keeps_the_v1_record_shape() {
+        let browser_id = BrowserSessionId::new();
+        let record: BrowserSessionRecord = serde_json::from_value(serde_json::json!({
+            "session": {
+                "browser_id": browser_id,
+                "state": "running",
+                "display_url": "https://example.com/",
+                "width": 1280,
+                "height": 800,
+                "created_at_ms": 1
+            },
+            "launch_url": "https://example.com/",
+            "supervisor_pid": 42,
+            "display": 100,
+            "rfb_socket": "/tmp/rfb.sock",
+            "ready_file": "/tmp/ready",
+            "profile_dir": "/tmp/profile",
+            "openbox_config": "/tmp/openbox.xml"
+        }))
+        .unwrap();
+        let encoded = serde_json::to_value(record).unwrap();
+        assert!(encoded.get("automation_socket").is_none());
     }
 
     #[test]

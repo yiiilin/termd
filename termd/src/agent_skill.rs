@@ -1,4 +1,4 @@
-//! Installation support for the bundled `termd-file-offer` agent skill.
+//! Installation support for termd's bundled agent skills.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -10,10 +10,29 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const SKILL_NAME: &str = "termd-file-offer";
+pub const BROWSER_SKILL_NAME: &str = "termd-browser";
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const BUNDLED_SKILL: &str = include_str!("../skills/termd-file-offer/SKILL.md");
+const BUNDLED_BROWSER_SKILL: &str = include_str!("../skills/termd-browser/SKILL.md");
 const SUPPORTED_AGENTS: [Agent; 3] = [Agent::Codex, Agent::Claude, Agent::OpenCode];
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct BundledSkill {
+    name: &'static str,
+    contents: &'static str,
+}
+
+const BUNDLED_SKILLS: [BundledSkill; 2] = [
+    BundledSkill {
+        name: SKILL_NAME,
+        contents: BUNDLED_SKILL,
+    },
+    BundledSkill {
+        name: BROWSER_SKILL_NAME,
+        contents: BUNDLED_BROWSER_SKILL,
+    },
+];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Agent {
@@ -95,6 +114,30 @@ pub struct UninstallReport {
     pub action: UninstallAction,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BundledInstallReport {
+    pub skill_name: &'static str,
+    pub agent: Agent,
+    pub path: PathBuf,
+    pub action: InstallAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BundledSkillStatus {
+    pub skill_name: &'static str,
+    pub agent: Agent,
+    pub path: Option<PathBuf>,
+    pub state: SkillState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BundledUninstallReport {
+    pub skill_name: &'static str,
+    pub agent: Agent,
+    pub path: PathBuf,
+    pub action: UninstallAction,
+}
+
 #[derive(Debug)]
 pub enum AgentSkillError {
     UnsupportedAgent {
@@ -161,6 +204,22 @@ pub fn bundled_skill() -> &'static str {
     BUNDLED_SKILL
 }
 
+pub fn bundled_browser_skill() -> &'static str {
+    BUNDLED_BROWSER_SKILL
+}
+
+pub fn install_all_auto(force: bool) -> Result<Vec<BundledInstallReport>, AgentSkillError> {
+    install_all_auto_with(&AgentLocations::from_process(), force)
+}
+
+pub fn installation_status_all() -> Result<Vec<BundledSkillStatus>, AgentSkillError> {
+    status_all_with(&AgentLocations::from_process())
+}
+
+pub fn uninstall_all(agent: Agent) -> Result<Vec<BundledUninstallReport>, AgentSkillError> {
+    uninstall_all_with(&AgentLocations::from_process(), agent)
+}
+
 pub fn install_auto(force: bool) -> Result<Vec<InstallReport>, AgentSkillError> {
     install_auto_with(&AgentLocations::from_process(), force)
 }
@@ -181,9 +240,13 @@ struct AgentLocation {
 
 impl AgentLocation {
     fn target_path(&self) -> Option<PathBuf> {
+        self.target_path_for(SKILL_NAME)
+    }
+
+    fn target_path_for(&self, skill_name: &str) -> Option<PathBuf> {
         self.config_root
             .as_ref()
-            .map(|root| root.join("skills").join(SKILL_NAME))
+            .map(|root| root.join("skills").join(skill_name))
     }
 }
 
@@ -265,6 +328,39 @@ fn status_with(locations: &AgentLocations) -> Result<Vec<SkillStatus>, AgentSkil
         .collect()
 }
 
+fn status_all_with(locations: &AgentLocations) -> Result<Vec<BundledSkillStatus>, AgentSkillError> {
+    let mut statuses = Vec::new();
+    for agent in SUPPORTED_AGENTS {
+        let location = locations.get(agent);
+        for skill in BUNDLED_SKILLS {
+            let Some(target) = location.target_path_for(skill.name) else {
+                statuses.push(BundledSkillStatus {
+                    skill_name: skill.name,
+                    agent,
+                    path: None,
+                    state: SkillState::ConfigurationMissing,
+                });
+                continue;
+            };
+            let Some(root) = location.config_root.as_deref() else {
+                unreachable!("a target path requires a configuration root")
+            };
+            let state = if directory_exists(root, "inspect", root)? {
+                inspect_bundled_target(&target, skill.contents)?
+            } else {
+                SkillState::ConfigurationMissing
+            };
+            statuses.push(BundledSkillStatus {
+                skill_name: skill.name,
+                agent,
+                path: Some(target),
+                state,
+            });
+        }
+    }
+    Ok(statuses)
+}
+
 fn install_auto_with(
     locations: &AgentLocations,
     force: bool,
@@ -322,6 +418,66 @@ fn install_auto_with(
         .collect()
 }
 
+fn install_all_auto_with(
+    locations: &AgentLocations,
+    force: bool,
+) -> Result<Vec<BundledInstallReport>, AgentSkillError> {
+    let mut targets = Vec::new();
+    for agent in SUPPORTED_AGENTS {
+        let location = locations.get(agent);
+        let Some(root) = location.config_root.as_deref() else {
+            continue;
+        };
+        if !directory_exists(root, "inspect", root)? {
+            continue;
+        }
+        for skill in BUNDLED_SKILLS {
+            let target = location
+                .target_path_for(skill.name)
+                .expect("a configured agent has a skill target path");
+            let state = inspect_bundled_target(&target, skill.contents)?;
+            if state == SkillState::Modified && !force {
+                return Err(AgentSkillError::ModifiedInstallation {
+                    agent,
+                    path: target,
+                });
+            }
+            targets.push((agent, skill, target));
+        }
+    }
+
+    if targets.is_empty() {
+        return Err(AgentSkillError::NoAgentConfigurationDetected);
+    }
+
+    targets
+        .into_iter()
+        .map(|(agent, skill, path)| {
+            let state = inspect_bundled_target(&path, skill.contents)?;
+            let action = match state {
+                SkillState::Current => InstallAction::AlreadyCurrent,
+                SkillState::NotInstalled => {
+                    write_bundled_target_contents(&path, skill.contents, false)?;
+                    InstallAction::Installed
+                }
+                SkillState::Modified => {
+                    write_bundled_target_contents(&path, skill.contents, true)?;
+                    InstallAction::Replaced
+                }
+                SkillState::ConfigurationMissing => {
+                    unreachable!("auto installation includes only existing configuration roots")
+                }
+            };
+            Ok(BundledInstallReport {
+                skill_name: skill.name,
+                agent,
+                path,
+                action,
+            })
+        })
+        .collect()
+}
+
 fn uninstall_with(
     locations: &AgentLocations,
     agent: Agent,
@@ -350,6 +506,49 @@ fn uninstall_with(
     }
 }
 
+fn uninstall_all_with(
+    locations: &AgentLocations,
+    agent: Agent,
+) -> Result<Vec<BundledUninstallReport>, AgentSkillError> {
+    let location = locations.get(agent);
+    let mut targets = Vec::new();
+    for skill in BUNDLED_SKILLS {
+        let path = location
+            .target_path_for(skill.name)
+            .ok_or(AgentSkillError::LocationUnavailable { agent })?;
+        let state = inspect_bundled_target(&path, skill.contents)?;
+        if matches!(
+            state,
+            SkillState::Modified | SkillState::ConfigurationMissing
+        ) {
+            return Err(AgentSkillError::ModifiedInstallation { agent, path });
+        }
+        targets.push((skill, path, state));
+    }
+
+    targets
+        .into_iter()
+        .map(|(skill, path, state)| {
+            let action = match state {
+                SkillState::NotInstalled => UninstallAction::AlreadyAbsent,
+                SkillState::Current => {
+                    remove_path(&path, "uninstall")?;
+                    UninstallAction::Removed
+                }
+                SkillState::Modified | SkillState::ConfigurationMissing => {
+                    unreachable!("all bundled skill targets were preflighted")
+                }
+            };
+            Ok(BundledUninstallReport {
+                skill_name: skill.name,
+                agent,
+                path,
+                action,
+            })
+        })
+        .collect()
+}
+
 fn directory_exists(
     path: &Path,
     operation: &'static str,
@@ -363,6 +562,13 @@ fn directory_exists(
 }
 
 fn inspect_target(path: &Path) -> Result<SkillState, AgentSkillError> {
+    inspect_bundled_target(path, BUNDLED_SKILL)
+}
+
+fn inspect_bundled_target(
+    path: &Path,
+    expected_contents: &str,
+) -> Result<SkillState, AgentSkillError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -391,7 +597,7 @@ fn inspect_target(path: &Path) -> Result<SkillState, AgentSkillError> {
         return Ok(SkillState::Modified);
     }
     let contents = fs::read(&skill_path).map_err(|source| io_error("read", &skill_path, source))?;
-    if contents == BUNDLED_SKILL.as_bytes() {
+    if contents == expected_contents.as_bytes() {
         Ok(SkillState::Current)
     } else {
         Ok(SkillState::Modified)
@@ -399,6 +605,14 @@ fn inspect_target(path: &Path) -> Result<SkillState, AgentSkillError> {
 }
 
 fn write_bundled_target(path: &Path, replace: bool) -> Result<(), AgentSkillError> {
+    write_bundled_target_contents(path, BUNDLED_SKILL, replace)
+}
+
+fn write_bundled_target_contents(
+    path: &Path,
+    contents: &str,
+    replace: bool,
+) -> Result<(), AgentSkillError> {
     let parent = path.parent().ok_or_else(|| {
         io_error(
             "create",
@@ -410,7 +624,7 @@ fn write_bundled_target(path: &Path, replace: bool) -> Result<(), AgentSkillErro
 
     let staging = create_staging_directory(path, "install")?;
     let skill_path = staging.join(SKILL_FILE_NAME);
-    if let Err(source) = fs::write(&skill_path, BUNDLED_SKILL) {
+    if let Err(source) = fs::write(&skill_path, contents) {
         let _ = fs::remove_dir_all(&staging);
         return Err(io_error("write", &skill_path, source));
     }
@@ -438,7 +652,7 @@ fn write_bundled_target(path: &Path, replace: bool) -> Result<(), AgentSkillErro
         return Err(io_error("install", path, source));
     }
 
-    if inspect_target(path)? != SkillState::Current {
+    if inspect_bundled_target(path, contents)? != SkillState::Current {
         return Err(io_error(
             "verify",
             path,
@@ -653,6 +867,65 @@ mod tests {
     }
 
     #[test]
+    fn all_bundle_install_manages_file_offer_and_browser_skills() {
+        let root = TestDir::new("all-bundles");
+        let locations = create_roots(&root);
+
+        let installed = install_all_auto_with(&locations, false).unwrap();
+        assert_eq!(
+            installed.len(),
+            SUPPORTED_AGENTS.len() * BUNDLED_SKILLS.len()
+        );
+        assert!(
+            installed
+                .iter()
+                .all(|report| report.action == InstallAction::Installed)
+        );
+        for report in &installed {
+            let expected = BUNDLED_SKILLS
+                .iter()
+                .find(|skill| skill.name == report.skill_name)
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(report.path.join(SKILL_FILE_NAME)).unwrap(),
+                expected.contents
+            );
+        }
+
+        let statuses = status_all_with(&locations).unwrap();
+        assert_eq!(statuses.len(), installed.len());
+        assert!(
+            statuses
+                .iter()
+                .all(|status| status.state == SkillState::Current)
+        );
+
+        let removed = uninstall_all_with(&locations, Agent::Codex).unwrap();
+        assert_eq!(removed.len(), BUNDLED_SKILLS.len());
+        assert!(
+            removed
+                .iter()
+                .all(|report| report.action == UninstallAction::Removed && !report.path.exists())
+        );
+    }
+
+    #[test]
+    fn modified_browser_skill_blocks_all_bundle_writes_without_force() {
+        let root = TestDir::new("modified-browser-bundle");
+        let locations = create_roots(&root);
+        let location = locations.get(Agent::Codex);
+        let browser_target = location.target_path_for(BROWSER_SKILL_NAME).unwrap();
+        fs::create_dir_all(&browser_target).unwrap();
+        fs::write(browser_target.join(SKILL_FILE_NAME), "user changes\n").unwrap();
+
+        assert!(matches!(
+            install_all_auto_with(&locations, false),
+            Err(AgentSkillError::ModifiedInstallation { path, .. }) if path == browser_target
+        ));
+        assert!(!location.target_path().unwrap().exists());
+    }
+
+    #[test]
     fn auto_install_ignores_missing_configuration_roots() {
         let root = TestDir::new("detected-only");
         let home = root.join("home");
@@ -850,6 +1123,17 @@ mod tests {
         assert!(skill.contains("Each successful invocation creates one broadcast"));
         assert!(skill.contains("Show the command output"));
         assert!(skill.contains("Do not scan for daemon sockets"));
+    }
+
+    #[test]
+    fn bundled_browser_document_covers_actions_downloads_and_untrusted_pages() {
+        let skill = bundled_browser_skill();
+        assert!(skill.contains("name: termd-browser"));
+        assert!(skill.contains("termd browser snapshot <BROWSER_ID> --json"));
+        assert!(skill.contains("termd browser wait-download"));
+        assert!(skill.contains("browser_automation_busy"));
+        assert!(skill.contains("untrusted data"));
+        assert!(skill.contains("Do not scan for daemon or per-session sockets"));
     }
 
     #[test]
