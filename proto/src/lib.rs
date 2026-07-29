@@ -129,6 +129,29 @@ impl Default for SessionId {
     }
 }
 
+/// 独立 Browser Session 标识；它不隶属于 terminal session。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BrowserSessionId(pub Uuid);
+
+impl BrowserSessionId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for BrowserSessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for BrowserSessionId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// device key 对应的设备身份；真实验签由 auth 层完成。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -318,6 +341,23 @@ pub fn is_http_tunnel_path_allowed(method: &str, path: &str) -> bool {
         || (method.eq_ignore_ascii_case("GET") && path == "/api/push/config")
         || (method.eq_ignore_ascii_case("PUT") && path == "/api/push/subscription")
         || (method.eq_ignore_ascii_case("DELETE") && path == "/api/push/subscription")
+        || is_http_browser_tunnel_path_allowed(method, path)
+}
+
+fn is_http_browser_tunnel_path_allowed(method: &str, path: &str) -> bool {
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["api", "browser", "sessions"] => {
+            method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("POST")
+        }
+        ["api", "browser", "sessions", browser_id] => {
+            method.eq_ignore_ascii_case("DELETE") && Uuid::parse_str(browser_id).is_ok()
+        }
+        _ => false,
+    }
 }
 
 fn is_http_file_tunnel_path_allowed(method: &str, path: &str) -> bool {
@@ -1390,6 +1430,8 @@ pub enum RelayControlEnvelope {
         route_kind: RelayRouteKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         access_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        browser_id: Option<BrowserSessionId>,
     },
     ClientDisconnected {
         client_id: RelayClientId,
@@ -1405,6 +1447,7 @@ pub enum RelayRouteKind {
     Legacy,
     Metadata,
     Terminal,
+    Browser,
     Http,
 }
 
@@ -1465,6 +1508,7 @@ pub fn decode_relay_data_control(payload: &[u8]) -> Option<RelayControlEnvelope>
                 data_token: Nonce(data_token),
                 route_kind: RelayRouteKind::Legacy,
                 access_token: None,
+                browser_id: None,
             })
         }
         2 => {
@@ -1865,11 +1909,28 @@ mod tests {
             data_token: Nonce("pipe-token".to_owned()),
             route_kind: RelayRouteKind::Terminal,
             access_token: Some("header.claims.signature".to_owned()),
+            browser_id: None,
         };
 
         let value = serde_json::to_value(envelope).unwrap();
         assert_eq!(value["route_kind"], "terminal");
         assert_eq!(value["access_token"], "header.claims.signature");
+    }
+
+    #[test]
+    fn browser_relay_open_data_carries_browser_id() {
+        let browser_id = BrowserSessionId::new();
+        let envelope = RelayControlEnvelope::OpenData {
+            client_id: RelayClientId(8),
+            data_token: Nonce("browser-pipe-token".to_owned()),
+            route_kind: RelayRouteKind::Browser,
+            access_token: Some("header.claims.signature".to_owned()),
+            browser_id: Some(browser_id),
+        };
+
+        let value = serde_json::to_value(envelope).unwrap();
+        assert_eq!(value["route_kind"], "browser");
+        assert_eq!(value["browser_id"], browser_id.to_string());
     }
 
     #[test]
@@ -2201,6 +2262,12 @@ mod tests {
             ("GET", "/api/push/config".to_owned()),
             ("PUT", "/api/push/subscription".to_owned()),
             ("DELETE", "/api/push/subscription".to_owned()),
+            ("GET", "/api/browser/sessions".to_owned()),
+            ("POST", "/api/browser/sessions".to_owned()),
+            (
+                "DELETE",
+                format!("/api/browser/sessions/{}", BrowserSessionId::new()),
+            ),
         ] {
             assert!(
                 is_http_tunnel_path_allowed(method, &path),
@@ -2233,6 +2300,8 @@ mod tests {
             "/v1/file-offers",
             "/api/push/config/extra",
             "/api/push/subscription/extra",
+            "/api/browser/sessions/not-a-uuid",
+            "/api/browser/sessions/00000000-0000-0000-0000-000000000000/extra",
         ] {
             assert!(!is_http_tunnel_path_allowed("POST", path), "{path}");
         }

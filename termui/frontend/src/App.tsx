@@ -6,6 +6,7 @@ import {
   CircleAlert,
   Folder,
   FolderPlus,
+  Globe2,
   MonitorUp,
   Menu,
   PanelLeftClose,
@@ -100,6 +101,7 @@ const SessionFilesPanel = lazy(() => import("./components/SessionFilesPanel").th
 const FileEditorDialog = lazy(() => import("./components/FileEditorDialog").then((module) => ({ default: module.FileEditorDialog })));
 const PairingQrScanner = lazy(() => import("./components/PairingQrScanner").then((module) => ({ default: module.PairingQrScanner })));
 const SettingsDialog = lazy(() => import("./components/SettingsDialog").then((module) => ({ default: module.SettingsDialog })));
+const BrowserWorkspaceDialog = lazy(() => import("./components/BrowserWorkspaceDialog").then((module) => ({ default: module.BrowserWorkspaceDialog })));
 
 function LazyPanelFallback({ className = "panel" }: { className?: string }) {
   // 中文注释：冷路径 chunk 加载通常很短；fallback 只占位，避免闪出无意义文案。
@@ -539,6 +541,7 @@ export default function App() {
   const [mobileTitlePullDistance, setMobileTitlePullDistance] = useState(0);
   const [connectionEditorOpen, setConnectionEditorOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [browserWorkspaceOpen, setBrowserWorkspaceOpen] = useState(false);
   const [qrScannerOpen, setQrScannerOpen] = useState(false);
   const [renamingDaemonId, setRenamingDaemonId] = useState<UUID | undefined>();
   const [daemonRenameDraft, setDaemonRenameDraft] = useState("");
@@ -4649,6 +4652,16 @@ export default function App() {
           {connectionReady && !isMobileLayout ? (
             <div className="toolbar-actions">
               <button
+                type="button"
+                className="icon-button toolbar-browser-button"
+                aria-label={t("app.browser")}
+                title={t("app.browser")}
+                onClick={() => setBrowserWorkspaceOpen(true)}
+              >
+                <Globe2 size={16} aria-hidden="true" />
+                <span className="toolbar-action-label">{t("app.browser")}</span>
+              </button>
+              <button
                 ref={clientsTriggerRef}
                 type="button"
                 className="icon-button toolbar-clients-button"
@@ -4814,6 +4827,17 @@ export default function App() {
             <button type="button" onClick={handleOpenMobileFiles} disabled={!attachedSessionId}>
               <Folder size={16} aria-hidden="true" />
               {t("app.files")}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setMobileMenuOpen(false);
+                setMobilePanel(undefined);
+                setBrowserWorkspaceOpen(true);
+              }}
+            >
+              <Globe2 size={16} aria-hidden="true" />
+              {t("app.browser")}
             </button>
             <button type="button" onClick={handleOpenMobileNewSession} disabled={status === "creating"}>
               <Plus size={16} aria-hidden="true" />
@@ -4999,6 +5023,16 @@ export default function App() {
               effectiveTheme={effectiveTheme}
               onPreferencesChange={handlePreferencesChange}
               onClose={() => setSettingsOpen(false)}
+            />
+          </Suspense>
+        ) : null}
+        {browserWorkspaceOpen && activeServer && state.device ? (
+          <Suspense fallback={<LazyModalFallback className="browser-workspace-dialog" />}>
+            <BrowserWorkspaceDialog
+              open
+              server={activeServer}
+              device={state.device}
+              onClose={() => setBrowserWorkspaceOpen(false)}
             />
           </Suspense>
         ) : null}

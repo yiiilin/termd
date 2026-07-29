@@ -1,14 +1,14 @@
 use axum::body::Body;
-use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_TYPE, HeaderName};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post, put};
+use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use termd_proto::{RelayRouteKind, ServerId, is_http_tunnel_path_allowed};
+use termd_proto::{BrowserSessionId, RelayRouteKind, ServerId, is_http_tunnel_path_allowed};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use uuid::Uuid;
 
@@ -23,6 +23,7 @@ pub fn router(state: RelayState, web_enabled: bool) -> Router {
         .route("/ws", get(relay_ws))
         .route("/ws/metadata", get(relay_metadata_ws))
         .route("/ws/terminal", get(relay_terminal_ws))
+        .route("/ws/browser/:browser_id", get(relay_browser_ws))
         .route("/api/relay/daemon/register", post(register_daemon))
         .route("/api/relay/daemon/status", post(daemon_status))
         .merge(http_api_tunnel_router())
@@ -47,7 +48,15 @@ async fn relay_metadata_ws(
     headers: HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> Response {
-    relay_workspace_ws(state, headers, websocket, RelayRouteKind::Metadata).await
+    relay_workspace_ws(
+        state,
+        headers,
+        websocket,
+        RelayRouteKind::Metadata,
+        None,
+        "termd.v0.7",
+    )
+    .await
 }
 
 async fn relay_terminal_ws(
@@ -55,7 +64,32 @@ async fn relay_terminal_ws(
     headers: HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> Response {
-    relay_workspace_ws(state, headers, websocket, RelayRouteKind::Terminal).await
+    relay_workspace_ws(
+        state,
+        headers,
+        websocket,
+        RelayRouteKind::Terminal,
+        None,
+        "termd.v0.7",
+    )
+    .await
+}
+
+async fn relay_browser_ws(
+    State(state): State<RelayState>,
+    Path(browser_id): Path<BrowserSessionId>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    relay_workspace_ws(
+        state,
+        headers,
+        websocket,
+        RelayRouteKind::Browser,
+        Some(browser_id),
+        "termd.rfb.v1",
+    )
+    .await
 }
 
 async fn relay_workspace_ws(
@@ -63,13 +97,15 @@ async fn relay_workspace_ws(
     headers: HeaderMap,
     websocket: WebSocketUpgrade,
     route_kind: RelayRouteKind,
+    browser_id: Option<BrowserSessionId>,
+    websocket_protocol: &'static str,
 ) -> Response {
     let access_token = headers
         .get("sec-websocket-protocol")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| {
             let mut protocols = value.split(',').map(str::trim);
-            (protocols.next() == Some("termd.v0.7"))
+            (protocols.next() == Some(websocket_protocol))
                 .then(|| protocols.next())
                 .flatten()
         })
@@ -92,9 +128,16 @@ async fn relay_workspace_ws(
     websocket
         .max_frame_size(WEBSOCKET_MAX_FRAME_SIZE)
         .max_message_size(WEBSOCKET_MAX_MESSAGE_SIZE)
-        .protocols(["termd.v0.7"])
+        .protocols([websocket_protocol])
         .on_upgrade(move |socket| {
-            handle_workspace_socket(socket, state, server_id, route_kind, access_token)
+            handle_workspace_socket(
+                socket,
+                state,
+                server_id,
+                route_kind,
+                access_token,
+                browser_id,
+            )
         })
         .into_response()
 }
@@ -153,6 +196,16 @@ fn http_api_tunnel_router() -> Router<RelayState> {
             put(relay_http_tunnel)
                 .delete(relay_http_tunnel)
                 .options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/browser/sessions",
+            get(relay_http_tunnel)
+                .post(relay_http_tunnel)
+                .options(relay_http_tunnel_preflight),
+        )
+        .route(
+            "/api/browser/sessions/:id",
+            delete(relay_http_tunnel).options(relay_http_tunnel_preflight),
         )
         .route_layer(http_api_tunnel_cors_layer());
 
@@ -423,6 +476,7 @@ fn relay_http_admission_requirement(path: &str) -> Option<RelayHttpAdmissionRequ
             Some(RelayHttpAdmissionRequirement::DownloadGrant)
         }
         path if path.starts_with("/api/control/")
+            || path.starts_with("/api/browser/")
             || path.starts_with("/api/files/")
             || path.starts_with("/api/push/") =>
         {
@@ -769,7 +823,11 @@ mod tests {
     #[tokio::test]
     async fn v070_workspace_websocket_routes_are_mounted() {
         let app = router(RelayState::default(), false);
-        for path in ["/ws/metadata", "/ws/terminal"] {
+        for path in [
+            "/ws/metadata",
+            "/ws/terminal",
+            "/ws/browser/00000000-0000-0000-0000-000000000001",
+        ] {
             let response = app
                 .clone()
                 .oneshot(
@@ -1308,6 +1366,50 @@ mod tests {
                 let mut request = Request::builder()
                     .method(method.clone())
                     .uri(path)
+                    .header("x-termd-server-id", server_id.0.to_string());
+                if let Some(authorization) = authorization {
+                    request = request.header("authorization", authorization);
+                }
+                let response = router(fixture.state.clone(), false)
+                    .oneshot(
+                        request
+                            .body(Body::empty())
+                            .expect("test request should build"),
+                    )
+                    .await
+                    .expect("router should respond");
+                assert_eq!(response.status(), expected_status, "{method} {path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_relay_browser_routes_require_access_token_credentials() {
+        let fixture = relay_http_credential_fixture();
+        let server_id = fixture.identity.server_id();
+        let browser_id = BrowserSessionId::new();
+        let valid_authorization = format!("Bearer {}", fixture.access_token);
+        let wrong_authorization = format!("Bearer {}", fixture.device_certificate);
+
+        for (method, path) in [
+            (Method::GET, "/api/browser/sessions".to_owned()),
+            (Method::POST, "/api/browser/sessions".to_owned()),
+            (
+                Method::DELETE,
+                format!("/api/browser/sessions/{browser_id}"),
+            ),
+        ] {
+            for (authorization, expected_status) in [
+                (
+                    Some(valid_authorization.as_str()),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ),
+                (Some(wrong_authorization.as_str()), StatusCode::UNAUTHORIZED),
+                (None, StatusCode::UNAUTHORIZED),
+            ] {
+                let mut request = Request::builder()
+                    .method(method.clone())
+                    .uri(&path)
                     .header("x-termd-server-id", server_id.0.to_string());
                 if let Some(authorization) = authorization {
                     request = request.header("authorization", authorization);

@@ -13,8 +13,8 @@ use axum::http::{HeaderMap, HeaderName};
 use futures_util::{Sink, SinkExt, StreamExt};
 use rustls::{ClientConfig, RootCertStore};
 use termd_proto::{
-    Envelope as ProtoEnvelope, MessageType as ProtoMessageType, Nonce as ProtoNonce,
-    PROTOCOL_PACKET_VERSION, ProtocolVersion as ProtoProtocolVersion,
+    BrowserSessionId, Envelope as ProtoEnvelope, MessageType as ProtoMessageType,
+    Nonce as ProtoNonce, PROTOCOL_PACKET_VERSION, ProtocolVersion as ProtoProtocolVersion,
     RelayAdmissionPayload as ProtoRelayAdmissionPayload, RelayClientId, RelayControlEnvelope,
     RelayHttpTunnelFrame, RelayRouteKind, RouteHelloPayload as ProtoRouteHelloPayload,
     RouteReadyPayload as ProtoRouteReadyPayload, RouteRole as ProtoRouteRole, ServerId, SessionId,
@@ -793,6 +793,7 @@ async fn handle_relay_control_envelope(
             data_token,
             route_kind,
             access_token,
+            browser_id,
         } => {
             prune_finished_relay_data_tasks(data_tasks);
             if abort_relay_data_task(data_tasks, client_id) {
@@ -817,6 +818,7 @@ async fn handle_relay_control_envelope(
                     data_token,
                     route_kind,
                     access_token,
+                    browser_id,
                 )
                 .await
                 {
@@ -883,6 +885,7 @@ async fn run_relay_data_connection(
     data_token: ProtoNonce,
     route_kind: RelayRouteKind,
     access_token: Option<String>,
+    browser_id: Option<BrowserSessionId>,
 ) -> Result<(), RelayConnectorError> {
     let relay_endpoint = base.canonical_url();
     let url = base.daemon_mux_url(server_id);
@@ -899,6 +902,9 @@ async fn run_relay_data_connection(
     .await?;
     let outcome = match route_kind {
         RelayRouteKind::Metadata | RelayRouteKind::Terminal => {
+            if browser_id.is_some() {
+                return Err(RelayConnectorError::InvalidEnvelope);
+            }
             run_relay_v070_data_connection(
                 relay_endpoint,
                 protocol,
@@ -911,6 +917,9 @@ async fn run_relay_data_connection(
             .await?
         }
         RelayRouteKind::Http => {
+            if browser_id.is_some() || access_token.is_some() {
+                return Err(RelayConnectorError::InvalidEnvelope);
+            }
             run_relay_http_data_connection(
                 relay_endpoint,
                 protocol,
@@ -920,10 +929,94 @@ async fn run_relay_data_connection(
             )
             .await?
         }
+        RelayRouteKind::Browser => {
+            let browser_id = browser_id.ok_or(RelayConnectorError::InvalidEnvelope)?;
+            run_relay_browser_data_connection(
+                relay_endpoint,
+                protocol,
+                client_id,
+                sender,
+                &mut receiver,
+                browser_id,
+                access_token,
+            )
+            .await?
+        }
         RelayRouteKind::Legacy => return Err(RelayConnectorError::InvalidEnvelope),
     };
     let _ = outcome;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_relay_browser_data_connection(
+    relay_endpoint: String,
+    protocol: SharedDaemonProtocol,
+    client_id: RelayClientId,
+    mut sender: RelaySender,
+    receiver: &mut RelayReceiver,
+    browser_id: BrowserSessionId,
+    access_token: Option<String>,
+) -> Result<RelayEstablishedDataOutcome, RelayConnectorError> {
+    let token = access_token.ok_or(RelayConnectorError::InvalidEnvelope)?;
+    protocol
+        .lock()
+        .await
+        .verify_access_token_credential(&token, current_unix_timestamp_millis())
+        .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
+    let rfb = protocol
+        .browser()
+        .connect_rfb(browser_id)
+        .await
+        .map_err(|_| RelayConnectorError::InvalidEnvelope)?;
+    let (mut rfb_read, mut rfb_write) = rfb.into_split();
+    let mut buffer = vec![0_u8; 64 * 1024];
+
+    loop {
+        tokio::select! {
+            incoming = receiver.next() => match incoming {
+                Some(Ok(Message::Binary(bytes))) => {
+                    rfb_write
+                        .write_all(&bytes)
+                        .await
+                        .map_err(|_| RelayConnectorError::SendFailed)?;
+                }
+                Some(Ok(Message::Ping(bytes))) => {
+                    send_relay_message(
+                        &mut sender,
+                        Message::Pong(bytes),
+                        Some(RELAY_PONG_DEADLINE),
+                    )
+                    .await?;
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(Message::Text(_))) => {
+                    return Err(RelayConnectorError::InvalidEnvelope);
+                }
+                Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+            },
+            read = rfb_read.read(&mut buffer) => match read {
+                Ok(0) => break,
+                Ok(read) => {
+                    send_relay_message(
+                        &mut sender,
+                        Message::Binary(buffer[..read].to_vec()),
+                        relay_send_deadline(RelayOutKind::PushOutput),
+                    )
+                    .await?;
+                }
+                Err(_) => return Err(RelayConnectorError::ReceiveFailed),
+            },
+        }
+    }
+
+    debug!(
+        relay = %relay_endpoint,
+        client_id = client_id.0,
+        browser_id = %browser_id,
+        "relay browser RFB data pipe closed"
+    );
+    Ok(RelayEstablishedDataOutcome::SocketClosed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1109,7 +1202,7 @@ async fn run_relay_v070_data_connection(
             .await?;
             outcome == RelayV070TerminalOutcome::ErrorSent
         }
-        RelayRouteKind::Legacy | RelayRouteKind::Http => {
+        RelayRouteKind::Legacy | RelayRouteKind::Browser | RelayRouteKind::Http => {
             return Err(RelayConnectorError::InvalidEnvelope);
         }
     };

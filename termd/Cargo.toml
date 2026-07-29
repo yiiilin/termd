@@ -12,6 +12,7 @@ base64 = "0.22"
 chacha20poly1305 = "0.10"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+flate2 = "1"
 hkdf = "0.12"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
@@ -25,12 +26,13 @@ rustls = "0.23"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+tar = "0.4"
 termd-proto = { path = "../proto" }
 terminstall = { path = "../terminstall" }
 termweb = { path = "../termweb" }
 tempfile = "3"
 thiserror.workspace = true
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tower = "0.5"
@@ -39,6 +41,7 @@ tower-service = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 unicode-width = "0.2"
+url = "2"
 uuid.workspace = true
 webpki-roots = "1"
 web-push-native = "0.4.0"

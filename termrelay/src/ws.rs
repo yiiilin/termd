@@ -18,8 +18,8 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use termd_proto::{
-    MessageType, Nonce, PublicKey, RelayAdmissionPayload, RelayClientId, RelayControlEnvelope,
-    RelayRouteKind, RouteRole, ServerId, UnixTimestampMillis,
+    BrowserSessionId, MessageType, Nonce, PublicKey, RelayAdmissionPayload, RelayClientId,
+    RelayControlEnvelope, RelayRouteKind, RouteRole, ServerId, UnixTimestampMillis,
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -858,9 +858,10 @@ impl RelayState {
         sender: FrameSender,
         route_kind: RelayRouteKind,
         access_token: String,
+        browser_id: Option<BrowserSessionId>,
     ) -> Result<ConnectionRegistration, RelayError> {
         self.inner
-            .register_workspace(server_id, sender, route_kind, access_token)
+            .register_workspace(server_id, sender, route_kind, access_token, browser_id)
     }
 
     #[cfg(test)]
@@ -1248,10 +1249,17 @@ pub async fn handle_workspace_socket(
     server_id: ServerId,
     route_kind: RelayRouteKind,
     access_token: String,
+    browser_id: Option<BrowserSessionId>,
 ) {
     let pipe_pump = PipePump::new(DATA_CHANNEL_CAPACITY);
     let tx = pipe_pump.sender();
-    let registration = match state.register_workspace(server_id, tx, route_kind, access_token) {
+    let registration = match state.register_workspace(
+        server_id,
+        tx,
+        route_kind,
+        access_token,
+        browser_id,
+    ) {
         Ok(registration) => registration,
         Err(error) => {
             warn!(server_id = %server_id.0, ?route_kind, %error, "relay workspace route registration failed");
@@ -1914,6 +1922,32 @@ mod tests {
             .0
     }
 
+    async fn connect_browser_client(
+        base_url: &str,
+        access_token: &str,
+        browser_id: BrowserSessionId,
+    ) -> TestSocket {
+        let mut request = format!("{base_url}/ws/browser/{browser_id}")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_str(&format!("termd.rfb.v1, {access_token}")).unwrap(),
+        );
+        let (socket, response) = timeout(Duration::from_secs(2), connect_async(request))
+            .await
+            .expect("browser websocket should connect")
+            .expect("browser websocket handshake should succeed");
+        assert_eq!(
+            response
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|value| value.to_str().ok()),
+            Some("termd.rfb.v1")
+        );
+        socket
+    }
+
     async fn register_workspace_daemon_control(
         socket: &mut TestSocket,
         fixture: &WorkspaceFixture,
@@ -2100,6 +2134,7 @@ mod tests {
             data_token,
             route_kind,
             access_token,
+            ..
         } = decode_control(control_rx.try_recv().unwrap())
         else {
             panic!("expected open_data after client registration");
@@ -2176,6 +2211,86 @@ mod tests {
         daemon_control.close(None).await.unwrap();
         daemon_data.close(None).await.unwrap();
         client.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn browser_route_forwards_rfb_bytes_opaquely_with_browser_id() {
+        let fixture = workspace_fixture();
+        let browser_id = BrowserSessionId::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let relay_state = fixture.state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(relay_state, false))
+                .await
+                .unwrap();
+        });
+        let base_url = format!("ws://{addr}");
+        let (mut daemon_control, _) = connect_async(format!("{base_url}/ws")).await.unwrap();
+        register_workspace_daemon_control(&mut daemon_control, &fixture, None).await;
+
+        let mut client = connect_browser_client(&base_url, &fixture.access_token, browser_id).await;
+        let open = timeout(Duration::from_secs(2), daemon_control.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let ClientMessage::Text(open) = open else {
+            panic!("expected browser open_data control frame");
+        };
+        let RelayControlEnvelope::OpenData {
+            client_id,
+            data_token,
+            route_kind,
+            access_token,
+            browser_id: routed_browser_id,
+        } = serde_json::from_str(&open).unwrap()
+        else {
+            panic!("expected browser open_data envelope");
+        };
+        assert_eq!(route_kind, RelayRouteKind::Browser);
+        assert_eq!(access_token.as_deref(), Some(fixture.access_token.as_str()));
+        assert_eq!(routed_browser_id, Some(browser_id));
+
+        let client_bytes = vec![0, 0xff, 1, 2, 0, 3];
+        client
+            .send(ClientMessage::Binary(client_bytes.clone()))
+            .await
+            .unwrap();
+
+        let (mut daemon_data, _) = connect_async(format!("{base_url}/ws")).await.unwrap();
+        send_route_hello_with_generation_and_admission(
+            &mut daemon_data,
+            fixture.server_id,
+            RouteRole::DaemonData,
+            None,
+            Some(client_id),
+            Some(data_token),
+            Some(RelayAdmissionPayload::Daemon {
+                token: TEST_DAEMON_TOKEN.to_owned(),
+            }),
+        )
+        .await;
+        expect_route_ready(&mut daemon_data, fixture.server_id, RouteRole::DaemonData).await;
+        assert_eq!(
+            next_data_frame(&mut daemon_data).await.unwrap(),
+            ClientMessage::Binary(client_bytes)
+        );
+
+        let daemon_bytes = vec![0xff, 7, 0, 8, 9, 0];
+        daemon_data
+            .send(ClientMessage::Binary(daemon_bytes.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_data_frame(&mut client).await.unwrap(),
+            ClientMessage::Binary(daemon_bytes)
+        );
+
+        let _ = client.close(None).await;
+        let _ = daemon_data.close(None).await;
+        let _ = daemon_control.close(None).await;
         server.abort();
     }
 
@@ -2540,6 +2655,7 @@ mod tests {
                 client_tx,
                 RelayRouteKind::Terminal,
                 "header.claims.signature".to_owned(),
+                None,
             )
             .unwrap();
 
@@ -2556,6 +2672,43 @@ mod tests {
         };
         assert_eq!(route_kind, RelayRouteKind::Terminal);
         assert_eq!(access_token.as_deref(), Some("header.claims.signature"));
+    }
+
+    #[test]
+    fn browser_workspace_registration_propagates_browser_id_opaquely() {
+        let state = RelayState::default();
+        let server_id = server_id(7071);
+        let browser_id = BrowserSessionId::new();
+        let (control_tx, mut control_rx) = channel();
+        state
+            .register(server_id, ConnectionRole::DaemonControl, control_tx)
+            .unwrap();
+        let (client_tx, _client_rx) = channel();
+        state
+            .register_workspace(
+                server_id,
+                client_tx,
+                RelayRouteKind::Browser,
+                "header.claims.signature".to_owned(),
+                Some(browser_id),
+            )
+            .unwrap();
+
+        let RelayOutbound::Frame(frame) = control_rx.try_recv().unwrap() else {
+            panic!("daemon control should receive open_data");
+        };
+        let RelayControlEnvelope::OpenData {
+            route_kind,
+            access_token,
+            browser_id: routed_browser_id,
+            ..
+        } = relay_control_from_frame(&frame).unwrap()
+        else {
+            panic!("expected open_data");
+        };
+        assert_eq!(route_kind, RelayRouteKind::Browser);
+        assert_eq!(access_token.as_deref(), Some("header.claims.signature"));
+        assert_eq!(routed_browser_id, Some(browser_id));
     }
 
     #[test]
@@ -3601,6 +3754,7 @@ mod tests {
             data_token,
             route_kind,
             access_token,
+            ..
         } = relay_control_from_frame(&open_frame).unwrap()
         else {
             panic!("expected open_data");

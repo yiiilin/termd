@@ -196,9 +196,65 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  browser-runtime:
+    name: build ${{ matrix.asset_arch }} browser runtime
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:20.04
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            asset_arch: amd64
+          - runner: ubuntu-24.04-arm
+            asset_arch: arm64
+    steps:
+      - name: Install checkout prerequisites
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install browser runtime build dependencies
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            autoconf automake binutils bison build-essential cmake curl flex gettext jq libtool \
+            libaudit-dev libbsd-dev libdbus-1-dev libdrm-dev libegl1-mesa-dev \
+            libepoxy-dev libfontenc-dev libgbm-dev libgcrypt20-dev libgl1-mesa-dev \
+            libglib2.0-dev libjpeg-turbo8-dev libpam0g-dev libpango1.0-dev libpciaccess-dev \
+            libpixman-1-dev libpng-dev libselinux1-dev libudev-dev libx11-dev \
+            libxau-dev libxaw7-dev libxcursor-dev libxdamage-dev libxdmcp-dev \
+            libxext-dev libxfixes-dev libxfont-dev libxft-dev libxi-dev \
+            libxinerama-dev libxkbfile-dev libxmu-dev libxpm-dev libxrandr-dev \
+            libxrender-dev libxres-dev libxshmfence-dev libxt-dev libxtst-dev \
+            libxv-dev libxml2-dev mesa-common-dev patch pkg-config x11proto-dev \
+            x11-xkb-utils xfonts-utils xkb-data xorg-server-source xserver-xorg-dev \
+            xtrans-dev xutils-dev zlib1g-dev
+
+      - name: Build self-contained browser runtime
+        run: |
+          set -euo pipefail
+          scripts/build-browser-runtime.sh dist/release "${GITHUB_REF_NAME}" "${{ matrix.asset_arch }}"
+
+      - name: Upload browser runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-runtime-${{ matrix.asset_arch }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     name: publish release binaries
-    needs: [validate, package]
+    needs: [validate, package, browser-runtime]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -211,12 +267,23 @@ jobs:
           path: dist/release
           merge-multiple: true
 
+      - name: Download browser runtimes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: browser-runtime-*
+          path: dist/release
+          merge-multiple: true
+
       - name: Validate exact release asset set
         run: |
           set -euo pipefail
           expected=(
             termctl-linux-amd64
             termctl-linux-arm64
+            termd-browser-runtime-linux-amd64.json
+            termd-browser-runtime-linux-amd64.tar.gz
+            termd-browser-runtime-linux-arm64.json
+            termd-browser-runtime-linux-arm64.tar.gz
             termd-linux-amd64
             termd-linux-arm64
             termrelay-linux-amd64
@@ -224,7 +291,7 @@ jobs:
           )
           mapfile -t actual < <(find dist/release -maxdepth 1 -type f -printf '%f\n' | sort)
           diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${actual[@]}")
-          if find dist/release -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.sh' -o -name 'checksums.txt' \) | grep -q .; then
+          if find dist/release -maxdepth 1 -type f \( -name '*.sh' -o -name 'checksums.txt' \) | grep -q .; then
             printf 'forbidden release asset generated\n' >&2
             exit 1
           fi
@@ -256,6 +323,10 @@ jobs:
             termd-linux-arm64
             termrelay-linux-amd64
             termrelay-linux-arm64
+            termd-browser-runtime-linux-amd64.json
+            termd-browser-runtime-linux-amd64.tar.gz
+            termd-browser-runtime-linux-arm64.json
+            termd-browser-runtime-linux-arm64.tar.gz
           )
           if gh release view "$tag" >/dev/null 2>&1; then
             mapfile -t remote_assets < <(gh release view "$tag" --json assets --jq '.assets[].name')

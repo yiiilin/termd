@@ -1454,6 +1454,10 @@ where
         self.file_offer_events.subscribe()
     }
 
+    pub fn file_offer_delivery_available(&self) -> bool {
+        self.file_offer_events.receiver_count() > 0 || self.push_notifications.has_subscriptions()
+    }
+
     pub fn create_file_offer(
         &mut self,
         path: impl AsRef<Path>,
@@ -1476,6 +1480,24 @@ where
         let offer = self.file_offers.register(inspected, now_ms);
         let _ = self.file_offer_events.send(offer.clone());
         self.push_notifications.observe_file_offer(offer.offer_id);
+        Ok(offer)
+    }
+
+    pub(crate) fn register_file_offer_for_delivery(
+        &mut self,
+        inspected: InspectedFileOffer,
+        now_ms: UnixTimestampMillis,
+    ) -> Result<FileOfferPayload, FileOfferError> {
+        let staged = FileOfferStore::stage(inspected, now_ms);
+        let offer = staged.payload().clone();
+        let metadata_delivered = self.file_offer_events.receiver_count() > 0
+            && self.file_offer_events.len() < FILE_OFFER_EVENT_QUEUE_CAPACITY
+            && self.file_offer_events.send(offer.clone()).is_ok();
+        let push_delivered = self.push_notifications.observe_file_offer(offer.offer_id);
+        if !metadata_delivered && !push_delivered {
+            return Err(FileOfferError::DeliveryBusy);
+        }
+        self.file_offers.commit(staged);
         Ok(offer)
     }
 

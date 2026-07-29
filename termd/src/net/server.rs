@@ -9,13 +9,14 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, SeekFrom};
 use std::net::{AddrParseError, IpAddr, SocketAddr};
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::rejection::JsonRejection;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{ConnectInfo, OriginalUri, Path, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderName,
@@ -42,11 +43,15 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tower::ServiceExt as _;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::warn;
 
 use crate::auth::current_unix_timestamp_millis;
+use crate::browser::{
+    BrowserCreateRequest, BrowserError, BrowserSession, BrowserSessionId, BrowserWorkspace,
+};
 use crate::config::DaemonConfig;
 #[cfg(test)]
 use crate::file_offer::FILE_OFFER_LIMIT;
@@ -74,6 +79,7 @@ const PUSH_P256DH_MAX_BYTES: usize = 128;
 const PUSH_AUTH_MAX_BYTES: usize = 64;
 const V070_FILE_CHUNK_MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_METADATA_TIMESTAMP_MS: u64 = 9_007_199_254_740_991;
+const BROWSER_DOWNLOAD_SCAN_INTERVAL: Duration = Duration::from_millis(500);
 
 pub type DefaultDaemonProtocol = DaemonProtocol<SupervisorPtyBackend, Ed25519SignatureVerifier>;
 /// daemon 的协议核心仍是单线程语义，但等待这把锁必须让出 Tokio worker。
@@ -81,7 +87,33 @@ pub type DefaultDaemonProtocol = DaemonProtocol<SupervisorPtyBackend, Ed25519Sig
 /// 直连 WebSocket 和 relay mux 共用同一个协议状态；如果使用 `std::sync::Mutex`，
 /// 快速切换大输出 session 时多个任务会在 worker 线程上阻塞等待锁，连心跳、输入和
 /// relay 主干读写都会一起迟滞。`tokio::sync::Mutex` 保持串行临界区，同时让等待者挂起。
-pub type SharedDaemonProtocol = Arc<Mutex<DefaultDaemonProtocol>>;
+pub struct DaemonSharedState {
+    protocol: Mutex<DefaultDaemonProtocol>,
+    browser: BrowserWorkspace,
+}
+
+impl DaemonSharedState {
+    fn new(protocol: DefaultDaemonProtocol, state_path: &std::path::Path) -> Self {
+        Self {
+            protocol: Mutex::new(protocol),
+            browser: BrowserWorkspace::for_state_path(state_path),
+        }
+    }
+
+    pub fn browser(&self) -> &BrowserWorkspace {
+        &self.browser
+    }
+}
+
+impl Deref for DaemonSharedState {
+    type Target = Mutex<DefaultDaemonProtocol>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.protocol
+    }
+}
+
+pub type SharedDaemonProtocol = Arc<DaemonSharedState>;
 
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -197,7 +229,10 @@ pub fn try_default_protocol(config: DaemonConfig) -> Result<SharedDaemonProtocol
     if let Err(error) = protocol.prune_closed_sessions_except(&protected_session_ids) {
         warn!(%error, "failed to prune closed session records during startup");
     }
-    Ok(Arc::new(Mutex::new(protocol)))
+    Ok(Arc::new(DaemonSharedState::new(
+        protocol,
+        &config.state_path,
+    )))
 }
 
 /// 测试与旧调用点使用的便捷构造器；生产启动路径使用 `try_default_protocol` 返回结构化错误。
@@ -213,8 +248,10 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
         .merge(http_control_api_router())
         .merge(http_file_api_router())
         .merge(push_api_router())
+        .merge(browser_api_router())
         .route("/ws/metadata", get(metadata_ws_handler))
         .route("/ws/terminal", get(terminal_ws_handler))
+        .route("/ws/browser/:browser_id", get(browser_ws_handler))
         .method_not_allowed_fallback(api_method_not_allowed)
         .with_state(protocol);
 
@@ -334,6 +371,103 @@ fn push_api_router() -> Router<SharedDaemonProtocol> {
                 .merge(options(v070_preflight)),
         )
         .route_layer(push_api_cors_layer())
+}
+
+fn browser_api_router() -> Router<SharedDaemonProtocol> {
+    Router::new()
+        .route(
+            "/api/browser/sessions",
+            get(browser_sessions_list)
+                .merge(post(browser_session_create))
+                .merge(options(v070_preflight)),
+        )
+        .route(
+            "/api/browser/sessions/:browser_id",
+            delete(browser_session_close).merge(options(v070_preflight)),
+        )
+        .route_layer(browser_api_cors_layer())
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserSessionsResponse {
+    sessions: Vec<BrowserSession>,
+}
+
+async fn browser_sessions_list(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_v070_http_device(&protocol, &headers).await {
+        return response;
+    }
+    match protocol.browser().list().await {
+        Ok(sessions) => {
+            (StatusCode::OK, Json(BrowserSessionsResponse { sessions })).into_response()
+        }
+        Err(error) => browser_operation_error(error),
+    }
+}
+
+async fn browser_session_create(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+    request: Result<Json<BrowserCreateRequest>, JsonRejection>,
+) -> Response {
+    if let Err(response) = authorize_v070_http_device(&protocol, &headers).await {
+        return response;
+    }
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return invalid_json_error(),
+    };
+    match protocol.browser().create(request).await {
+        Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
+        Err(error) => browser_operation_error(error),
+    }
+}
+
+async fn browser_session_close(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(browser_id): Path<BrowserSessionId>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_v070_http_device(&protocol, &headers).await {
+        return response;
+    }
+    match protocol.browser().close(browser_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => browser_operation_error(error),
+    }
+}
+
+fn browser_operation_error(error: BrowserError) -> Response {
+    let status = match error {
+        BrowserError::InvalidUrl | BrowserError::InvalidViewport => StatusCode::BAD_REQUEST,
+        BrowserError::CapacityExceeded => StatusCode::TOO_MANY_REQUESTS,
+        BrowserError::SessionNotFound => StatusCode::NOT_FOUND,
+        BrowserError::SessionNotRunning => StatusCode::CONFLICT,
+        BrowserError::StorageUnavailable
+        | BrowserError::StateInvalid
+        | BrowserError::StateWriteFailed => StatusCode::INTERNAL_SERVER_ERROR,
+        BrowserError::RuntimeUnavailable
+        | BrowserError::UnsupportedArchitecture
+        | BrowserError::RuntimeDownloadFailed
+        | BrowserError::RuntimeManifestInvalid
+        | BrowserError::RuntimeArchiveInvalid
+        | BrowserError::RuntimeInstallFailed
+        | BrowserError::ChromiumUnavailable
+        | BrowserError::SupervisorArgumentsInvalid
+        | BrowserError::SupervisorStartFailed
+        | BrowserError::SupervisorStartTimeout
+        | BrowserError::SupervisorStopFailed
+        | BrowserError::RfbUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    api_error(
+        status,
+        error.code(),
+        error.safe_message(),
+        error.retryable(),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -597,14 +731,14 @@ fn invalid_json_error() -> Response {
     )
 }
 
-fn websocket_access_token(headers: &HeaderMap) -> Option<&str> {
+fn websocket_access_token<'a>(headers: &'a HeaderMap, protocol: &str) -> Option<&'a str> {
     let mut protocols = headers
         .get("sec-websocket-protocol")?
         .to_str()
         .ok()?
         .split(',')
         .map(str::trim);
-    if protocols.next()? != "termd.v0.7" {
+    if protocols.next()? != protocol {
         return None;
     }
     protocols
@@ -615,8 +749,9 @@ fn websocket_access_token(headers: &HeaderMap) -> Option<&str> {
 async fn authorize_workspace_websocket(
     protocol: &SharedDaemonProtocol,
     headers: &HeaderMap,
+    websocket_protocol: &str,
 ) -> Result<DeviceId, Response> {
-    let token = websocket_access_token(headers).ok_or_else(|| {
+    let token = websocket_access_token(headers, websocket_protocol).ok_or_else(|| {
         api_error(
             StatusCode::UNAUTHORIZED,
             "access_token_required",
@@ -643,7 +778,7 @@ async fn metadata_ws_handler(
     headers: HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> Response {
-    let device_id = match authorize_workspace_websocket(&protocol, &headers).await {
+    let device_id = match authorize_workspace_websocket(&protocol, &headers, "termd.v0.7").await {
         Ok(device_id) => device_id,
         Err(response) => return response,
     };
@@ -735,7 +870,7 @@ async fn terminal_ws_handler(
     headers: HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> Response {
-    let device_id = match authorize_workspace_websocket(&protocol, &headers).await {
+    let device_id = match authorize_workspace_websocket(&protocol, &headers, "termd.v0.7").await {
         Ok(device_id) => device_id,
         Err(response) => return response,
     };
@@ -743,6 +878,66 @@ async fn terminal_ws_handler(
         .protocols(["termd.v0.7"])
         .on_upgrade(move |socket| run_terminal_websocket(socket, protocol, device_id))
         .into_response()
+}
+
+async fn browser_ws_handler(
+    State(protocol): State<SharedDaemonProtocol>,
+    Path(browser_id): Path<BrowserSessionId>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    if let Err(response) = authorize_workspace_websocket(&protocol, &headers, "termd.rfb.v1").await
+    {
+        return response;
+    }
+    let rfb = match protocol.browser().connect_rfb(browser_id).await {
+        Ok(rfb) => rfb,
+        Err(error) => return browser_operation_error(error),
+    };
+    websocket
+        .protocols(["termd.rfb.v1"])
+        .on_upgrade(move |socket| run_browser_websocket(socket, rfb))
+        .into_response()
+}
+
+async fn run_browser_websocket(mut socket: WebSocket, mut rfb: tokio::net::UnixStream) {
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Binary(bytes))) => {
+                    if rfb.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Ping(bytes))) => {
+                    if socket.send(Message::Pong(bytes)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {
+                    let _ = socket.send(Message::Close(Some(CloseFrame {
+                        code: close_code::UNSUPPORTED,
+                        reason: "binary RFB frames are required".into(),
+                    }))).await;
+                    break;
+                }
+            },
+            read = rfb.read(&mut buffer) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if socket
+                        .send(Message::Binary(buffer[..read].to_vec()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            },
+        }
+    }
 }
 
 async fn run_terminal_websocket(
@@ -1974,6 +2169,17 @@ fn push_api_cors_layer() -> CorsLayer {
         ])
 }
 
+fn browser_api_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([
+            CONTENT_TYPE,
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("x-termd-server-id"),
+        ])
+}
+
 pub async fn serve(
     config: DaemonConfig,
     protocol: SharedDaemonProtocol,
@@ -2013,6 +2219,7 @@ pub async fn serve_listener(
     web_enabled: bool,
 ) -> Result<(), ServerError> {
     let _push_tasks = start_push_notification_tasks(protocol.clone()).await;
+    let _browser_download_task = start_browser_download_monitor(protocol.clone());
     axum::serve(
         listener,
         router(protocol, web_enabled).into_make_service_with_connect_info::<SocketAddr>(),
@@ -2029,6 +2236,7 @@ pub async fn serve_tls_listener(
 ) -> Result<(), ServerError> {
     let tls_config = load_rustls_server_config(&tls_paths)?;
     let _push_tasks = start_push_notification_tasks(protocol.clone()).await;
+    let _browser_download_task = start_browser_download_monitor(protocol.clone());
 
     // TLS 只替换 transport accept 层；router 和协议状态机保持同一套认证与 session 规则。
     serve_rustls_listener(listener, router(protocol, web_enabled), tls_config).await
@@ -2037,6 +2245,65 @@ pub async fn serve_tls_listener(
 struct PushNotificationTasks {
     observer: Option<JoinHandle<()>>,
     delivery: Option<JoinHandle<()>>,
+}
+
+struct BrowserDownloadMonitorTask(JoinHandle<()>);
+
+impl Drop for BrowserDownloadMonitorTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn start_browser_download_monitor(protocol: SharedDaemonProtocol) -> BrowserDownloadMonitorTask {
+    BrowserDownloadMonitorTask(tokio::spawn(async move {
+        loop {
+            sleep(BROWSER_DOWNLOAD_SCAN_INTERVAL).await;
+            if let Err(error) = offer_completed_browser_downloads(&protocol).await {
+                tracing::debug!(code = error.code(), "browser download scan failed");
+            }
+        }
+    }))
+}
+
+async fn offer_completed_browser_downloads(
+    protocol: &SharedDaemonProtocol,
+) -> Result<usize, BrowserError> {
+    let candidates = protocol.browser().completed_downloads().await?;
+    let mut offered = 0;
+    for candidate in candidates {
+        if !protocol.lock().await.file_offer_delivery_available() {
+            break;
+        }
+        let inspected = match protocol.browser().inspect_download(&candidate).await {
+            Ok(inspected) => inspected,
+            Err(error) => {
+                tracing::debug!(
+                    code = error.code(),
+                    "completed browser download was rejected"
+                );
+                continue;
+            }
+        };
+        match protocol
+            .lock()
+            .await
+            .register_file_offer_for_delivery(inspected, current_unix_timestamp_millis())
+        {
+            Ok(_) => {
+                protocol.browser().mark_download_handled(candidate).await;
+                offered += 1;
+            }
+            Err(FileOfferError::DeliveryBusy) => break,
+            Err(error) => {
+                tracing::debug!(
+                    code = error.code(),
+                    "completed browser download could not be offered"
+                );
+            }
+        }
+    }
+    Ok(offered)
 }
 
 impl Drop for PushNotificationTasks {
@@ -3007,6 +3274,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(local_only.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn completed_browser_download_is_stably_scanned_and_broadcast_once() {
+        let fixture = test_protocol("browser-download-offer");
+        let browser_id = BrowserSessionId::new();
+        let download_dir = fixture
+            ._state_dir
+            .state_dir
+            .join("browser-workspaces/downloads")
+            .join(browser_id.to_string());
+        fs::create_dir(&download_dir).unwrap();
+        let file_path = download_dir.join("report.zip");
+        fs::write(&file_path, b"browser bytes").unwrap();
+
+        assert_eq!(
+            offer_completed_browser_downloads(&fixture.protocol).await,
+            Ok(0)
+        );
+        assert_eq!(
+            offer_completed_browser_downloads(&fixture.protocol).await,
+            Ok(0),
+            "a completed download must wait until a client can receive the one-shot offer"
+        );
+        let mut events = fixture.protocol.lock().await.file_offer_events();
+        assert_eq!(
+            offer_completed_browser_downloads(&fixture.protocol).await,
+            Ok(1)
+        );
+        let offer = events.recv().await.unwrap();
+        assert_eq!(offer.name, "report.zip");
+        assert_eq!(offer.path, file_path.to_string_lossy());
+        assert_eq!(offer.size_bytes, 13);
+        assert_eq!(
+            offer_completed_browser_downloads(&fixture.protocol).await,
+            Ok(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_file_offer_requires_a_live_sink_when_it_is_registered() {
+        let fixture = test_protocol("browser-download-live-sink");
+        let file_path = fixture._state_dir.state_dir.join("report.zip");
+        fs::write(&file_path, b"browser bytes").unwrap();
+        let inspected = inspect_file_offer(&file_path).unwrap();
+        let dropped_events = fixture.protocol.lock().await.file_offer_events();
+        drop(dropped_events);
+
+        let error = fixture
+            .protocol
+            .lock()
+            .await
+            .register_file_offer_for_delivery(inspected.clone(), current_unix_timestamp_millis())
+            .unwrap_err();
+        assert_eq!(error, FileOfferError::DeliveryBusy);
+
+        let mut events = fixture.protocol.lock().await.file_offer_events();
+        let offer = fixture
+            .protocol
+            .lock()
+            .await
+            .register_file_offer_for_delivery(inspected, current_unix_timestamp_millis())
+            .unwrap();
+        assert_eq!(events.recv().await.unwrap(), offer);
     }
 
     #[tokio::test]
@@ -4036,6 +4367,138 @@ mod tests {
             .exchange_access_token(&certificate, payload, now_ms)
             .unwrap();
         (device_id, token)
+    }
+
+    #[tokio::test]
+    async fn browser_session_http_routes_require_bearer_and_preserve_error_contract() {
+        let fixture = test_protocol("browser-http-routes");
+        let (_, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        let app = router(fixture.protocol.clone(), false);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/browser/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/browser/sessions")
+                    .header("authorization", format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let list: serde_json::Value =
+            serde_json::from_slice(&to_bytes(list.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(list["sessions"], serde_json::json!([]));
+
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/browser/sessions")
+                    .header("authorization", format!("Bearer {access_token}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"url": "file:///etc/passwd", "width": 1280, "height": 800})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let invalid: serde_json::Value =
+            serde_json::from_slice(&to_bytes(invalid.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(invalid["error"]["code"], "browser_url_invalid");
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/browser/sessions/{}", BrowserSessionId::new()))
+                    .header("authorization", format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_websocket_pipes_binary_rfb_bytes_in_both_directions() {
+        let (rfb_server, mut rfb_peer) = tokio::net::UnixStream::pair().unwrap();
+        let rfb = Arc::new(Mutex::new(Some(rfb_server)));
+        let app = Router::new().route(
+            "/ws",
+            get({
+                let rfb = Arc::clone(&rfb);
+                move |websocket: WebSocketUpgrade| {
+                    let rfb = Arc::clone(&rfb);
+                    async move {
+                        let stream = rfb.lock().await.take().unwrap();
+                        websocket
+                            .protocols(["termd.rfb.v1"])
+                            .on_upgrade(move |socket| run_browser_websocket(socket, stream))
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "termd.rfb.v1".parse().unwrap());
+        let (mut client, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|value| value.to_str().ok()),
+            Some("termd.rfb.v1")
+        );
+
+        let client_bytes = vec![0, 1, 2, 0xff, 0, 7];
+        client
+            .send(ClientWsMessage::Binary(client_bytes.clone()))
+            .await
+            .unwrap();
+        let mut received = vec![0; client_bytes.len()];
+        rfb_peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, client_bytes);
+
+        let server_bytes = vec![0xff, 0, 3, 4, 0, 5];
+        rfb_peer.write_all(&server_bytes).await.unwrap();
+        let relayed = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(relayed, ClientWsMessage::Binary(server_bytes));
+
+        let _ = client.close(None).await;
+        server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]

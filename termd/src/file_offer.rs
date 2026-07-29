@@ -15,8 +15,8 @@ use uuid::Uuid;
 pub const FILE_OFFER_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const FILE_OFFER_LIMIT: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct FileIdentity {
     len: u64,
     modified: Option<SystemTime>,
     #[cfg(unix)]
@@ -30,7 +30,7 @@ struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
+    pub(crate) fn from_metadata(metadata: &fs::Metadata) -> Self {
         Self {
             len: metadata.len(),
             modified: metadata.modified().ok(),
@@ -44,6 +44,14 @@ impl FileIdentity {
             ctime_nsec: metadata.ctime_nsec(),
         }
     }
+
+    pub(crate) fn len(self) -> u64 {
+        self.len
+    }
+
+    pub(crate) fn modified(self) -> Option<SystemTime> {
+        self.modified
+    }
 }
 
 #[derive(Debug)]
@@ -54,7 +62,17 @@ struct FileOfferEntry {
     content_sha256: [u8; 32],
 }
 
-#[derive(Debug)]
+pub(crate) struct StagedFileOffer {
+    entry: FileOfferEntry,
+}
+
+impl StagedFileOffer {
+    pub(crate) fn payload(&self) -> &FileOfferPayload {
+        &self.entry.payload
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct InspectedFileOffer {
     name: String,
     canonical_path: PathBuf,
@@ -130,7 +148,13 @@ impl FileOfferStore {
         inspected: InspectedFileOffer,
         now_ms: UnixTimestampMillis,
     ) -> FileOfferPayload {
-        self.expire(now_ms);
+        self.commit(Self::stage(inspected, now_ms))
+    }
+
+    pub(crate) fn stage(
+        inspected: InspectedFileOffer,
+        now_ms: UnixTimestampMillis,
+    ) -> StagedFileOffer {
         let payload = FileOfferPayload {
             offer_id: Uuid::new_v4(),
             name: inspected.name,
@@ -139,15 +163,23 @@ impl FileOfferStore {
             created_at_ms: now_ms,
             expires_at_ms: UnixTimestampMillis(now_ms.0.saturating_add(FILE_OFFER_TTL_MS)),
         };
+        StagedFileOffer {
+            entry: FileOfferEntry {
+                payload,
+                canonical_path: inspected.canonical_path,
+                identity: inspected.identity,
+                content_sha256: inspected.content_sha256,
+            },
+        }
+    }
+
+    pub(crate) fn commit(&mut self, staged: StagedFileOffer) -> FileOfferPayload {
+        self.expire(staged.entry.payload.created_at_ms);
         if self.entries.len() >= FILE_OFFER_LIMIT {
             self.entries.pop_front();
         }
-        self.entries.push_back(FileOfferEntry {
-            payload: payload.clone(),
-            canonical_path: inspected.canonical_path,
-            identity: inspected.identity,
-            content_sha256: inspected.content_sha256,
-        });
+        let payload = staged.entry.payload.clone();
+        self.entries.push_back(staged.entry);
         payload
     }
 
@@ -226,12 +258,30 @@ impl FileOfferStore {
 
 pub fn inspect_file_offer(path: impl AsRef<Path>) -> Result<InspectedFileOffer, FileOfferError> {
     let canonical_path = fs::canonicalize(path.as_ref()).map_err(map_canonicalize_error)?;
+    inspect_file_offer_path(canonical_path, None, false)
+}
+
+pub(crate) fn inspect_file_offer_exact(
+    path: impl AsRef<Path>,
+    expected_identity: FileIdentity,
+) -> Result<InspectedFileOffer, FileOfferError> {
+    inspect_file_offer_path(path.as_ref().to_owned(), Some(expected_identity), true)
+}
+
+fn inspect_file_offer_path(
+    canonical_path: PathBuf,
+    expected_identity: Option<FileIdentity>,
+    nofollow_path_check: bool,
+) -> Result<InspectedFileOffer, FileOfferError> {
     let mut file = open_regular_file(&canonical_path).map_err(map_open_error)?;
     let initial_metadata = file.metadata().map_err(|_| FileOfferError::Unreadable)?;
     if !initial_metadata.is_file() {
         return Err(FileOfferError::NotRegular);
     }
     let identity = FileIdentity::from_metadata(&initial_metadata);
+    if expected_identity.is_some_and(|expected| expected != identity) {
+        return Err(FileOfferError::Invalidated);
+    }
     let name = canonical_path
         .file_name()
         .filter(|name| !name.is_empty())
@@ -250,7 +300,12 @@ pub fn inspect_file_offer(path: impl AsRef<Path>) -> Result<InspectedFileOffer, 
         hasher.update(&buffer[..read]);
     }
     let final_metadata = file.metadata().map_err(|_| FileOfferError::Invalidated)?;
-    let path_metadata = fs::metadata(&canonical_path).map_err(|_| FileOfferError::Invalidated)?;
+    let path_metadata = if nofollow_path_check {
+        fs::symlink_metadata(&canonical_path)
+    } else {
+        fs::metadata(&canonical_path)
+    }
+    .map_err(|_| FileOfferError::Invalidated)?;
     if FileIdentity::from_metadata(&final_metadata) != identity
         || FileIdentity::from_metadata(&path_metadata) != identity
     {

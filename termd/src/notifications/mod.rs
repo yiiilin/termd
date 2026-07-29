@@ -222,6 +222,15 @@ impl PushNotificationCoordinator {
         self.store.is_some()
     }
 
+    pub(crate) fn has_subscriptions(&self) -> bool {
+        match self.lock_store() {
+            Ok(store) => store
+                .list_stored_subscriptions()
+                .is_ok_and(|subscriptions| !subscriptions.is_empty()),
+            Err(_) => false,
+        }
+    }
+
     pub fn server_id(&self) -> ServerId {
         self.server_id
     }
@@ -292,14 +301,21 @@ impl PushNotificationCoordinator {
     }
 
     pub fn observe_file_offer(&self, offer_id: uuid::Uuid) -> bool {
-        if !self.is_available() {
+        let Ok(store) = self.lock_store() else {
+            return false;
+        };
+        let has_subscriptions = store
+            .list_stored_subscriptions()
+            .is_ok_and(|subscriptions| !subscriptions.is_empty());
+        if !has_subscriptions {
             return false;
         }
-        if self
+        let queued = self
             .event_tx
             .try_send(PushEvent::FileOffer { offer_id })
-            .is_ok()
-        {
+            .is_ok();
+        drop(store);
+        if queued {
             true
         } else {
             warn!("Web Push File Offer queue is full or closed");
@@ -1037,6 +1053,19 @@ mod tests {
         assert_eq!(payload["offer_id"], offer_id.to_string());
         assert_eq!(payload.as_object().unwrap().len(), 4);
         worker.abort();
+    }
+
+    #[test]
+    fn file_offer_is_not_queued_without_a_push_subscription() {
+        let state_dir = TestStateDir::new("file-offer-no-subscription");
+        let coordinator = PushNotificationCoordinator::open_with_delivery(
+            ServerId::new(),
+            state_dir.state_path(),
+            Arc::new(FakeDelivery::new([])),
+        )
+        .unwrap();
+
+        assert!(!coordinator.observe_file_offer(uuid::Uuid::new_v4()));
     }
 
     #[tokio::test]

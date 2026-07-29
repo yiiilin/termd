@@ -19,6 +19,8 @@ use termd::agent_skill::{
     Agent as SkillAgent, InstallAction, SkillState, UninstallAction, bundled_skill, install_auto,
     installation_status, uninstall as uninstall_skill,
 };
+#[cfg(unix)]
+use termd::browser::supervisor::{BrowserSupervisorArgs, run_browser_supervisor};
 use termd::config::{
     DaemonConfig, SecretString, normalize_relay_endpoints, normalize_relay_proxy_url,
 };
@@ -36,6 +38,8 @@ use termd_proto::{
     FileOfferPayload, PairingQrPayload, PairingToken, PublicKey, ServerId, UnixTimestampMillis,
 };
 use tokio::task::JoinHandle;
+#[cfg(unix)]
+use uuid::Uuid;
 
 mod installer_helper;
 mod process_lock;
@@ -57,6 +61,8 @@ const COMMON_WSS_PROXY_ENV_VARS: [&str; 6] = [
     "all_proxy",
 ];
 const NO_PROXY_ENV_VARS: [&str; 2] = ["NO_PROXY", "no_proxy"];
+#[cfg(unix)]
+const BROWSER_SUPERVISOR_PAYLOAD_MAX_BYTES: u64 = 64 * 1024;
 const HELP_TEXT: &str = concat!(
     "termd ",
     env!("CARGO_PKG_VERSION"),
@@ -192,6 +198,11 @@ async fn runtime_main() -> Result<(), Box<dyn Error>> {
         }
         CliCommand::Skill(command) => run_skill_command(command)?,
         CliCommand::SessionSupervisor(args) => run_session_supervisor(args).await?,
+        #[cfg(unix)]
+        CliCommand::BrowserSupervisor(session_id) => {
+            let args = read_browser_supervisor_payload(session_id)?;
+            run_browser_supervisor(args).await?;
+        }
     }
 
     Ok(())
@@ -546,6 +557,8 @@ enum CliCommand {
     },
     Skill(SkillCommand),
     SessionSupervisor(SessionSupervisorArgs),
+    #[cfg(unix)]
+    BrowserSupervisor(Uuid),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -599,6 +612,11 @@ impl fmt::Debug for CliCommand {
                 .debug_tuple("SessionSupervisor")
                 .field(args)
                 .finish(),
+            #[cfg(unix)]
+            Self::BrowserSupervisor(session_id) => formatter
+                .debug_tuple("BrowserSupervisor")
+                .field(session_id)
+                .finish(),
         }
     }
 }
@@ -625,6 +643,8 @@ impl CliCommand {
             "offer-file" => parse_offer_file_args(args),
             "skill" => parse_skill_args(args),
             "__session-supervisor" => parse_session_supervisor_args(args),
+            #[cfg(unix)]
+            "__browser-supervisor" => parse_browser_supervisor_args(args),
             "--listen"
             | "--relay"
             | "--relay-url"
@@ -980,6 +1000,39 @@ fn parse_session_supervisor_args(
         command: command.ok_or(CliError::MissingSupervisorCommand)?,
         size: size.ok_or(CliError::MissingSupervisorSize)?,
     }))
+}
+
+#[cfg(unix)]
+fn parse_browser_supervisor_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<CliCommand, CliError> {
+    let session_id = args
+        .next()
+        .ok_or(CliError::InvalidSupervisorPayload)?
+        .parse::<Uuid>()
+        .map_err(|_| CliError::InvalidSupervisorPayload)?;
+    ensure_no_remaining_args(args)?;
+    Ok(CliCommand::BrowserSupervisor(session_id))
+}
+
+#[cfg(unix)]
+fn read_browser_supervisor_payload(
+    expected_session_id: Uuid,
+) -> Result<BrowserSupervisorArgs, CliError> {
+    let mut payload = Vec::new();
+    io::stdin()
+        .take(BROWSER_SUPERVISOR_PAYLOAD_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut payload)
+        .map_err(|_| CliError::InvalidSupervisorPayload)?;
+    if payload.is_empty() || payload.len() as u64 > BROWSER_SUPERVISOR_PAYLOAD_MAX_BYTES {
+        return Err(CliError::InvalidSupervisorPayload);
+    }
+    let args = serde_json::from_slice::<BrowserSupervisorArgs>(&payload)
+        .map_err(|_| CliError::InvalidSupervisorPayload)?;
+    if args.session_id != expected_session_id {
+        return Err(CliError::InvalidSupervisorPayload);
+    }
+    Ok(args)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

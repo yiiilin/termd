@@ -993,6 +993,419 @@ label {
   animation: dialog-materialize 200ms var(--ease-out-ui) both;
 }
 
+.browser-workspace-dialog {
+  width: min(720px, 100%);
+  max-height: calc(
+    100dvh - 24px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)
+  );
+  border: 1px solid var(--color-border-panel);
+  border-radius: 8px;
+  background: var(--color-surface-soft);
+  color: var(--color-text);
+  box-shadow: 0 24px 70px var(--color-modal-shadow);
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  overflow: hidden;
+  transform-origin: center;
+  animation: dialog-materialize 200ms var(--ease-out-ui) both;
+}
+
+.browser-workspace-backdrop {
+  padding:
+    calc(12px + env(safe-area-inset-top, 0px))
+    calc(12px + env(safe-area-inset-right, 0px))
+    calc(12px + env(safe-area-inset-bottom, 0px))
+    calc(12px + env(safe-area-inset-left, 0px));
+}
+
+.browser-workspace-header,
+.browser-workspace-title-group,
+.browser-workspace-header-actions,
+.browser-session-actions,
+.browser-session-status,
+.browser-viewer-toolbar,
+.browser-viewer-status,
+.browser-viewer-actions {
+  display: flex;
+  align-items: center;
+}
+
+.browser-workspace-header {
+  min-width: 0;
+  min-height: 56px;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 14px 0 16px;
+  background: var(--color-surface);
+  box-shadow: inset 0 -1px var(--color-border-subtle);
+}
+
+.browser-workspace-title-group {
+  min-width: 0;
+  gap: 9px;
+  color: var(--color-info);
+}
+
+.browser-workspace-title-group > div {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.browser-workspace-title-group h2 {
+  margin: 0;
+  color: var(--color-text-strong);
+  font-size: 15px;
+  line-height: 1.25;
+}
+
+.browser-workspace-title-group span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-subtle);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-workspace-header-actions,
+.browser-session-actions,
+.browser-viewer-actions {
+  flex: 0 0 auto;
+  gap: 5px;
+}
+
+.browser-workspace-header .icon-button,
+.browser-session-actions .icon-button,
+.browser-viewer-actions .icon-button {
+  width: 32px;
+  min-height: 32px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+}
+
+.browser-workspace-header .icon-button:hover,
+.browser-session-actions .icon-button:hover,
+.browser-viewer-actions .icon-button:hover {
+  background: var(--color-surface-hover);
+}
+
+.browser-create-form {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 126px auto;
+  align-items: end;
+  gap: 9px;
+  padding: 14px 16px;
+  background: color-mix(in srgb, var(--color-surface) 62%, var(--color-surface-soft));
+  box-shadow: inset 0 -1px var(--color-border-subtle);
+}
+
+.browser-url-field,
+.browser-viewport-field {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.browser-url-field > span,
+.browser-viewport-field > span {
+  color: var(--color-text-subtle);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.browser-url-field input,
+.browser-viewport-field select {
+  width: 100%;
+  min-height: 34px;
+  border-color: var(--color-border-input);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-strong);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.browser-create-button {
+  min-width: 116px;
+  min-height: 34px;
+  justify-content: center;
+  gap: 6px;
+  border-color: var(--color-accent-border);
+  background: var(--color-surface-selected);
+  color: var(--color-accent-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.browser-create-button:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-surface-selected) 72%, var(--color-accent));
+}
+
+.browser-create-button .lucide-loader-circle,
+.browser-session-empty .lucide-loader-circle,
+.browser-viewer-overlay > .lucide-loader-circle {
+  animation: browser-spin 900ms linear infinite;
+}
+
+@keyframes browser-spin {
+  to { transform: rotate(360deg); }
+}
+
+.browser-workspace-error {
+  min-width: 0;
+  min-height: 38px;
+  padding: 8px 10px 8px 16px;
+  background: var(--color-danger-bg);
+  color: var(--color-danger-text);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.browser-workspace-error span {
+  min-width: 0;
+}
+
+.browser-workspace-error button {
+  width: 26px;
+  min-height: 26px;
+  flex: 0 0 auto;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: inherit;
+}
+
+.browser-session-list {
+  min-height: 120px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px;
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  background: var(--color-surface-soft);
+}
+
+.browser-session-row {
+  min-width: 0;
+  min-height: 54px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 6px;
+  background: var(--color-surface);
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 7px 7px 10px;
+}
+
+.browser-session-row:hover {
+  border-color: var(--color-border-soft);
+  background: var(--color-surface-hover);
+}
+
+.browser-session-status {
+  justify-content: center;
+}
+
+.browser-session-status span,
+.browser-viewer-status > span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-success) 15%, transparent);
+}
+
+.browser-session-main {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.browser-session-main strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-strong);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-session-main span {
+  min-width: 0;
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+
+.browser-session-main b {
+  margin: 0 6px;
+  color: var(--color-border-deep);
+  font-weight: 400;
+}
+
+.browser-stop-button {
+  color: var(--color-danger-soft);
+}
+
+.browser-session-empty {
+  min-height: 108px;
+  display: grid;
+  place-items: center;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.browser-viewer-boot,
+.browser-viewer-fatal {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  background: var(--color-terminal-bg);
+  color: var(--color-text-muted);
+}
+
+.browser-viewer-fatal {
+  align-content: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+}
+
+.browser-viewer-fatal button,
+.browser-viewer-reconnect button {
+  justify-self: center;
+  border-color: var(--color-accent-border);
+  background: var(--color-surface-selected);
+  color: var(--color-accent-text);
+}
+
+.browser-viewer-shell {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--color-terminal-bg);
+  display: grid;
+  grid-template-rows: calc(42px + env(safe-area-inset-top, 0px)) minmax(0, 1fr);
+}
+
+.browser-viewer-toolbar {
+  position: relative;
+  z-index: 5;
+  min-width: 0;
+  justify-content: space-between;
+  gap: 12px;
+  padding: env(safe-area-inset-top, 0px) calc(8px + env(safe-area-inset-right, 0px)) 0 calc(10px + env(safe-area-inset-left, 0px));
+  background: color-mix(in srgb, var(--color-bg-shell) 90%, transparent);
+  box-shadow: inset 0 -1px var(--color-border-subtle);
+  backdrop-filter: blur(18px) saturate(125%);
+}
+
+.browser-viewer-status {
+  min-width: 0;
+  gap: 8px;
+}
+
+.browser-viewer-status strong {
+  color: var(--color-text-strong);
+  font-size: 12px;
+}
+
+.browser-viewer-status.connecting > span {
+  background: var(--color-info);
+  animation: browser-status-pulse 1.2s ease-in-out infinite;
+}
+
+.browser-viewer-status.disconnected > span,
+.browser-viewer-status.error > span,
+.browser-viewer-status.stopped > span {
+  background: var(--color-danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-danger) 15%, transparent);
+}
+
+@keyframes browser-status-pulse {
+  50% { opacity: 0.45; }
+}
+
+.browser-viewer-stop {
+  color: var(--color-danger-soft);
+}
+
+.browser-viewer-canvas {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  touch-action: none;
+  background: var(--color-terminal-bg);
+}
+
+.browser-viewer-canvas > .rfb {
+  width: 100%;
+  height: 100%;
+}
+
+.browser-viewer-overlay {
+  position: absolute;
+  z-index: 4;
+  inset: calc(42px + env(safe-area-inset-top, 0px)) 0 0;
+  display: grid;
+  place-items: center;
+  color: var(--color-text-subtle);
+  pointer-events: none;
+}
+
+.browser-viewer-reconnect {
+  align-content: center;
+  gap: 12px;
+  padding: 24px;
+  background: color-mix(in srgb, var(--color-terminal-bg) 78%, transparent);
+  text-align: center;
+  pointer-events: auto;
+  backdrop-filter: blur(5px);
+}
+
+.browser-viewer-reconnect span {
+  color: var(--color-text-strong);
+  font-size: 13px;
+}
+
+@media (max-width: 640px) {
+  .browser-create-form {
+    grid-template-columns: minmax(0, 1fr) 108px;
+  }
+
+  .browser-create-button {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .browser-session-row {
+    grid-template-columns: 16px minmax(0, 1fr) auto;
+    padding-left: 8px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-create-button .lucide-loader-circle,
+  .browser-session-empty .lucide-loader-circle,
+  .browser-viewer-overlay > .lucide-loader-circle,
+  .browser-viewer-status.connecting > span {
+    animation: none;
+  }
+}
+
 .settings-backdrop {
   padding:
     calc(12px + env(safe-area-inset-top, 0px))
@@ -1746,6 +2159,11 @@ label {
   padding: 2px;
   pointer-events: none;
   scrollbar-width: thin;
+}
+
+.browser-viewer-shell > .file-offer-center {
+  top: calc(42px + env(safe-area-inset-top, 0px) + 10px);
+  max-height: calc(100% - 42px - env(safe-area-inset-top, 0px) - 20px);
 }
 
 .file-offer-list {

@@ -5,6 +5,8 @@
 
 pub mod agent_skill;
 pub mod auth;
+#[cfg(unix)]
+pub mod browser;
 pub mod config;
 pub mod file_offer;
 pub mod net;

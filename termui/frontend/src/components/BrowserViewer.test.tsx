@@ -1,0 +1,189 @@
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { BrowserState, FileOfferPayload } from "../protocol/types";
+import BrowserViewer from "./BrowserViewer";
+
+const viewerMocks = vi.hoisted(() => ({
+  instances: [] as Array<EventTarget & {
+    url: string;
+    options: { wsProtocols?: string[] };
+    disconnect: ReturnType<typeof vi.fn>;
+  }>,
+  accessToken: vi.fn<() => Promise<string>>(),
+  close: vi.fn(),
+  dispose: vi.fn(),
+  metadataClose: vi.fn(),
+  prepareFileOfferDownload: vi.fn(),
+  fileOfferDownloadUrl: vi.fn(),
+  subscribeMetadata: vi.fn(),
+  fileOfferListener: undefined as ((offer: FileOfferPayload) => void) | undefined,
+  loadState: vi.fn<() => Promise<BrowserState>>(),
+}));
+
+vi.mock("@novnc/novnc", () => ({
+  default: class MockRFB extends EventTarget {
+    background = "";
+    clipViewport = false;
+    compressionLevel = 0;
+    dragViewport = false;
+    focusOnClick = false;
+    qualityLevel = 0;
+    resizeSession = false;
+    scaleViewport = false;
+    viewOnly = false;
+    disconnect = vi.fn();
+    sendCtrlAltDel = vi.fn();
+
+    constructor(_target: HTMLElement, readonly url: string, readonly options: { wsProtocols?: string[] }) {
+      super();
+      viewerMocks.instances.push(this);
+    }
+  },
+}));
+
+vi.mock("../protocol/browser-client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../protocol/browser-client")>();
+  return {
+    ...actual,
+    BrowserWorkspaceClient: class {
+      accessToken = viewerMocks.accessToken;
+      close = viewerMocks.close;
+      dispose = viewerMocks.dispose;
+    },
+  };
+});
+
+vi.mock("../state/browser-state", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../state/browser-state")>();
+  return { ...actual, loadBrowserState: viewerMocks.loadState };
+});
+
+vi.mock("../protocol/v070-client", () => ({
+  V070Client: class {
+    close = viewerMocks.metadataClose;
+    prepareFileOfferDownload = viewerMocks.prepareFileOfferDownload;
+    fileOfferDownloadUrl = viewerMocks.fileOfferDownloadUrl;
+    subscribeMetadata = viewerMocks.subscribeMetadata;
+
+    watchFileOffers(listener: NonNullable<typeof viewerMocks.fileOfferListener>) {
+      viewerMocks.fileOfferListener = listener;
+      return () => {
+        if (viewerMocks.fileOfferListener === listener) viewerMocks.fileOfferListener = undefined;
+      };
+    }
+  },
+}));
+
+const browserId = "11111111-2222-4333-8444-555555555555";
+const serverId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+describe("BrowserViewer", () => {
+  beforeEach(() => {
+    viewerMocks.instances.length = 0;
+    viewerMocks.accessToken.mockResolvedValue("header.payload.signature");
+    viewerMocks.close.mockResolvedValue(undefined);
+    viewerMocks.fileOfferListener = undefined;
+    viewerMocks.metadataClose.mockReset();
+    viewerMocks.prepareFileOfferDownload.mockReset();
+    viewerMocks.fileOfferDownloadUrl.mockReset();
+    viewerMocks.subscribeMetadata.mockReset().mockResolvedValue(undefined);
+    viewerMocks.loadState.mockResolvedValue({
+      device: {
+        device_id: "99999999-8888-4777-8666-555555555555",
+        device_public_key: "device-public",
+        device_signing_key_secret: "device-secret",
+      },
+      pairedServers: [{
+        server_id: serverId,
+        daemon_public_key: "daemon-public",
+        device_certificate: "certificate",
+        url: "wss://relay.example/ws",
+        paired_at_ms: 1,
+      }],
+    });
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: vi.fn(() => ({
+        matches: true,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      })),
+    });
+  });
+
+  it("connects noVNC with the RFB protocol and a fresh access token", async () => {
+    const { unmount } = render(<BrowserViewer browserId={browserId} serverId={serverId} />);
+
+    await waitFor(() => expect(viewerMocks.instances).toHaveLength(1));
+    const rfb = viewerMocks.instances[0];
+    expect(rfb.url).toBe(`wss://relay.example/ws/browser/${browserId}`);
+    expect(rfb.options.wsProtocols).toEqual(["termd.rfb.v1", "header.payload.signature"]);
+
+    act(() => rfb.dispatchEvent(new Event("connect")));
+    expect(screen.getByRole("status")).toHaveTextContent("Connected");
+
+    unmount();
+    expect(rfb.disconnect).toHaveBeenCalledOnce();
+    expect(viewerMocks.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("shows completed browser downloads through the existing File Offer prompt", async () => {
+    viewerMocks.prepareFileOfferDownload.mockResolvedValue({
+      download_id: "77777777-6666-4555-8444-333333333333",
+      download_url: "/api/files/offer-downloads/77777777-6666-4555-8444-333333333333",
+      name: "report.zip",
+      size_bytes: 13,
+      expires_at_ms: Date.now() + 60_000,
+    });
+    viewerMocks.fileOfferDownloadUrl.mockReturnValue(
+      "https://relay.example/api/files/offer-downloads/77777777-6666-4555-8444-333333333333",
+    );
+    const nativeClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    const { unmount } = render(<BrowserViewer browserId={browserId} serverId={serverId} />);
+    await waitFor(() => expect(viewerMocks.fileOfferListener).toBeTypeOf("function"));
+
+    act(() => viewerMocks.fileOfferListener?.({
+      offer_id: "12345678-1234-4234-8234-123456789abc",
+      name: "report.zip",
+      path: "/var/tmp/termd-browser-downloads/session/report.zip",
+      size_bytes: 13,
+      created_at_ms: Date.now(),
+      expires_at_ms: Date.now() + 86_400_000,
+    }));
+
+    const download = await screen.findByRole("button", { name: /download report\.zip/i });
+    fireEvent.click(download);
+    await waitFor(() => expect(viewerMocks.prepareFileOfferDownload).toHaveBeenCalledWith(
+      "12345678-1234-4234-8234-123456789abc",
+    ));
+    expect(nativeClick).toHaveBeenCalledOnce();
+
+    unmount();
+    nativeClick.mockRestore();
+  });
+
+  it("retries the File Offer metadata connection after its first attempt fails", async () => {
+    let rejectFirstAttempt: ((reason?: unknown) => void) | undefined;
+    viewerMocks.subscribeMetadata
+      .mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+        rejectFirstAttempt = reject;
+      }))
+      .mockResolvedValueOnce(undefined);
+    const { unmount } = render(<BrowserViewer browserId={browserId} serverId={serverId} />);
+    await waitFor(() => expect(viewerMocks.subscribeMetadata).toHaveBeenCalledOnce());
+
+    vi.useFakeTimers();
+    await act(async () => {
+      rejectFirstAttempt?.(new Error("metadata unavailable"));
+      await Promise.resolve();
+    });
+    expect(viewerMocks.metadataClose).toHaveBeenCalledOnce();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(viewerMocks.subscribeMetadata).toHaveBeenCalledTimes(2);
+
+    unmount();
+    vi.useRealTimers();
+  });
+});
