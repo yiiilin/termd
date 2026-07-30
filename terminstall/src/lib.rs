@@ -16,7 +16,7 @@ use reqwest::header::{ACCEPT, HeaderValue};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 
 const TERMD_INSTALLER: &str = include_str!("../../scripts/install-termd.sh");
 const TERMRELAY_INSTALLER: &str = include_str!("../../scripts/install-termrelay.sh");
@@ -1497,7 +1497,7 @@ struct ReleaseAsset {
 
 struct UpgradeCandidate {
     path: PathBuf,
-    _temporary_file: Option<NamedTempFile>,
+    _temporary_path: Option<TempPath>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2029,9 +2029,12 @@ fn stage_candidate(
         .as_file()
         .set_permissions(fs::Permissions::from_mode(0o700))
         .map_err(UpgradeError::CandidatePermissions)?;
+    // Linux rejects exec while a writable descriptor is open. TempPath keeps
+    // automatic cleanup ownership without retaining the file handle.
+    let temporary_path = temporary_file.into_temp_path();
     Ok(UpgradeCandidate {
-        path: temporary_file.path().to_owned(),
-        _temporary_file: Some(temporary_file),
+        path: temporary_path.to_path_buf(),
+        _temporary_path: Some(temporary_path),
     })
 }
 
@@ -3028,7 +3031,7 @@ uname -m >/dev/null
             }
             Ok(UpgradeCandidate {
                 path: PathBuf::from("/tmp/verified-upgrade-candidate"),
-                _temporary_file: None,
+                _temporary_path: None,
             })
         }
 
@@ -3239,6 +3242,42 @@ uname -m >/dev/null
         };
 
         assert!(matches!(error, UpgradeError::DigestMismatch(name) if name == asset.name));
+    }
+
+    #[test]
+    fn verified_release_candidate_runs_version_and_installer_commands() {
+        let bytes = b"#!/bin/sh\ncase \"$1\" in\n  --version) printf 'termd 9.9.9\\n' ;;\n  install) [ \"$2\" = \"--yes\" ] ;;\n  *) exit 64 ;;\nesac\n";
+        let asset = ReleaseAsset {
+            name: "termd-linux-amd64".to_owned(),
+            download_url: "https://github.com/example/release".to_owned(),
+            digest: Sha256::digest(bytes).into(),
+            size: bytes.len() as u64,
+        };
+        let candidate = stage_candidate(io::Cursor::new(bytes), Some(bytes.len() as u64), &asset)
+            .expect("verified candidate should be staged");
+
+        let status = SystemUpgradeRuntime
+            .candidate_version(&candidate)
+            .expect("verified candidate should execute");
+        assert!(status.success);
+        assert_eq!(status.description, "termd 9.9.9");
+
+        let candidate_path = candidate.path.clone();
+        let invocation = CandidateInvocation {
+            path: candidate_path.clone(),
+            args: ["install", "--yes"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            install_prefix: PathBuf::from("/unused-test-prefix"),
+        };
+        let install_status = SystemUpgradeRuntime
+            .install_candidate(&invocation)
+            .expect("verified candidate installer should execute");
+        assert!(install_status.success);
+
+        drop(candidate);
+        assert!(!candidate_path.exists());
     }
 
     #[test]
