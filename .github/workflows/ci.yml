@@ -20,6 +20,9 @@ jobs:
       - name: Check shell scripts
         run: bash -n scripts/*.sh
 
+      - name: Test browser runtime archive validation
+        run: bash scripts/test-browser-runtime-archive.sh
+
       - name: Test installers
         run: bash scripts/test-installers.sh
 

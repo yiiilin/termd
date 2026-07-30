@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 TIGERVNC_VERSION="1.16.2"
 TIGERVNC_SHA256="3f22ba333f4b54c1d8f5cd2e57e2723b12706bbd127a3583d57bcc205e94b47d"
 TIGERVNC_URL="https://sourceforge.net/projects/tigervnc/files/stable/${TIGERVNC_VERSION}/ubuntu-22.04LTS/source/tigervnc_${TIGERVNC_VERSION}.orig.tar.gz/download"
@@ -268,8 +270,10 @@ archive_name="termd-browser-runtime-linux-${asset_arch}.tar.gz"
 manifest_name="termd-browser-runtime-linux-${asset_arch}.json"
 archive_path="${output_dir}/${archive_name}"
 manifest_path="${output_dir}/${manifest_name}"
-tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+tar --hard-dereference --sort=name --mtime='UTC 1970-01-01' \
+  --owner=0 --group=0 --numeric-owner \
   -czf "$archive_path" -C "$runtime_dir" bin lib share
+"${script_dir}/validate-browser-runtime-archive.sh" "$archive_path"
 archive_size="$(stat -c '%s' "$archive_path")"
 archive_sha256="$(sha256sum "$archive_path" | cut -d' ' -f1)"
 jq -n \
