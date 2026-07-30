@@ -185,6 +185,14 @@ fn relay_idle_ping_due(
         && now.duration_since(last_idle_ping_sent_at) >= heartbeat_interval
 }
 
+fn acknowledge_relay_idle_ping(pending_payload: &mut Option<Vec<u8>>, pong_payload: &[u8]) -> bool {
+    if pending_payload.as_deref() != Some(pong_payload) {
+        return false;
+    }
+    *pending_payload = None;
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayReconnectPolicy {
     initial_delay: Duration,
@@ -654,6 +662,9 @@ async fn connect_relay_control_base_once(
     let mut last_activity = Instant::now();
     let mut last_idle_ping_sent_at = Instant::now();
     let mut idle_ping_nonce = 0_u64;
+    let mut pending_idle_ping_payload: Option<Vec<u8>> = None;
+    let pending_pong_deadline = tokio::time::sleep(RELAY_PONG_DEADLINE);
+    tokio::pin!(pending_pong_deadline);
     let mut data_tasks = RelayDataTaskMap::new();
 
     let result = loop {
@@ -661,6 +672,9 @@ async fn connect_relay_control_base_once(
         tokio::select! {
             biased;
 
+            _ = &mut pending_pong_deadline, if pending_idle_ping_payload.is_some() => {
+                break Err(RelayConnectorError::MuxKeepaliveTimeout);
+            }
             inbound = receiver.next() => {
                 let Some(message) = inbound else {
                     break Ok(());
@@ -731,8 +745,12 @@ async fn connect_relay_control_base_once(
                             break Err(error);
                         }
                     }
-                    Message::Pong(_) => {
+                    Message::Pong(payload) => {
                         last_activity = Instant::now();
+                        acknowledge_relay_idle_ping(
+                            &mut pending_idle_ping_payload,
+                            payload.as_slice(),
+                        );
                     }
                     Message::Close(_) => break Ok(()),
                     Message::Frame(_) => {}
@@ -740,12 +758,19 @@ async fn connect_relay_control_base_once(
             }
             _ = heartbeat.tick() => {
                 let now = Instant::now();
-                if relay_idle_ping_due(now, last_activity, last_idle_ping_sent_at, heartbeat_interval) {
+                if pending_idle_ping_payload.is_none()
+                    && relay_idle_ping_due(
+                        now,
+                        last_activity,
+                        last_idle_ping_sent_at,
+                        heartbeat_interval,
+                    )
+                {
                     idle_ping_nonce = idle_ping_nonce.wrapping_add(1);
                     let payload = idle_ping_nonce.to_be_bytes().to_vec();
                     if let Err(error) = send_relay_message_with_deadline(
                         &mut sender,
-                        Message::Ping(payload),
+                        Message::Ping(payload.clone()),
                         RELAY_SEND_DEADLINE,
                     )
                     .await
@@ -754,6 +779,11 @@ async fn connect_relay_control_base_once(
                     }
                     last_activity = Instant::now();
                     last_idle_ping_sent_at = last_activity;
+                    // 写入成功只能证明 frame 进入了本地 socket；匹配 Pong 才能证明整条链路可用。
+                    pending_idle_ping_payload = Some(payload);
+                    pending_pong_deadline
+                        .as_mut()
+                        .reset(last_activity + RELAY_PONG_DEADLINE);
                     trace!(
                         relay = %relay_endpoint,
                         ?server_id,
@@ -2671,6 +2701,137 @@ mod tests {
             .exchange_access_token(&certificate, payload, now_ms)
             .unwrap()
             .0
+    }
+
+    async fn accept_relay_control_for_test(
+        listener: tokio::net::TcpListener,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let message = tokio::time::timeout(Duration::from_millis(500), socket.next())
+            .await
+            .expect("control socket should send route hello")
+            .expect("control socket should remain open")
+            .unwrap();
+        let raw = message.into_text().expect("route hello should be text");
+        let route_hello: ProtoEnvelope<ProtoRouteHelloPayload> =
+            serde_json::from_str(&raw).unwrap();
+        assert_eq!(route_hello.kind, ProtoMessageType::RouteHello);
+        assert_eq!(route_hello.payload.role, ProtoRouteRole::DaemonControl);
+
+        let route_ready = ProtoEnvelope::new(
+            ProtoMessageType::RouteReady,
+            ProtoRouteReadyPayload {
+                server_id: route_hello.payload.server_id,
+                role: ProtoRouteRole::DaemonControl,
+            },
+        );
+        socket
+            .send(Message::Text(serde_json::to_string(&route_ready).unwrap()))
+            .await
+            .unwrap();
+        socket
+    }
+
+    #[tokio::test]
+    async fn relay_control_times_out_when_idle_ping_is_not_acknowledged() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let protocol = crate::net::server::default_protocol(
+            crate::config::DaemonConfig::default_for_state_path(
+                state_dir.path().join("daemon-state.json"),
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let relay_peer = tokio::spawn(async move {
+            let _socket = accept_relay_control_for_test(listener).await;
+            std::future::pending::<()>().await;
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            connect_relay_control_base_once(
+                RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap(),
+                None,
+                None,
+                protocol,
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("unacknowledged relay control ping should time out");
+
+        assert!(matches!(
+            result,
+            Err(RelayConnectorError::MuxKeepaliveTimeout)
+        ));
+        relay_peer.abort();
+        let _ = relay_peer.await;
+    }
+
+    #[tokio::test]
+    async fn relay_control_matching_pong_keeps_idle_connection_alive() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let protocol = crate::net::server::default_protocol(
+            crate::config::DaemonConfig::default_for_state_path(
+                state_dir.path().join("daemon-state.json"),
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let relay_peer = tokio::spawn(async move {
+            let mut socket = accept_relay_control_for_test(listener).await;
+            for _ in 0..2 {
+                loop {
+                    let message = tokio::time::timeout(Duration::from_millis(250), socket.next())
+                        .await
+                        .expect("control socket should send idle ping")
+                        .expect("control socket should remain open")
+                        .unwrap();
+                    if let Message::Ping(payload) = message {
+                        socket.send(Message::Pong(payload)).await.unwrap();
+                        break;
+                    }
+                }
+            }
+            socket.close(None).await.unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            connect_relay_control_base_once(
+                RelayBaseUrl::parse(&format!("ws://{addr}")).unwrap(),
+                None,
+                None,
+                protocol,
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("acknowledged relay control pings should keep the socket alive");
+
+        assert!(result.is_ok());
+        relay_peer.await.unwrap();
+    }
+
+    #[test]
+    fn relay_control_wrong_pong_does_not_acknowledge_idle_ping() {
+        let expected_payload = 1_u64.to_be_bytes().to_vec();
+        let mut pending_payload = Some(expected_payload.clone());
+
+        assert!(!acknowledge_relay_idle_ping(
+            &mut pending_payload,
+            &u64::MAX.to_be_bytes(),
+        ));
+        assert_eq!(
+            pending_payload.as_deref(),
+            Some(expected_payload.as_slice())
+        );
+        assert!(acknowledge_relay_idle_ping(
+            &mut pending_payload,
+            &expected_payload,
+        ));
+        assert!(pending_payload.is_none());
     }
 
     #[test]
