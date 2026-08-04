@@ -142,6 +142,19 @@ function setViewportWidth(width: number): void {
   window.dispatchEvent(new Event("resize"));
 }
 
+function dispatchPointerEvent(
+  target: Element | Node | Window | Document,
+  type: "pointerdown" | "pointermove" | "pointerup",
+  init: { pointerId: number; clientX?: number },
+): void {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperties(event, {
+    pointerId: { value: init.pointerId },
+    clientX: { value: init.clientX ?? 0 },
+  });
+  fireEvent(target, event);
+}
+
 function setTouchCapability(enabled: boolean): void {
   Object.defineProperty(navigator, "maxTouchPoints", {
     configurable: true,
@@ -4222,6 +4235,28 @@ describe("termui web 工作台", () => {
     observer.disconnect();
     expect(sawConnectionAlert).toBe(false);
   });
+
+  it("连续短断恢复时始终只保留当前 metadata 和 terminal WebSocket", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+    await screen.findByText(/termd-e2e-ready/);
+    await waitFor(() => expect(daemon.attachedSessions).toEqual([DEFAULT_SESSION_ID]));
+
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const expectedAttachCount = daemon.attachedSessions.length + 1;
+      daemon.dropConnections();
+      await waitFor(
+        () => expect(daemon.attachedSessions).toHaveLength(expectedAttachCount),
+        { timeout: 2200 },
+      );
+      await waitFor(() => expectTerminalAndMetadataConnectionBudget(daemon));
+      await new Promise((resolve) => window.setTimeout(resolve, 40));
+      expectTerminalAndMetadataConnectionBudget(daemon);
+    }
+  }, 25_000);
 
   it.each(["heartbeat_timeout", "slow_consumer"])(
     "terminal attach 以 %s 关闭时会静默重新 attach",
@@ -8353,7 +8388,7 @@ describe("termui web 工作台", () => {
     await waitFor(() => expect(daemon.closedSessions).toEqual([DEFAULT_SESSION_ID]));
   });
 
-  it("Session 行名称在会话菜单里左对齐", async () => {
+  it("Session 行名称左对齐且过长时保持单行省略", async () => {
     const user = userEvent.setup();
     render(<App />);
 
@@ -8364,14 +8399,20 @@ describe("termui web 工作台", () => {
     const openButton = screen.getByRole("button", { name: `Open ${DEFAULT_SESSION_NAME}` });
     const openButtonRule = cssRuleBody(css, ".session-open-button");
     const openButtonNameRule = cssRuleBody(css, ".session-open-button strong");
+    const sessionRowNameRule = cssRuleBody(css, ".session-row strong");
+    const sessionName = openButton.querySelector("strong");
 
     expect(openButton).toHaveClass("session-open-button");
+    expect(sessionName).toHaveAttribute("title", DEFAULT_SESSION_NAME);
     expect(openButtonRule).toMatch(/display:\s*grid;/);
     expect(openButtonRule).toMatch(/justify-content:\s*stretch;/);
     expect(openButtonRule).toMatch(/justify-items:\s*start;/);
     expect(openButtonRule).toMatch(/width:\s*100%;/);
     expect(openButtonRule).toMatch(/text-align:\s*left;/);
     expect(openButtonNameRule).toMatch(/text-align:\s*left;/);
+    expect(sessionRowNameRule).toMatch(/overflow:\s*hidden;/);
+    expect(sessionRowNameRule).toMatch(/text-overflow:\s*ellipsis;/);
+    expect(sessionRowNameRule).toMatch(/white-space:\s*nowrap;/);
   });
 
   it("桌面侧栏固定标题和新建按钮，只让 session 列表滚动", async () => {
@@ -8410,10 +8451,12 @@ describe("termui web 工作台", () => {
     await clickSessionCard(user);
 
     expect(await screen.findByLabelText("session files")).toBeInTheDocument();
+    expect(screen.getByRole("separator", { name: "Resize sessions panel" })).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
 
     expect(screen.getByRole("button", { name: "Expand sidebar" })).toBeInTheDocument();
+    expect(screen.queryByRole("separator", { name: "Resize sessions panel" })).toBeNull();
     expect(screen.getByRole("button", { name: "New session" })).toBeInTheDocument();
     expect(screen.queryByText("New session")).toBeNull();
     expect(screen.queryByLabelText("connection status")).toBeNull();
@@ -8421,6 +8464,7 @@ describe("termui web 工作台", () => {
 
     await user.click(screen.getByRole("button", { name: "Expand sidebar" }));
     expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+    expect(screen.getByRole("separator", { name: "Resize sessions panel" })).toBeInTheDocument();
     await screen.findByText("New session");
 
     await user.click(screen.getByRole("button", { name: "Hide files panel" }));
@@ -8508,12 +8552,40 @@ describe("termui web 工作台", () => {
     expect(document.querySelector(".files-resizer")).toBeNull();
     expect(resizer.classList.contains("files-panel-edge-resizer")).toBe(true);
 
-    fireEvent.pointerDown(resizer, { clientX: 1180, pointerId: 1 });
-    fireEvent.pointerMove(window, { clientX: 1080, pointerId: 1 });
-    fireEvent.pointerUp(window, { pointerId: 1 });
+    dispatchPointerEvent(resizer, "pointerdown", { clientX: 1180, pointerId: 1 });
+    dispatchPointerEvent(window, "pointermove", { clientX: 1080, pointerId: 1 });
+    dispatchPointerEvent(window, "pointerup", { pointerId: 1 });
 
     await waitFor(() => expect(workspaceBody!.style.gridTemplateColumns).not.toBe(initialColumns));
-    expect(workspaceBody!.style.gridTemplateColumns).toContain("px");
+    expect(workspaceBody!.style.gridTemplateColumns).toContain("386px");
+  });
+
+  it("桌面会话面板可以通过右边缘分隔条调整宽度", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await pairWithInvite(user, daemon);
+    await waitForWorkspaceSession();
+
+    const appShell = document.querySelector<HTMLElement>(".app-shell");
+    expect(appShell).not.toBeNull();
+    const resizer = screen.getByRole("separator", { name: "Resize sessions panel" });
+    expect(resizer).toHaveClass("sidebar-edge-resizer");
+    const initialWidth = appShell!.style.getPropertyValue("--deck-sidebar-width");
+
+    dispatchPointerEvent(resizer, "pointerdown", { clientX: 248, pointerId: 7 });
+    expect(appShell).toHaveClass("sidebar-resizing");
+    dispatchPointerEvent(window, "pointermove", { clientX: 328, pointerId: 7 });
+    dispatchPointerEvent(window, "pointerup", { pointerId: 7 });
+
+    await waitFor(() => {
+      expect(appShell!.style.getPropertyValue("--deck-sidebar-width")).not.toBe(initialWidth);
+      expect(appShell).not.toHaveClass("sidebar-resizing");
+    });
+    expect(appShell!.style.getPropertyValue("--deck-sidebar-width")).toBe("328px");
+
+    fireEvent.keyDown(resizer, { key: "ArrowLeft" });
+    await waitFor(() => expect(appShell!.style.getPropertyValue("--deck-sidebar-width")).toBe("312px"));
   });
 
   it("粘贴 QR payload 后会使用当前连接地址和 token", async () => {

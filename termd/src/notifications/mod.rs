@@ -618,6 +618,7 @@ fn activity_agent_wire(agent: SessionActivityAgent) -> &'static str {
         SessionActivityAgent::ClaudeCode => "claude_code",
         SessionActivityAgent::OpenCode => "opencode",
         SessionActivityAgent::ZCode => "zcode",
+        SessionActivityAgent::OhMyPi => "oh_my_pi",
     }
 }
 
@@ -627,6 +628,7 @@ fn activity_agent_label(agent: SessionActivityAgent) -> &'static str {
         SessionActivityAgent::ClaudeCode => "Claude Code",
         SessionActivityAgent::OpenCode => "OpenCode",
         SessionActivityAgent::ZCode => "ZCode",
+        SessionActivityAgent::OhMyPi => "oh-my-pi",
     }
 }
 

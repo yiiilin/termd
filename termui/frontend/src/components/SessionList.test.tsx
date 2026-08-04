@@ -227,7 +227,12 @@ describe("SessionList", () => {
     const idleVisual = screen.getByTitle("ZCode is ready");
     expect(idleVisual).toHaveAttribute("title", "ZCode is ready");
     expect(idleVisual).toHaveClass("activity-idle");
-    expect(document.querySelectorAll(".session-activity-indicator")).toHaveLength(3);
+    const idleIndicator = within(screen.getByRole("button", { name: "Open ready, ZCode is ready" }))
+      .getByText("ZCode is ready")
+      .closest(".session-activity-indicator");
+    expect(idleIndicator).toHaveClass("activity-idle");
+    expect(idleIndicator?.querySelector("svg")).not.toBeNull();
+    expect(document.querySelectorAll(".session-activity-indicator")).toHaveLength(4);
     expect(document.querySelectorAll(".session-avatar")).toHaveLength(4);
     expect(
       runningRow.querySelector(
@@ -598,5 +603,32 @@ describe("SessionList", () => {
     expect(button).toHaveClass("activity-attention");
     expect(within(button).getByTitle("Claude Code needs attention"))
       .toHaveClass("session-visual", "activity-attention");
+  });
+
+  it("展示 oh-my-pi 会话活动状态", () => {
+    render(
+      <SessionList
+        sessions={[{
+          session_id: "00000000-0000-0000-0000-000000000405",
+          name: "pi work",
+          state: "running",
+          size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+          activity: { kind: "ai", agent: "oh_my_pi", state: "running", changed_at_ms: 50 },
+        }]}
+        selectedSessionId="00000000-0000-0000-0000-000000000405"
+        newOutputSessionIds={new Set()}
+        renameDraft=""
+        canSaveRename={false}
+        onAttach={vi.fn()}
+        onStartRename={vi.fn()}
+        onRenameDraftChange={vi.fn()}
+        onSaveRename={vi.fn()}
+        onCancelRename={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Open pi work, oh-my-pi is running" }))
+      .toBeInTheDocument();
   });
 });

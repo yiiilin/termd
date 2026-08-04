@@ -172,6 +172,7 @@ const enUS = {
   "daemons.fallbackHostName": "Daemon {index} {host}",
 
   "sessions.aria": "sessions",
+  "sessions.resizePanel": "Resize sessions panel",
   "sessions.empty": "No sessions",
   "sessions.creating": "Creating session",
   "sessions.open": "Open {name}",
@@ -196,6 +197,7 @@ const enUS = {
   "sessions.activity.agent.claude_code": "Claude Code",
   "sessions.activity.agent.opencode": "OpenCode",
   "sessions.activity.agent.zcode": "ZCode",
+  "sessions.activity.agent.oh_my_pi": "oh-my-pi",
   "sessions.activity.idle": "{agent} is ready",
   "sessions.activity.running": "{agent} is running",
   "sessions.activity.attention": "{agent} needs attention",
@@ -567,6 +569,7 @@ const zhCN: Record<TranslationKey, string> = {
   "daemons.fallbackHostName": "守护进程 {index} {host}",
 
   "sessions.aria": "会话",
+  "sessions.resizePanel": "调整会话面板宽度",
   "sessions.empty": "没有会话",
   "sessions.creating": "正在创建会话",
   "sessions.open": "打开 {name}",
@@ -591,6 +594,7 @@ const zhCN: Record<TranslationKey, string> = {
   "sessions.activity.agent.claude_code": "Claude Code",
   "sessions.activity.agent.opencode": "OpenCode",
   "sessions.activity.agent.zcode": "ZCode",
+  "sessions.activity.agent.oh_my_pi": "oh-my-pi",
   "sessions.activity.idle": "{agent} 已就绪",
   "sessions.activity.running": "{agent} 正在运行",
   "sessions.activity.attention": "{agent} 需要操作",

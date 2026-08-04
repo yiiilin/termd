@@ -118,6 +118,10 @@ function LazyModalFallback({ className }: { className: string }) {
 
 const FALLBACK_WS_URL = "ws://127.0.0.1:8765/ws";
 const DEFAULT_SESSION_SIZE: TerminalSize = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+const DEFAULT_SIDEBAR_WIDTH = 248;
+const MEDIUM_SIDEBAR_WIDTH = 280;
+const MIN_SIDEBAR_WIDTH = 200;
+const MAX_SIDEBAR_WIDTH = 480;
 const DEFAULT_FILES_PANEL_WIDTH = 286;
 const MIN_FILES_PANEL_WIDTH = 240;
 const MAX_FILES_PANEL_WIDTH = 640;
@@ -534,6 +538,10 @@ export default function App() {
   const [filesPanelOpen, setFilesPanelOpen] = useState(
     () => panelDefaultsForBand(viewportBand).filesPanelOpen,
   );
+  const [sidebarWidth, setSidebarWidth] = useState(() => defaultSidebarWidthForViewport(
+    typeof window === "undefined" ? 1280 : window.innerWidth,
+  ));
+  const [isSidebarResizing, setIsSidebarResizing] = useState(false);
   const [filesPanelWidth, setFilesPanelWidth] = useState(DEFAULT_FILES_PANEL_WIDTH);
   const [isFilesPanelResizing, setIsFilesPanelResizing] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -610,6 +618,12 @@ export default function App() {
   const closingSessionIdsRef = useRef<Set<UUID>>(new Set());
   const closedSessionIdsRef = useRef<Set<UUID>>(new Set());
   const renamingSessionIdRef = useRef<UUID | undefined>(undefined);
+  const sidebarWidthRef = useRef(sidebarWidth);
+  const sidebarResizeRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startWidth: number;
+  } | null>(null);
   const filesPanelWidthRef = useRef(DEFAULT_FILES_PANEL_WIDTH);
   const filesPanelResizeRef = useRef<{
     pointerId: number;
@@ -807,7 +821,7 @@ export default function App() {
         attachReconnectTimerRef.current = undefined;
       }
       clearFileTransferProgressTimers();
-      closeWorkspaceClient();
+      closeWorkspaceClient("app_unmount");
     };
   }, [clearFileTransferProgressTimers, closeWorkspaceClient]);
 
@@ -817,12 +831,16 @@ export default function App() {
     }
     // 中文注释：空工作台保留已认证 WebSocket，New session 可直接提升它为 terminal
     // transport，避免 relay 再做一次 route/hello/auth。离开 workspace 时才回收。
-    closeWorkspaceMetadataClient();
+    closeWorkspaceMetadataClient("leave_workspace");
   }, [activeSurface, closeWorkspaceMetadataClient, workspaceClientRef]);
 
   useEffect(() => {
     renamingSessionIdRef.current = renamingSessionId;
   }, [renamingSessionId]);
+
+  useEffect(() => {
+    sidebarWidthRef.current = sidebarWidth;
+  }, [sidebarWidth]);
 
   useEffect(() => {
     filesPanelWidthRef.current = filesPanelWidth;
@@ -858,6 +876,10 @@ export default function App() {
     }
 
     const clampToViewport = () => {
+      const nextSidebarWidth = clampSidebarWidth(sidebarWidthRef.current, window.innerWidth);
+      if (nextSidebarWidth !== sidebarWidthRef.current) {
+        setSidebarWidth(nextSidebarWidth);
+      }
       const nextWidth = clampFilesPanelWidth(filesPanelWidthRef.current, window.innerWidth);
       if (nextWidth !== filesPanelWidthRef.current) {
         setFilesPanelWidth(nextWidth);
@@ -867,6 +889,42 @@ export default function App() {
     clampToViewport();
     window.addEventListener("resize", clampToViewport);
     return () => window.removeEventListener("resize", clampToViewport);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return undefined;
+    }
+
+    const finishResize = (pointerId?: number) => {
+      const drag = sidebarResizeRef.current;
+      if (!drag || (pointerId !== undefined && drag.pointerId !== pointerId)) {
+        return;
+      }
+      sidebarResizeRef.current = null;
+      setIsSidebarResizing(false);
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const drag = sidebarResizeRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      const nextWidth = clampSidebarWidth(drag.startWidth + event.clientX - drag.startX, window.innerWidth);
+      setSidebarWidth(nextWidth);
+    };
+
+    const handlePointerUp = (event: PointerEvent) => finishResize(event.pointerId);
+    const handlePointerCancel = (event: PointerEvent) => finishResize(event.pointerId);
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerCancel);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerCancel);
+    };
   }, []);
 
   useEffect(() => {
@@ -1010,17 +1068,20 @@ export default function App() {
       ? { gridTemplateColumns: `minmax(0, 1fr) ${filesPanelWidth}px` }
       : undefined;
   const mobileKeyboardOpen = mobileTerminalInputMode && activeSurface === "workspace" && visualViewportMetrics.keyboardOpen;
-  const appShellStyle = isMobileLayout
-    ? ({
-        "--termd-layout-viewport-width": `${visualViewportMetrics.width}px`,
-        "--termd-visual-viewport-width": `${visualViewportMetrics.width}px`,
-        "--termd-layout-viewport-height": `${visualViewportMetrics.height}px`,
-        "--termd-visual-viewport-height": `${visualViewportMetrics.height}px`,
-        "--termd-visual-viewport-offset-left": `${visualViewportMetrics.offsetLeft}px`,
-        "--termd-visual-viewport-offset-top": `${visualViewportMetrics.offsetTop}px`,
-        "--termd-visual-viewport-keyboard-inset": `${visualViewportMetrics.keyboardInset}px`,
-      } as CSSProperties)
-    : undefined;
+  const appShellStyle = ({
+    "--deck-sidebar-width": `${sidebarWidth}px`,
+    ...(isMobileLayout
+      ? {
+          "--termd-layout-viewport-width": `${visualViewportMetrics.width}px`,
+          "--termd-visual-viewport-width": `${visualViewportMetrics.width}px`,
+          "--termd-layout-viewport-height": `${visualViewportMetrics.height}px`,
+          "--termd-visual-viewport-height": `${visualViewportMetrics.height}px`,
+          "--termd-visual-viewport-offset-left": `${visualViewportMetrics.offsetLeft}px`,
+          "--termd-visual-viewport-offset-top": `${visualViewportMetrics.offsetTop}px`,
+          "--termd-visual-viewport-keyboard-inset": `${visualViewportMetrics.keyboardInset}px`,
+        }
+      : {}),
+  } as CSSProperties);
   const canOpenWorkspace = Boolean(activeServer && state.device) && status !== "saving_url";
   const canSaveRename = Boolean(renameDraft.trim()) && renameDraft.trim() !== renameOriginalName.trim();
   const activeDaemonLabel =
@@ -1615,7 +1676,7 @@ export default function App() {
     closedSessionIdsRef.current.clear();
     clearTerminalSnapshotRevealHistory();
     closeMetadataClient();
-    closeWorkspaceClient();
+    closeWorkspaceClient("reset_workspace");
     receiveLoopGenerationRef.current += 1;
     setSessionOrder([]);
     sessionOrderRef.current = [];
@@ -3076,10 +3137,10 @@ export default function App() {
       // 中文注释：浏览器切 offline 时，WebSocket 不一定会立刻触发 close。
       // 主动丢弃旧 transport，避免恢复后继续向半开连接写 terminal.attach/input。
       closeMetadataClient();
-      closeWorkspaceClient();
+      closeWorkspaceClient("browser_offline");
     };
 
-    const invalidateFrozenTerminalConnection = () => {
+    const invalidateFrozenTerminalConnection = (event: Event) => {
       if (
         activeSurfaceRef.current !== "workspace" ||
         !attachedSessionRef.current ||
@@ -3090,7 +3151,7 @@ export default function App() {
       }
       terminalTransportFrozenRef.current = true;
       rescuePendingTerminalOutputFlush(true);
-      closeWorkspaceClient();
+      closeWorkspaceClient(`browser_${event.type}`);
     };
 
     const resumeVisibleConnection = () => {
@@ -3124,13 +3185,20 @@ export default function App() {
               probeSize,
               TERMINAL_LIVENESS_TIMEOUT_MS,
             );
-          } catch {
+          } catch (caught) {
             if (!terminalResumeMountedRef.current) return;
+            const safeError = toSafeError(caught);
+            recordTermdDiagnostic("terminal_resume_liveness_probe_failed", {
+              clientId: probeClient.diagnosticId,
+              sessionId: probeSessionId,
+              code: safeError.code,
+              message: safeError.message,
+            }, { console: true });
             if (
               attachClientRef.current === probeClient &&
               attachedSessionRef.current === probeSessionId
             ) {
-              closeWorkspaceClient();
+              closeWorkspaceClient("resume_liveness_probe_failed");
               await handleForcedRetryConnection();
             }
             scheduleResumeMetadataRefresh();
@@ -4213,6 +4281,32 @@ export default function App() {
     handleCloseMobilePanel();
   }, [handleCloseMobilePanel]);
 
+  const handleSidebarResizePointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (isMobileLayout || sidebarCollapsed) {
+        return;
+      }
+      event.preventDefault();
+      sidebarResizeRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startWidth: sidebarWidthRef.current,
+      };
+      setIsSidebarResizing(true);
+    },
+    [isMobileLayout, sidebarCollapsed],
+  );
+
+  const handleSidebarResizeKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 48 : 16;
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
+      return;
+    }
+    event.preventDefault();
+    const delta = event.key === "ArrowRight" ? step : -step;
+    setSidebarWidth((current) => clampSidebarWidth(current + delta, window.innerWidth));
+  }, []);
+
   const handleFilesPanelResizePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       if (isMobileLayout || !showDesktopFilesPanel) {
@@ -4406,6 +4500,7 @@ export default function App() {
         "workspace-surface",
         !isMobileLayout && sidebarCollapsed ? "sidebar-is-collapsed" : "",
         connectionReady ? "connection-ready" : "",
+        isSidebarResizing ? "sidebar-resizing" : "",
         isFilesPanelResizing ? "files-panel-resizing" : "",
         mobileTerminalInputMode ? "mobile-terminal-input" : "",
         mobileKeyboardOpen ? "mobile-keyboard-open" : "",
@@ -4425,6 +4520,17 @@ export default function App() {
         />
       ) : null}
       <aside className={sidebarCollapsed ? "sidebar collapsed-sidebar" : "sidebar"}>
+        {!isMobileLayout && !sidebarCollapsed ? (
+          <div
+            className="sidebar-edge-resizer"
+            role="separator"
+            aria-label={t("sessions.resizePanel")}
+            aria-orientation="vertical"
+            tabIndex={0}
+            onPointerDown={handleSidebarResizePointerDown}
+            onKeyDown={handleSidebarResizeKeyDown}
+          />
+        ) : null}
         {sidebarCollapsed ? (
           <>
             <div className="rail-brand">
@@ -5406,6 +5512,17 @@ function useVisualViewportMetrics(enabled: boolean): { width: number; height: nu
         keyboardInset: 0,
         keyboardOpen: false,
       };
+}
+
+function defaultSidebarWidthForViewport(viewportWidth: number): number {
+  return viewportWidth > 760 && viewportWidth <= 1100
+    ? MEDIUM_SIDEBAR_WIDTH
+    : DEFAULT_SIDEBAR_WIDTH;
+}
+
+function clampSidebarWidth(width: number, viewportWidth: number): number {
+  const viewportCap = Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, viewportWidth - 420));
+  return Math.max(MIN_SIDEBAR_WIDTH, Math.min(width, viewportCap));
 }
 
 function clampFilesPanelWidth(width: number, viewportWidth: number): number {

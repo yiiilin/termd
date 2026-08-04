@@ -1,4 +1,5 @@
 import { AccessTokenManager, applicationHttpUrl } from "./access-token";
+import { recordTermdDiagnostic, termdDiagnosticContextId } from "../diagnostics";
 import { ProtocolClientError } from "./errors";
 import { buildAttachFramePayload, encodeSupervisorTerminalClientFrame } from "./supervisor-terminal";
 import type {
@@ -31,8 +32,8 @@ interface TransportLike {
   sendMetadata?: (data: string) => void;
   openTerminal(command: WorkspaceCommand): Promise<unknown>;
   sendTerminal(data: string | ArrayBufferLike | Blob | ArrayBufferView): void;
-  closeTerminal(): void;
-  close(): void;
+  closeTerminal(reason?: string): void;
+  close(reason?: string): void;
 }
 
 type JsonRequest = (path: string, payload: unknown) => Promise<any>;
@@ -87,7 +88,10 @@ async function readBlobArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
 
 export type MetadataDeliveryKind = "snapshot" | "update";
 
+let nextClientDiagnosticId = 0;
+
 export class V070Client {
+  readonly diagnosticId = `${termdDiagnosticContextId()}-client-${++nextClientDiagnosticId}`;
   readonly serverId: UUID;
   readonly deviceId: UUID;
   isClosed = false;
@@ -132,7 +136,7 @@ export class V070Client {
     this.serverId = server.server_id;
     this.deviceId = device.device_id;
     this.tokens = new AccessTokenManager(server, device);
-    this.transport = transport ?? new WorkspaceTransport(server.url, this.tokens);
+    this.transport = transport ?? new WorkspaceTransport(server.url, this.tokens, this.diagnosticId);
     this.jsonRequest = request ?? ((path, payload) => this.requestJson(path, payload));
     this.httpRequest = httpRequest ?? ((path, init) => this.requestAuthorized(path, init));
     this.transport.onMetadata = (data) => this.handleMetadata(data);
@@ -140,6 +144,11 @@ export class V070Client {
     this.transport.onMetadataClose = () => this.handleMetadataClose();
     this.transport.onTerminalClose = () => this.handleTerminalClose();
     this.tokens.onRefresh(() => this.reconnectWithRefreshedToken());
+    recordTermdDiagnostic("workspace_client_created", {
+      clientId: this.diagnosticId,
+      serverId: this.serverId,
+      deviceId: this.deviceId,
+    }, { console: true });
   }
 
   static async connect(server: PairedServerState, device: DeviceState): Promise<V070Client> {
@@ -285,13 +294,13 @@ export class V070Client {
   detachSession(sessionId: UUID): void {
     if (this.terminalSessionId !== sessionId && this.terminalOpen?.sessionId !== sessionId) return;
     this.resetTerminalState(new ProtocolClientError("connection_closed", "terminal connection closed"));
-    this.transport.closeTerminal();
+    this.transport.closeTerminal("detach_session");
   }
 
   async closeSession(sessionId: UUID): Promise<SessionClosedPayload> {
     if (this.terminalSessionId === sessionId || this.terminalOpen?.sessionId === sessionId) {
       this.resetTerminalState(new ProtocolClientError("connection_closed", "terminal connection closed"));
-      this.transport.closeTerminal();
+      this.transport.closeTerminal("close_session");
     }
     return this.jsonRequest(`/api/control/session/${sessionId}/close`, {});
   }
@@ -526,8 +535,15 @@ export class V070Client {
     for (const waiter of this.receiveWaiters.splice(0)) waiter.reject(error);
   }
 
-  close(): void {
+  close(reason = "client_close"): void {
     if (this.isClosed) return;
+    recordTermdDiagnostic("workspace_client_close_requested", {
+      clientId: this.diagnosticId,
+      reason,
+      metadataConnected: this.metadataConnected,
+      terminalSessionId: this.terminalSessionId,
+      terminalOpeningSessionId: this.terminalOpen?.sessionId,
+    }, { console: true, stack: true });
     this.isClosed = true;
     this.tokens.dispose();
     this.metadataConnectionGeneration += 1;
@@ -538,7 +554,7 @@ export class V070Client {
     this.rejectMetadataWaiters(error);
     this.rejectMetadataPingWaiters(error);
     this.resetTerminalState(new ProtocolClientError("connection_closed", "connection closed"));
-    this.transport.close();
+    this.transport.close(reason);
     this.interruptReceiveWaiters();
   }
 
@@ -593,6 +609,11 @@ export class V070Client {
 
   private reconnectWithRefreshedToken(): void {
     if (this.isClosed) return;
+    recordTermdDiagnostic("workspace_access_token_refresh_reconnect", {
+      clientId: this.diagnosticId,
+      reconnectMetadata: this.metadataConnected,
+      terminalSessionId: this.terminalSessionId,
+    }, { console: true, stack: true });
     const reconnects: Promise<unknown>[] = [];
     if (this.metadataConnected) {
       this.metadataState = undefined;
@@ -823,6 +844,12 @@ export class V070Client {
   private handleTerminalClose(): void {
     if (this.isClosed) return;
     const hadTerminal = this.terminalSessionId !== undefined || this.terminalOpen !== undefined;
+    recordTermdDiagnostic("workspace_terminal_closed", {
+      clientId: this.diagnosticId,
+      terminalSessionId: this.terminalSessionId,
+      terminalOpeningSessionId: this.terminalOpen?.sessionId,
+      hadTerminal,
+    }, { console: true });
     this.resetTerminalState(new ProtocolClientError("connection_closed", "terminal connection closed"));
     if (!hadTerminal) return;
     this.interruptReceiveWaiters();

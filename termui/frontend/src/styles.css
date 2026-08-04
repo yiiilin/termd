@@ -529,6 +529,37 @@ label {
     8px 0 24px var(--shadow-panel-edge);
 }
 
+.sidebar-edge-resizer {
+  position: absolute;
+  z-index: 5;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 10px;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.sidebar:has(.sidebar-edge-resizer:hover),
+.sidebar:has(.sidebar-edge-resizer:focus-visible),
+.sidebar-resizing .sidebar {
+  box-shadow:
+    inset -1px 0 0 var(--color-accent),
+    8px 0 24px var(--shadow-panel-edge);
+}
+
+.sidebar-edge-resizer:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+  box-shadow: none;
+}
+
+.app-shell.sidebar-resizing,
+.sidebar-resizing .sidebar {
+  cursor: col-resize;
+}
+
 .collapsed-sidebar {
   position: relative;
   padding: 8px 6px;
@@ -1855,12 +1886,16 @@ label {
 }
 
 .session-row strong {
+  min-width: 0;
+  max-width: 100%;
   display: block;
-  overflow-wrap: anywhere;
+  overflow: hidden;
   color: var(--color-text-strong);
   font-size: 13px;
   font-weight: 650;
   line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-row.has-new-output strong {
@@ -2016,6 +2051,10 @@ label {
 
 .session-activity-indicator.activity-running {
   color: var(--color-info-text);
+}
+
+.session-activity-indicator.activity-idle {
+  color: var(--color-text-muted);
 }
 
 .session-activity-indicator.activity-completed {
@@ -5053,7 +5092,7 @@ label {
 
 @media (min-width: 761px) and (max-width: 1100px) {
   .app-shell {
-    grid-template-columns: 280px minmax(0, 1fr);
+    grid-template-columns: var(--deck-sidebar-width) minmax(0, 1fr);
   }
 }
 

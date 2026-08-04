@@ -1,4 +1,5 @@
 import { ProtocolClientError } from "./errors";
+import { recordTermdDiagnostic } from "../diagnostics";
 
 function workspaceWebSocketUrl(serverUrl: string, kind: "metadata" | "terminal"): string {
   const parsed = new URL(serverUrl, globalThis.location?.href);
@@ -18,7 +19,27 @@ export interface WorkspaceCommand {
   payload: unknown;
 }
 
+interface SocketDiagnosticContext {
+  connectionId: string;
+  kind: "metadata" | "terminal";
+  createdAtMs: number;
+  generation?: number;
+  commandType?: WorkspaceCommand["type"];
+  sessionId?: string;
+}
+
+let nextWorkspaceTransportDiagnosticId = 0;
+
+function terminalCommandSessionId(command: WorkspaceCommand): string | undefined {
+  if (!command.payload || typeof command.payload !== "object") return undefined;
+  const sessionId = (command.payload as { session_id?: unknown }).session_id;
+  return typeof sessionId === "string" ? sessionId : undefined;
+}
+
 export class WorkspaceTransport {
+  private readonly diagnosticId = `transport-${++nextWorkspaceTransportDiagnosticId}`;
+  private nextSocketDiagnosticId = 0;
+  private readonly socketDiagnostics = new WeakMap<WebSocket, SocketDiagnosticContext>();
   private metadata?: WebSocket;
   private metadataOpen?: Promise<WebSocket>;
   private metadataGeneration = 0;
@@ -33,6 +54,7 @@ export class WorkspaceTransport {
   constructor(
     private readonly serverUrl: string,
     private readonly tokens: TokenProvider,
+    private readonly diagnosticOwnerId?: string,
   ) {}
 
   async connectMetadata(): Promise<WebSocket> {
@@ -46,7 +68,7 @@ export class WorkspaceTransport {
     const opening = this.open("metadata", (data) => this.onMetadata?.(data))
       .then((socket) => {
         if (generation !== this.metadataGeneration) {
-          socket.close();
+          this.requestSocketClose(socket, "metadata_superseded_after_open");
           throw new Error("metadata websocket was superseded");
         }
         this.metadata = socket;
@@ -71,7 +93,7 @@ export class WorkspaceTransport {
     const socket = this.metadata;
     this.metadata = undefined;
     this.metadataOpen = undefined;
-    socket?.close();
+    if (socket) this.requestSocketClose(socket, "metadata_reconnect");
     return this.connectMetadata();
   }
 
@@ -83,7 +105,7 @@ export class WorkspaceTransport {
   }
 
   async openTerminal(command: WorkspaceCommand): Promise<WebSocket> {
-    this.closeTerminal();
+    this.closeTerminal(`replace_for_${command.type}`);
     const generation = this.terminalGeneration;
     let socket: WebSocket;
     try {
@@ -96,10 +118,15 @@ export class WorkspaceTransport {
         },
         (opening) => {
           if (generation !== this.terminalGeneration) {
-            opening.close();
+            this.requestSocketClose(opening, "terminal_superseded_on_create");
             return;
           }
           this.terminalOpening = opening;
+        },
+        {
+          generation,
+          commandType: command.type,
+          sessionId: terminalCommandSessionId(command),
         },
       );
     } catch (caught) {
@@ -111,7 +138,7 @@ export class WorkspaceTransport {
     }
     if (this.terminalOpening === socket) this.terminalOpening = undefined;
     if (generation !== this.terminalGeneration) {
-      socket.close();
+      this.requestSocketClose(socket, "terminal_superseded_after_open");
       throw new ProtocolClientError("stale_connection", "terminal websocket was superseded");
     }
     this.terminal = socket;
@@ -121,6 +148,7 @@ export class WorkspaceTransport {
       this.onTerminalClose?.();
     };
     socket.send(JSON.stringify(command));
+    this.recordSocketDiagnostic("terminal_command_sent", socket);
     return socket;
   }
 
@@ -131,33 +159,58 @@ export class WorkspaceTransport {
     this.terminal.send(data);
   }
 
-  closeTerminal(): void {
+  closeTerminal(reason = "terminal_close_requested"): void {
     this.terminalGeneration += 1;
     const socket = this.terminal;
     const opening = this.terminalOpening;
     this.terminal = undefined;
     this.terminalOpening = undefined;
-    opening?.close();
+    if (opening) this.requestSocketClose(opening, reason, true);
     if (socket === opening) return;
-    socket?.close();
+    if (socket) this.requestSocketClose(socket, reason, true);
   }
 
-  close(): void {
-    this.closeTerminal();
+  close(reason = "transport_close_requested"): void {
+    this.closeTerminal(reason);
     this.metadataGeneration += 1;
     const socket = this.metadata;
     this.metadata = undefined;
     this.metadataOpen = undefined;
-    socket?.close();
+    if (socket) this.requestSocketClose(socket, reason);
   }
 
   private async open(
     kind: "metadata" | "terminal",
     receive: (data: unknown, socket: WebSocket) => void,
     onCreated?: (socket: WebSocket) => void,
+    diagnosticFields: Partial<Pick<SocketDiagnosticContext, "generation" | "commandType" | "sessionId">> = {},
   ): Promise<WebSocket> {
     const token = await this.tokens.get();
     const socket = new WebSocket(workspaceWebSocketUrl(this.serverUrl, kind), ["termd.v0.7", token]);
+    const context: SocketDiagnosticContext = {
+      connectionId: `${this.diagnosticId}-socket-${++this.nextSocketDiagnosticId}`,
+      kind,
+      createdAtMs: Date.now(),
+      ...diagnosticFields,
+    };
+    this.socketDiagnostics.set(socket, context);
+    this.recordSocketDiagnostic(`${kind}_socket_created`, socket);
+    socket.addEventListener("open", () => {
+      this.recordSocketDiagnostic(`${kind}_socket_opened`, socket);
+    });
+    socket.addEventListener("error", () => {
+      this.recordSocketDiagnostic(`${kind}_socket_error`, socket, {
+        readyState: socket.readyState,
+      });
+    });
+    socket.addEventListener("close", (event) => {
+      this.recordSocketDiagnostic(`${kind}_socket_closed`, socket, {
+        code: event.code,
+        reason: event.reason || undefined,
+        wasClean: event.wasClean,
+        lifetimeMs: Math.max(0, Date.now() - context.createdAtMs),
+      });
+    });
     socket.binaryType = "arraybuffer";
     socket.onmessage = (event) => receive(event.data, socket);
     await new Promise<void>((resolve, reject) => {
@@ -168,5 +221,36 @@ export class WorkspaceTransport {
     });
     socket.onclose = null;
     return socket;
+  }
+
+  private requestSocketClose(socket: WebSocket, reason: string, stack = false): void {
+    this.recordSocketDiagnostic(`${this.socketDiagnostics.get(socket)?.kind ?? "workspace"}_socket_close_requested`, socket, {
+      reason,
+      readyState: socket.readyState,
+    }, stack);
+    socket.close();
+  }
+
+  private recordSocketDiagnostic(
+    name: string,
+    socket: WebSocket,
+    fields: Record<string, unknown> = {},
+    stack = false,
+  ): void {
+    const context = this.socketDiagnostics.get(socket);
+    recordTermdDiagnostic(name, {
+      transportId: this.diagnosticId,
+      ownerId: this.diagnosticOwnerId,
+      connectionId: context?.connectionId,
+      generation: context?.generation,
+      commandType: context?.commandType,
+      sessionId: context?.sessionId,
+      visibilityState: typeof document === "undefined" ? undefined : document.visibilityState,
+      browserOnline: typeof navigator === "undefined" ? undefined : navigator.onLine,
+      ...fields,
+    }, {
+      console: context?.kind === "terminal",
+      stack,
+    });
   }
 }

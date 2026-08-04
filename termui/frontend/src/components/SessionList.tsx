@@ -1,5 +1,6 @@
 import {
   Check,
+  Circle,
   CircleAlert,
   CircleCheck,
   FolderPlus,
@@ -71,15 +72,17 @@ function SessionVisual(props: {
 
 function SessionActivityIndicator(props: { activity?: SessionAiActivityPayload | null }) {
   const { t } = useI18n();
-  if (!props.activity || props.activity.state === "idle") {
+  if (!props.activity) {
     return null;
   }
   const activityLabel = sessionActivityLabel(t, props.activity);
-  const ActivityIcon = props.activity.state === "running"
-    ? LoaderCircle
-    : props.activity.state === "attention"
-      ? CircleAlert
-      : CircleCheck;
+  const ActivityIcon = props.activity.state === "idle"
+    ? Circle
+    : props.activity.state === "running"
+      ? LoaderCircle
+      : props.activity.state === "attention"
+        ? CircleAlert
+        : CircleCheck;
   return (
     <span
       className={[
@@ -530,7 +533,7 @@ export function SessionList(props: SessionListProps) {
                       moveSessionByOffset(session.session_id, event.key === "ArrowUp" ? -1 : 1);
                     }}
                   >
-                    <strong>{displayName}</strong>
+                    <strong title={displayName}>{displayName}</strong>
                     <SessionActivityIndicator activity={session.activity} />
                   </button>
                 )}

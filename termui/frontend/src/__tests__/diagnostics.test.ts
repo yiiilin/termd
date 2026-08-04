@@ -33,4 +33,21 @@ describe("诊断事件", () => {
     expect(JSON.stringify(event)).not.toContain("terminal-password");
     expect(JSON.stringify(consoleDebug.mock.calls)).not.toContain("terminal-password");
   });
+
+  it("关键连接事件可在未开启完整 trace 时直接输出到 console", () => {
+    const consoleInfo = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+    recordTermdDiagnostic("terminal_socket_closed", {
+      connectionId: "terminal-1",
+      preview: "must-not-leak",
+      code: 1006,
+    }, { console: true });
+
+    expect(testDiagnostics().__TERMD_DIAG_EVENTS__).toBeUndefined();
+    expect(consoleInfo).toHaveBeenCalledWith(
+      "[termd-terminal]",
+      "terminal_socket_closed",
+      { connectionId: "terminal-1", code: 1006 },
+    );
+  });
 });

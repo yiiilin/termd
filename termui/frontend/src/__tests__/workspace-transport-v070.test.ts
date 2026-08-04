@@ -7,19 +7,41 @@ class FakeSocket {
   readyState = 0;
   onopen?: () => void;
   onmessage?: (event: { data: unknown }) => void;
-  onclose?: () => void;
+  onclose?: (event: { code: number; reason: string; wasClean: boolean }) => void;
   onerror?: () => void;
   sent: unknown[] = [];
+  private readonly listeners = new Map<string, Set<(event: any) => void>>();
 
   constructor(public readonly url: string, public readonly protocols: string[]) {
     FakeSocket.instances.push(this);
     if (FakeSocket.autoOpen) queueMicrotask(() => this.open());
   }
 
-  open() { this.readyState = 1; this.onopen?.(); }
+  addEventListener(type: string, listener: (event: any) => void) {
+    const listeners = this.listeners.get(type) ?? new Set<(event: any) => void>();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+  private dispatch(type: string, event: any) {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+  open() {
+    this.readyState = 1;
+    this.dispatch("open", {});
+    this.onopen?.();
+  }
   receive(value: unknown) { this.onmessage?.({ data: value }); }
   send(value: unknown) { this.sent.push(value); }
-  close() { this.readyState = 3; this.onclose?.(); }
+  close(code = 1000, reason = "", wasClean = true) {
+    this.readyState = 3;
+    const event = { code, reason, wasClean };
+    this.dispatch("close", event);
+    this.onclose?.(event);
+  }
+  fail() {
+    this.dispatch("error", {});
+    this.onerror?.();
+  }
 }
 
 describe("WorkspaceTransport v0.7", () => {
@@ -129,5 +151,35 @@ describe("WorkspaceTransport v0.7", () => {
 
     expect(openingSocket.readyState).toBe(3);
     await expect(pending).rejects.toMatchObject({ code: "stale_connection" });
+  });
+
+  it("logs terminal socket identity, explicit close cause, and native close details", async () => {
+    FakeSocket.instances = [];
+    FakeSocket.autoOpen = true;
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const consoleInfo = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const transport = new WorkspaceTransport(
+      "wss://relay.example/ws?server_id=server-a",
+      { get: vi.fn(async () => "header.claims.signature") },
+      "client-7",
+    );
+
+    await transport.openTerminal({ type: "terminal.attach", payload: { session_id: "session-a" } });
+    transport.closeTerminal("test_manual_close");
+
+    const lifecycle = consoleInfo.mock.calls.map((call) => ({
+      name: call[1],
+      fields: call[2] as Record<string, unknown>,
+    }));
+    const created = lifecycle.find((event) => event.name === "terminal_socket_created");
+    expect(created?.fields).toMatchObject({
+      ownerId: "client-7",
+      commandType: "terminal.attach",
+      sessionId: "session-a",
+    });
+    expect(lifecycle.find((event) => event.name === "terminal_socket_close_requested")?.fields)
+      .toMatchObject({ reason: "test_manual_close", connectionId: created?.fields.connectionId });
+    expect(lifecycle.find((event) => event.name === "terminal_socket_closed")?.fields)
+      .toMatchObject({ code: 1000, wasClean: true, connectionId: created?.fields.connectionId });
   });
 });

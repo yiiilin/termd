@@ -1,6 +1,7 @@
 const TRACE_STORAGE_KEY = "termd.debug.trace";
 const TRACE_CONSOLE_STORAGE_KEY = "termd.debug.trace.console";
 const MAX_TRACE_EVENTS = 5000;
+const DIAGNOSTIC_CONTEXT_ID = `page-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 export interface TermdDiagnosticEvent {
   t: number;
@@ -32,6 +33,10 @@ interface TermdDiagnosticGlobal {
   __TERMD_DIAG_EVENTS__?: TermdDiagnosticEvent[];
 }
 
+export function termdDiagnosticContextId(): string {
+  return DIAGNOSTIC_CONTEXT_ID;
+}
+
 function traceGlobal(): TermdDiagnosticGlobal {
   return globalThis as TermdDiagnosticGlobal;
 }
@@ -56,14 +61,12 @@ function traceConsoleEnabled(): boolean {
 export function recordTermdDiagnostic(
   name: string,
   fields?: Record<string, unknown>,
-  options: { stack?: boolean } = {},
+  options: { stack?: boolean; console?: boolean } = {},
 ): void {
-  if (!traceEnabled()) {
+  const shouldTrace = traceEnabled();
+  if (!shouldTrace && !options.console) {
     return;
   }
-  const target = traceGlobal();
-  const events = target.__TERMD_DIAG_EVENTS__ ?? [];
-  target.__TERMD_DIAG_EVENTS__ = events;
   const safeFields = fields ? sanitizeDiagnosticFields(fields) : undefined;
   const event: TermdDiagnosticEvent = {
     t: typeof performance === "undefined" ? Date.now() : performance.now(),
@@ -71,14 +74,25 @@ export function recordTermdDiagnostic(
     ...(safeFields ? { fields: safeFields } : {}),
     ...(options.stack ? { stack: new Error(name).stack } : {}),
   };
-  events.push(event);
-  if (events.length > MAX_TRACE_EVENTS) {
-    events.splice(0, events.length - MAX_TRACE_EVENTS);
+  if (shouldTrace) {
+    const target = traceGlobal();
+    const events = target.__TERMD_DIAG_EVENTS__ ?? [];
+    target.__TERMD_DIAG_EVENTS__ = events;
+    events.push(event);
+    if (events.length > MAX_TRACE_EVENTS) {
+      events.splice(0, events.length - MAX_TRACE_EVENTS);
+    }
   }
-  if (traceConsoleEnabled()) {
+  if (options.console || traceConsoleEnabled()) {
     // 中文注释：诊断日志默认只保存在内存数组里；显式开启 console 开关时才打印。
-    // eslint-disable-next-line no-console
-    console.debug("[termd-trace]", name, safeFields ?? {});
+    // terminal 连接边界会强制输出，便于现场区分主动替换、服务端 close 和网络断开。
+    if (options.console) {
+      // eslint-disable-next-line no-console
+      console.info("[termd-terminal]", name, safeFields ?? {}, ...(event.stack ? [event.stack] : []));
+    } else {
+      // eslint-disable-next-line no-console
+      console.debug("[termd-trace]", name, safeFields ?? {}, ...(event.stack ? [event.stack] : []));
+    }
   }
 }
 

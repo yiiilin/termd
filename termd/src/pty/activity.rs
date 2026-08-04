@@ -217,11 +217,45 @@ impl SessionActivityDetector {
         if agent == SessionActivityAgent::Codex {
             return self.observe_codex_title(title, now_ms);
         }
+        if agent == SessionActivityAgent::OhMyPi {
+            return self.observe_oh_my_pi_title(title, now_ms);
+        }
 
         match self.activity {
             Some(activity) if activity.agent == agent => false,
             _ => self.transition(agent, SessionActivityState::Idle, now_ms),
         }
+    }
+
+    fn observe_oh_my_pi_title(&mut self, title: &[u8], now_ms: u64) -> bool {
+        let Ok(title) = std::str::from_utf8(title) else {
+            return false;
+        };
+        let Some(marker) = title
+            .trim()
+            .strip_prefix("\u{03c0} ")
+            .and_then(|suffix| suffix.chars().next())
+        else {
+            return false;
+        };
+        if ('\u{2800}'..='\u{28ff}').contains(&marker) {
+            return self.transition(
+                SessionActivityAgent::OhMyPi,
+                SessionActivityState::Running,
+                now_ms,
+            );
+        }
+        if marker == '!' {
+            return self.transition(
+                SessionActivityAgent::OhMyPi,
+                SessionActivityState::Attention,
+                now_ms,
+            );
+        }
+        if marker == '>' {
+            return self.finish_or_idle(SessionActivityAgent::OhMyPi, now_ms);
+        }
+        false
     }
 
     fn observe_codex_title(&mut self, title: &[u8], now_ms: u64) -> bool {
@@ -440,6 +474,7 @@ fn agent_for_executable_name(name: &[u8]) -> Option<SessionActivityAgent> {
         b"claude" => Some(SessionActivityAgent::ClaudeCode),
         b"opencode" => Some(SessionActivityAgent::OpenCode),
         b"zcode" | b"zcode-cli" => Some(SessionActivityAgent::ZCode),
+        b"omp" => Some(SessionActivityAgent::OhMyPi),
         _ => None,
     }
 }
@@ -876,6 +911,51 @@ mod tests {
     }
 
     #[test]
+    fn oh_my_pi_braille_title_reports_running() {
+        let mut detector = SessionActivityDetector::default();
+        let oh_my_pi = || ForegroundProcess::Agent(SessionActivityAgent::OhMyPi);
+
+        assert!(detector.observe_output(b"\x1b]0;\xcf\x80 \xe2\xa0\x8b repo\x07", 100, oh_my_pi,));
+        assert_eq!(
+            detector
+                .activity()
+                .map(|activity| (activity.agent, activity.state)),
+            Some((SessionActivityAgent::OhMyPi, SessionActivityState::Running,))
+        );
+    }
+
+    #[test]
+    fn oh_my_pi_bang_title_reports_attention() {
+        let mut detector = SessionActivityDetector::default();
+        let oh_my_pi = || ForegroundProcess::Agent(SessionActivityAgent::OhMyPi);
+
+        assert!(detector.observe_output(b"\x1b]0;\xcf\x80 \xe2\xa0\x8b repo\x07", 100, oh_my_pi,));
+        assert!(detector.observe_output(b"\x1b]0;\xcf\x80 ! repo\x07", 201, oh_my_pi));
+        assert_eq!(
+            detector.activity().map(|activity| activity.state),
+            Some(SessionActivityState::Attention)
+        );
+    }
+
+    #[test]
+    fn oh_my_pi_prompt_title_finishes_active_state() {
+        for active_title in [
+            b"\x1b]0;\xcf\x80 \xe2\xa0\x8b repo\x07".as_slice(),
+            b"\x1b]0;\xcf\x80 ! repo\x07".as_slice(),
+        ] {
+            let mut detector = SessionActivityDetector::default();
+            let oh_my_pi = || ForegroundProcess::Agent(SessionActivityAgent::OhMyPi);
+
+            assert!(detector.observe_output(active_title, 100, oh_my_pi));
+            assert!(detector.observe_output(b"\x1b]0;\xcf\x80 > repo\x07", 201, oh_my_pi));
+            assert_eq!(
+                detector.activity().map(|activity| activity.state),
+                Some(SessionActivityState::Completed)
+            );
+        }
+    }
+
+    #[test]
     fn initial_plain_output_recognizes_non_codex_agent_as_idle() {
         let mut detector = SessionActivityDetector::default();
         assert!(detector.observe_output(b"plain startup output", 100, || {
@@ -1176,6 +1256,14 @@ mod tests {
                 SessionActivityAgent::ZCode,
             ),
             (b"bunx\0zcode-cli\0".as_slice(), SessionActivityAgent::ZCode),
+            (
+                b"/usr/local/bin/omp\0".as_slice(),
+                SessionActivityAgent::OhMyPi,
+            ),
+            (
+                b"bun\0/root/.bun/bin/omp\0".as_slice(),
+                SessionActivityAgent::OhMyPi,
+            ),
         ] {
             assert_eq!(agent_for_cmdline(cmdline), Some(expected));
         }

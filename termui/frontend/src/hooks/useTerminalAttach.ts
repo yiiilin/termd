@@ -528,8 +528,19 @@ export function useTerminalReceiveLoop(
               }
             } else if (frame.type === "heartbeat_ping") {
               throwIfLoopStale();
+              recordTermdDiagnostic("terminal_heartbeat_ping", {
+                clientId: client.diagnosticId,
+                sessionId: payload.session_id,
+                nonce: frame.nonce,
+              }, { console: true });
               client.sendSupervisorTerminalHeartbeatPong(payload.session_id, frame.nonce);
             } else if (frame.type === "close") {
+              recordTermdDiagnostic("terminal_supervisor_close", {
+                clientId: client.diagnosticId,
+                sessionId: payload.session_id,
+                reason: frame.reason,
+                message: frame.message,
+              }, { console: true });
               throw new ProtocolClientError(frame.reason, frame.message ?? frame.reason);
             }
           } else if (inner.type === "session_activity") {
@@ -590,11 +601,12 @@ export function useTerminalReceiveLoop(
             const sessionId = attachedSessionRef.current;
             const safeError = toSafeError(caught);
             recordTermdDiagnostic("receive_loop_error", {
+              clientId: client.diagnosticId,
               loopGeneration,
               attachedSessionId: sessionId,
               code: safeError.code,
               message: safeError.message,
-            });
+            }, { console: true });
             if (sessionId && isIgnoredClosingSessionError(sessionId, caught)) {
               recordReceiveLoopEnd("error", {
                 code: safeError.code,
@@ -727,7 +739,8 @@ export function useTerminalReconnectScheduler(
       attachedSessionId: attachedSessionRef.current,
       selectedSessionId: options.selectedSessionId,
       userDetached: userDetachedRef.current,
-    }, { stack: true });
+      staleClientId: staleClient.diagnosticId,
+    }, { stack: true, console: true });
     if (userDetachedRef.current || !options.isRetryableConnectionError(caught)) {
       recordTermdDiagnostic("reconnect_rejected", {
         code: safeCaught.code,
@@ -823,7 +836,7 @@ export function useTerminalReconnectScheduler(
       snapshotToken,
       revealHistory: reconnectOptions.revealHistory,
       attempt: attachReconnectAttemptsRef.current,
-    });
+    }, { console: true });
 
     if (options.isTerminalTransportPaused()) {
       // 中文注释：offline 期间不主动建新 WebSocket；恢复事件会按当前
@@ -872,7 +885,7 @@ export function useTerminalReconnectScheduler(
             sessionId,
             lastTerminalSeq,
             snapshotToken,
-          });
+          }, { console: true });
           if (options.isTerminalTransportPaused() || isBrowserOffline()) {
             clearCurrentSnapshotIntent();
             options.setStatus("ready");
@@ -912,12 +925,13 @@ export function useTerminalReconnectScheduler(
           pendingTerminalAttachSessionRef.current = sessionId;
           const attached = await client.attachSession(sessionId);
           recordTermdDiagnostic("reconnect_attach_ack", {
+            clientId: client.diagnosticId,
             reconnectKey,
             sessionId,
             lastTerminalSeq,
             attachedSize: attached.size,
             snapshotToken,
-          });
+          }, { console: true });
           if (!isCurrentReconnect()) {
             clearCurrentSnapshotIntent();
             client.detachSession(sessionId);
@@ -1015,7 +1029,7 @@ export function useTerminalReconnectScheduler(
             code: toSafeError(retryError).code,
             message: toSafeError(retryError).message,
             snapshotToken,
-          });
+          }, { console: true });
           if (!controller.attachReconnectHandlerRef.current(staleClient, retryError, {
             lastTerminalSeq,
             forceFullSnapshot: lastTerminalSeq === undefined,

@@ -717,6 +717,7 @@ pub enum SessionActivityAgent {
     OpenCode,
     #[serde(rename = "zcode")]
     ZCode,
+    OhMyPi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2722,6 +2723,7 @@ mod tests {
             (SessionActivityAgent::ClaudeCode, "claude_code"),
             (SessionActivityAgent::OpenCode, "opencode"),
             (SessionActivityAgent::ZCode, "zcode"),
+            (SessionActivityAgent::OhMyPi, "oh_my_pi"),
         ] {
             let with_activity = SessionSummaryPayload {
                 activity: Some(SessionAiActivityPayload {

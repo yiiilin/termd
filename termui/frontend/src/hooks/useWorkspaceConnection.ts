@@ -60,7 +60,7 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
   const connectionAutoRetryKeyRef = useRef<string | undefined>(undefined);
   const connectionAutoRetryAttemptsRef = useRef(0);
 
-  const closeWorkspaceMetadataClient = useCallback(() => {
+  const closeWorkspaceMetadataClient = useCallback((reason = "workspace_metadata_close") => {
     workspaceClientGenerationRef.current += 1;
     workspaceClientAbortControllerRef.current?.abort();
     workspaceClientAbortControllerRef.current = undefined;
@@ -69,7 +69,7 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
     workspaceClientRef.current = undefined;
     if (workspaceClient) {
       workspaceClient.interruptReceiveWaiters();
-      workspaceClient.close();
+      workspaceClient.close(reason);
     }
   }, []);
 
@@ -102,19 +102,19 @@ export function useWorkspaceConnection(options: UseWorkspaceConnectionOptions) {
     options.receiveLoopGenerationRef,
   ]);
 
-  const closeWorkspaceClient = useCallback(() => {
+  const closeWorkspaceClient = useCallback((reason = "workspace_close") => {
     const clients = new Set([
       workspaceClientRef.current,
       pendingAttachClientRef.current,
       attachClientRef.current,
     ].filter((client): client is V070Client => Boolean(client)));
-    closeWorkspaceMetadataClient();
+    closeWorkspaceMetadataClient(reason);
     options.receiveLoopActiveRef.current = false;
     options.receiveLoopGenerationRef.current += 1;
     pendingAttachClientRef.current = undefined;
     attachClientRef.current = undefined;
     options.pendingTerminalAttachSessionRef.current = undefined;
-    for (const client of clients) client.close();
+    for (const client of clients) client.close(reason);
   }, [
     closeWorkspaceMetadataClient,
     options.pendingTerminalAttachSessionRef,

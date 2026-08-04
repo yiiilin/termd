@@ -94,6 +94,73 @@ test.beforeEach(async ({ page }) => {
   await resetBrowserState(page);
 });
 
+test("desktop session titles stay on one line and the sidebar resizes from its edge", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "chromium", "该回归只需要桌面 Chromium 覆盖");
+  await page.setViewportSize({ width: 1366, height: 768 });
+
+  const sessionId = "00000000-0000-0000-0000-0000000005f3";
+  const sessionName = "production-session-with-a-title-that-is-intentionally-too-long-for-the-sidebar";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: sessionId,
+        name: sessionName,
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "sidebar-resize-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expect.poll(() => daemon.attachedSessions).toEqual([sessionId]);
+
+    const sessionTitle = page.locator(".session-row strong", { hasText: sessionName });
+    await expect(sessionTitle).toHaveAttribute("title", sessionName);
+    const titleLayout = await sessionTitle.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return {
+        clientHeight: element.clientHeight,
+        clientWidth: element.clientWidth,
+        lineHeight: Number.parseFloat(style.lineHeight),
+        overflow: style.overflow,
+        scrollWidth: element.scrollWidth,
+        textOverflow: style.textOverflow,
+        whiteSpace: style.whiteSpace,
+      };
+    });
+    expect(titleLayout.whiteSpace).toBe("nowrap");
+    expect(titleLayout.overflow).toBe("hidden");
+    expect(titleLayout.textOverflow).toBe("ellipsis");
+    expect(titleLayout.scrollWidth).toBeGreaterThan(titleLayout.clientWidth);
+    expect(titleLayout.clientHeight).toBeLessThanOrEqual(titleLayout.lineHeight + 1);
+
+    const sidebar = page.locator(".sidebar");
+    const resizer = page.getByRole("separator", { name: "Resize sessions panel" });
+    const sidebarBefore = await sidebar.boundingBox();
+    const resizerBox = await resizer.boundingBox();
+    expect(sidebarBefore).not.toBeNull();
+    expect(resizerBox).not.toBeNull();
+    expect(resizerBox!.width).toBeCloseTo(10, 0);
+    expect(resizerBox!.x + resizerBox!.width).toBeCloseTo(sidebarBefore!.x + sidebarBefore!.width, 0);
+
+    await page.mouse.move(resizerBox!.x + resizerBox!.width / 2, resizerBox!.y + 80);
+    await page.mouse.down();
+    await page.mouse.move(resizerBox!.x + resizerBox!.width / 2 + 96, resizerBox!.y + 80);
+    await page.mouse.up();
+
+    await expect.poll(async () => (await sidebar.boundingBox())?.width).toBeCloseTo(sidebarBefore!.width + 96, 0);
+    await expect(page.locator(".app-shell")).not.toHaveClass(/sidebar-resizing/);
+  } finally {
+    await daemon.stop();
+  }
+});
+
 test("narrow mobile workspace menu stays compact and touch-operable", async ({ page }, testInfo: TestInfo) => {
   test.skip(testInfo.project.name !== "mobile-chrome", "该回归只需要移动端项目覆盖");
   await page.setViewportSize({ width: 320, height: 568 });

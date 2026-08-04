@@ -103,7 +103,7 @@ export type SessionState = "created" | "running" | "closed";
 export type AttachRole = "operator";
 
 export type SessionAiActivityState = "idle" | "running" | "attention" | "completed";
-export type SessionAiActivityAgent = "codex" | "claude_code" | "opencode" | "zcode";
+export type SessionAiActivityAgent = "codex" | "claude_code" | "opencode" | "zcode" | "oh_my_pi";
 
 export interface SessionAiActivityPayload {
   kind: "ai";
