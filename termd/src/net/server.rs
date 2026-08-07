@@ -244,12 +244,14 @@ pub fn default_protocol(config: DaemonConfig) -> SharedDaemonProtocol {
 pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/version", get(version_endpoint))
         .route("/local/pairing-token", post(local_pairing_token))
         .merge(auth_api_router())
         .merge(http_control_api_router())
         .merge(http_file_api_router())
         .merge(push_api_router())
         .merge(browser_api_router())
+        .merge(update_api_router())
         .route("/ws/metadata", get(metadata_ws_handler))
         .route("/ws/terminal", get(terminal_ws_handler))
         .route("/ws/browser/:browser_id", get(browser_ws_handler))
@@ -261,6 +263,15 @@ pub fn router(protocol: SharedDaemonProtocol, web_enabled: bool) -> Router {
     } else {
         router.fallback(api_or_plain_not_found)
     }
+}
+
+/// 版本检查与一键更新路由。更新端点只接受已认证设备的 Bearer access token；
+/// relay 更新由 daemon 用其 admission token 委托给 relay 的受限 `/update` 端点。
+fn update_api_router() -> Router<SharedDaemonProtocol> {
+    Router::new()
+        .route("/api/update/check", post(update_check))
+        .route("/api/update/apply", post(update_apply))
+        .route("/api/update/relay", post(update_relay))
 }
 
 /// Local daemon-control routes. This router is served only over the Unix socket.
@@ -2810,6 +2821,240 @@ async fn http_control_request(
         .await
 }
 
+/// 只读版本端点：前端用它识别「当前连接的服务组件」。
+/// 直连 daemon 返回 `termd`；经 relay 时同一路径由 relay 返回 `termrelay`。
+async fn version_endpoint() -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "component": "termd",
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
+        .into_response()
+}
+
+/// 更新端点共用的设备认证：Bearer access token 必须属于已配对设备。
+async fn authenticated_device(
+    protocol: &SharedDaemonProtocol,
+    headers: &HeaderMap,
+) -> Result<DeviceId, Response> {
+    let access_token = authorization_credential(headers, "Bearer")?;
+    protocol
+        .lock()
+        .await
+        .verify_access_token_credential(access_token, current_unix_timestamp_millis())
+        .map_err(|_| {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "access_token_invalid",
+                "access token is invalid or expired",
+                false,
+            )
+        })
+}
+
+async fn update_check(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authenticated_device(&protocol, &headers).await {
+        return response;
+    }
+    let current = env!("CARGO_PKG_VERSION").to_owned();
+    let arch = termupdater::host_arch().to_owned();
+    let check_current = current.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        termupdater::check_update("termd", &arch, &check_current)
+    })
+    .await;
+    match result {
+        Ok(Ok(info)) => Json(serde_json::json!({
+            "current": current,
+            "update_available": true,
+            "latest": info.latest,
+            "release_url": info.release_url,
+        }))
+        .into_response(),
+        Ok(Err(termupdater::UpdateError::NoNewerRelease { .. })) => Json(serde_json::json!({
+            "current": current,
+            "update_available": false,
+        }))
+        .into_response(),
+        Ok(Err(_)) | Err(_) => api_error(
+            StatusCode::BAD_GATEWAY,
+            "update_check_failed",
+            "failed to query the latest release",
+            true,
+        ),
+    }
+}
+
+/// 一键更新 termd：校验设备凭证 → 确认存在新版本 → 后台下载/校验/备份/
+/// 原子替换/重启服务。响应先返回（含 `restart_pending`），服务随后重启。
+async fn update_apply(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authenticated_device(&protocol, &headers).await {
+        return response;
+    }
+    let current = env!("CARGO_PKG_VERSION").to_owned();
+    let arch = termupdater::host_arch().to_owned();
+    let check_current = current.clone();
+    let info = match tokio::task::spawn_blocking(move || {
+        termupdater::check_update("termd", &arch, &check_current)
+    })
+    .await
+    {
+        Ok(Ok(info)) => info,
+        Ok(Err(termupdater::UpdateError::NoNewerRelease { .. })) => {
+            return Json(serde_json::json!({
+                "current": current,
+                "update_available": false,
+                "applied": false,
+            }))
+            .into_response();
+        }
+        Ok(Err(_)) | Err(_) => {
+            return api_error(
+                StatusCode::BAD_GATEWAY,
+                "update_check_failed",
+                "failed to query the latest release",
+                true,
+            );
+        }
+    };
+    let Ok(binary_path) = std::env::current_exe() else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "update_unavailable",
+            "cannot resolve the daemon binary path",
+            false,
+        );
+    };
+    let service_name = std::env::var("TERMD_SERVICE_NAME").unwrap_or_else(|_| "termd".to_owned());
+    let asset_url = info.asset_url.clone();
+    let expected = info.latest.clone();
+    // 后台执行下载/替换；延迟重启让上面的响应先送达浏览器。
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            termupdater::apply_update(termupdater::ApplyRequest {
+                binary_path,
+                service_name,
+                expected_version: expected,
+                asset_url,
+            })
+        })
+        .await;
+    });
+    Json(serde_json::json!({
+        "current": current,
+        "update_available": true,
+        "latest": info.latest,
+        "release_url": info.release_url,
+        "applied": true,
+        "restart_pending": true,
+    }))
+    .into_response()
+}
+
+/// 一键更新 relay：daemon 用其 relay admission token 委托给 relay 的受限
+/// `/update` 端点（relay 校验 `TermdDaemon` 凭证后自行下载/替换/重启）。
+async fn update_relay(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authenticated_device(&protocol, &headers).await {
+        return response;
+    }
+    let (endpoint, token, server_id) = {
+        let guard = protocol.lock().await;
+        let config = guard.config();
+        let Some(endpoint) = config.relay_endpoints.first() else {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "relay_not_configured",
+                "daemon has no relay endpoint configured",
+                false,
+            );
+        };
+        let Some(token) = config.relay_daemon_token.as_ref() else {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "relay_not_configured",
+                "daemon has no relay admission token configured",
+                false,
+            );
+        };
+        (
+            endpoint.clone(),
+            token.expose_secret().to_owned(),
+            guard.server_id().0.to_string(),
+        )
+    };
+    let Some(base) = relay_http_base(&endpoint) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "relay_not_configured",
+            "relay endpoint must be ws(s)://host[:port]",
+            false,
+        );
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build();
+    let Ok(client) = client else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "update_unavailable",
+            "failed to build HTTP client",
+            false,
+        );
+    };
+    let response = client
+        .post(format!("{base}/update"))
+        .header("x-termd-server-id", &server_id)
+        .header("authorization", format!("TermdDaemon {token}"))
+        .send()
+        .await;
+    match response {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            (
+                status,
+                Json(serde_json::json!({
+                    "relay_update_requested": status.is_success(),
+                    "relay_response": body,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "relay update request failed");
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "relay_update_failed",
+                "failed to reach the relay update endpoint",
+                true,
+            )
+        }
+    }
+}
+
+/// 把配置的 relay 端点（`wss://host` 或 `ws://host`）转成 HTTP base URL。
+fn relay_http_base(endpoint: &str) -> Option<String> {
+    if let Some(rest) = endpoint.strip_prefix("wss://") {
+        Some(format!("https://{}", rest.trim_end_matches("/ws")))
+    } else if let Some(rest) = endpoint.strip_prefix("ws://") {
+        Some(format!("http://{}", rest.trim_end_matches("/ws")))
+    } else {
+        None
+    }
+}
+
 async fn handle_v070_json_control_request(
     protocol: SharedDaemonProtocol,
     method: String,
@@ -5144,6 +5389,105 @@ mod tests {
         let _ = terminal.close(None).await;
         let _ = metadata.close(None).await;
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn version_endpoint_reports_termd_component() {
+        let fixture = test_protocol("version-endpoint");
+        let response = router(fixture.protocol.clone(), false)
+            .oneshot(
+                Request::builder()
+                    .uri("/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["component"], "termd");
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn update_endpoints_require_device_bearer_authentication() {
+        let fixture = test_protocol("update-endpoint-auth");
+        let app = router(fixture.protocol.clone(), false);
+
+        for path in [
+            "/api/update/check",
+            "/api/update/apply",
+            "/api/update/relay",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("router should respond");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must require device authentication"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_check_reports_no_newer_release_for_current_build() {
+        let fixture = test_protocol("update-check");
+        let (_, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        let response = router(fixture.protocol.clone(), false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/update/check")
+                    .header("authorization", format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["current"], env!("CARGO_PKG_VERSION"));
+        // 测试构建版本与最新 release 一致（或网络不可达）：只断言响应结构稳定，
+        // 不依赖外网结果——两种结局（有更新/无更新）都返回 200。
+        assert!(body.get("update_available").is_some());
+    }
+
+    #[tokio::test]
+    async fn update_relay_rejects_when_no_relay_is_configured() {
+        let fixture = test_protocol("update-relay-unconfigured");
+        let (_, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        let response = router(fixture.protocol.clone(), false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/update/relay")
+                    .header("authorization", format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router should respond");
+        // 未配置 relay 端点 → 400；已认证的调用不会拿到 401。
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

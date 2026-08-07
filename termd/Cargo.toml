@@ -29,6 +29,7 @@ sha2 = "0.10"
 tar = "0.4"
 termd-proto = { path = "../proto" }
 terminstall = { path = "../terminstall" }
+termupdater = { path = "../termupdater" }
 termweb = { path = "../termweb" }
 tempfile = "3"
 thiserror.workspace = true

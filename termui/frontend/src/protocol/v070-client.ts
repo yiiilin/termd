@@ -533,6 +533,18 @@ export class V070Client {
   }
 
   /**
+   * 已认证的 JSON POST 请求（更新端点等控制操作）。
+   * 通过 AccessTokenManager 附加 Bearer access token。
+   */
+  async postAuthorized(path: string, payload?: unknown): Promise<Response> {
+    return this.requestAuthorized(path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: payload === undefined ? undefined : JSON.stringify(payload),
+    });
+  }
+
+  /**
    * 上送一批评析日志（`client.diagnostics`）。
    * 仅当连接存活且 metadata WebSocket 已打开时真正发送；返回是否发出。
    */

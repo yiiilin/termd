@@ -2575,6 +2575,7 @@ dependencies = [
  "tempfile",
  "termd-proto",
  "terminstall",
+ "termupdater",
  "termweb",
  "thiserror 2.0.18",
  "tokio",
@@ -2635,6 +2636,7 @@ dependencies = [
  "termd",
  "termd-proto",
  "terminstall",
+ "termupdater",
  "termweb",
  "thiserror 2.0.18",
  "tokio",
@@ -2646,6 +2648,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "termupdater"
+version = "0.9.7"
+dependencies = [
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

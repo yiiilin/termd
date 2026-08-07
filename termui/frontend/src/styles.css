@@ -439,6 +439,48 @@ label {
   gap: 8px;
 }
 
+.version-check-component {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 6px;
+  background: var(--color-surface-muted);
+}
+
+.version-check-update-action {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.version-check-update-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--color-accent-border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  background: var(--color-surface-selected);
+  color: var(--color-accent-text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.version-check-update-button:hover:not(:disabled) {
+  border-color: var(--color-accent);
+}
+
+.version-check-update-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.version-check-updating {
+  font-size: 12px;
+  color: var(--color-warning-text);
+}
+
 .version-check-row {
   min-width: 0;
   display: flex;

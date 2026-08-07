@@ -875,6 +875,9 @@ pub struct DaemonStatusResultPayload {
     #[serde(default)]
     pub process_count: u64,
     pub atop_available: bool,
+    /// daemon 二进制版本（`CARGO_PKG_VERSION`）；旧 daemon 没有该字段时前端按缺失降级。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// `session_data` 在 JSON 通道中使用 base64；二进制 WebSocket 帧可绕过这个结构。

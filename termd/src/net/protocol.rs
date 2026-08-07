@@ -3881,6 +3881,7 @@ fn collect_daemon_status() -> DaemonStatusResultPayload {
         // 兼容 0.1.25 及更早前端的字段；新 UI 不再展示或采集进程数量。
         process_count: 0,
         atop_available: command_available("atop"),
+        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
     }
 }
 

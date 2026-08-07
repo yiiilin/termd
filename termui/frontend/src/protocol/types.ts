@@ -186,6 +186,8 @@ export interface DaemonStatusResultPayload {
    */
   process_count?: number;
   atop_available: boolean;
+  /** daemon 二进制版本（如 `0.9.7`）；旧 daemon 缺失时前端回退到构建版本。 */
+  version?: string | null;
 }
 
 export interface SessionCreatePayload {

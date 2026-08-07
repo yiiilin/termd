@@ -805,6 +805,25 @@ impl RelayState {
         }
     }
 
+    /// 校验 daemon 的 admission token（用于受限的主机级更新端点）。
+    /// 只接受已注册 daemon 的 server_id + 匹配 token hash；浏览器侧拿不到该凭证。
+    pub(crate) fn authorize_daemon_admission(
+        &self,
+        server_id: &ServerId,
+        token: &str,
+    ) -> Result<(), ()> {
+        let admission_state = self.admission.read().map_err(|_| ())?;
+        let Some(expected_hash) = admission_state.daemon_token_hashes.get(server_id) else {
+            return Err(());
+        };
+        let provided_hash = relay_daemon_token_hash(token);
+        if relay_auth_token_constant_time_eq(expected_hash, &provided_hash) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
     fn start_pending_client_pair_deadline(&self, registration: &ConnectionRegistration) {
         if registration.role != ConnectionRole::Client {
             return;

@@ -1181,6 +1181,26 @@ export default function App() {
     setDiagnosticUploadEnabled(Boolean(state.preferences?.uploadDiagnostics));
   }, [state.preferences?.uploadDiagnostics]);
 
+  const handleTermdUpdate = useCallback(async (): Promise<boolean> => {
+    try {
+      const client = await authenticatedWorkspaceClient(APP_CONNECTION_TIMEOUT_MS);
+      const response = await client.postAuthorized("/api/update/apply");
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }, [authenticatedWorkspaceClient]);
+
+  const handleRelayUpdate = useCallback(async (): Promise<boolean> => {
+    try {
+      const client = await authenticatedWorkspaceClient(APP_CONNECTION_TIMEOUT_MS);
+      const response = await client.postAuthorized("/api/update/relay");
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }, [authenticatedWorkspaceClient]);
+
   const markBrowserNotificationPrompted = useCallback(() => {
     setState((current) => ({ ...current, browserNotificationPrompted: true }));
     void recordBrowserNotificationPrompted()
@@ -4396,7 +4416,11 @@ export default function App() {
           <div className="admin-brand">
             <Cable size={18} aria-hidden="true" />
             <span>{t("app.adminTitle")}</span>
-            <AppVersionBadge />
+            <AppVersionBadge
+              termdVersion={daemonStatus?.version ?? undefined}
+              onUpdateTermd={handleTermdUpdate}
+              onUpdateRelay={handleRelayUpdate}
+            />
           </div>
           <div className="admin-topbar-actions">
             <button type="button" className="icon-button" aria-label={t("app.settings")} onClick={() => setSettingsOpen(true)}>
@@ -4584,7 +4608,11 @@ export default function App() {
                 <div className="brand-title">
                   <Cable size={18} aria-hidden="true" />
                   <span>{t("app.termd")}</span>
-                  <AppVersionBadge />
+                  <AppVersionBadge
+                    termdVersion={daemonStatus?.version ?? undefined}
+                    onUpdateTermd={handleTermdUpdate}
+                    onUpdateRelay={handleRelayUpdate}
+                  />
                 </div>
                 <button
                   type="button"

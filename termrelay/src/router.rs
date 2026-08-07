@@ -20,6 +20,8 @@ use crate::ws::{
 pub fn router(state: RelayState, web_enabled: bool) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/version", get(version_endpoint))
+        .route("/update", post(relay_update))
         .route("/ws", get(relay_ws))
         .route("/ws/metadata", get(relay_metadata_ws))
         .route("/ws/terminal", get(relay_terminal_ws))
@@ -41,6 +43,86 @@ pub fn router(state: RelayState, web_enabled: bool) -> Router {
     } else {
         router.fallback(api_not_found)
     }
+}
+
+/// 只读版本端点：前端经 relay 访问时用它识别「当前连接组件 = termrelay」。
+async fn version_endpoint() -> Response {
+    relay_json(
+        StatusCode::OK,
+        &serde_json::json!({
+            "component": "termrelay",
+            "version": env!("CARGO_PKG_VERSION"),
+        }),
+    )
+}
+
+/// 受限的主机级更新端点：只接受已注册 daemon 的 admission token
+/// （`Authorization: TermdDaemon <token>` + `x-termd-server-id`）。
+/// 校验通过后在后台执行 termupdater（下载/校验/备份/替换/重启自身）。
+async fn relay_update(State(state): State<RelayState>, headers: HeaderMap) -> Response {
+    let server_id = headers
+        .get("x-termd-server-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<Uuid>().ok())
+        .map(ServerId);
+    let token = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("TermdDaemon "));
+    let (Some(server_id), Some(token)) = (server_id, token) else {
+        return relay_json_error(
+            StatusCode::UNAUTHORIZED,
+            "daemon_admission_required",
+            "a registered daemon admission credential is required",
+        );
+    };
+    if state.authorize_daemon_admission(&server_id, token).is_err() {
+        return relay_json_error(
+            StatusCode::UNAUTHORIZED,
+            "daemon_admission_invalid",
+            "daemon admission credential is invalid",
+        );
+    }
+    let Ok(binary_path) = std::env::current_exe() else {
+        return relay_json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "update_unavailable",
+            "cannot resolve the relay binary path",
+        );
+    };
+    let service_name =
+        std::env::var("TERMD_SERVICE_NAME").unwrap_or_else(|_| "termrelay".to_owned());
+    // 响应先返回；后台下载/替换/延迟重启（relay 重启会断开所有连接，包括本请求）。
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let arch = termupdater::host_arch();
+            let current = env!("CARGO_PKG_VERSION").to_owned();
+            let info = termupdater::check_update("termrelay", arch, &current)?;
+            termupdater::apply_update(termupdater::ApplyRequest {
+                binary_path,
+                service_name,
+                expected_version: info.latest,
+                asset_url: info.asset_url,
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok(_)) => tracing::info!("relay update applied; restarting"),
+            Ok(Err(error)) => tracing::warn!(%error, "relay update failed"),
+            Err(_) => tracing::warn!("relay update task panicked"),
+        }
+    });
+    relay_json(
+        StatusCode::ACCEPTED,
+        &serde_json::json!({
+            "update_started": true,
+        }),
+    )
+}
+
+/// 复用现有响应辅助：JSON 响应。
+fn relay_json(status: StatusCode, value: &serde_json::Value) -> Response {
+    (status, Json(value.clone())).into_response()
 }
 
 async fn relay_metadata_ws(
@@ -710,6 +792,84 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn version_endpoint_reports_relay_component() {
+        let app = router(RelayState::default(), false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/version")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .expect("version body should be readable"),
+        )
+        .expect("version body should be JSON");
+        assert_eq!(body["component"], "termrelay");
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn relay_update_requires_registered_daemon_admission() {
+        // 无凭证
+        let app = router(RelayState::default(), false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/update")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // 已注册 daemon + 错误 token：拒绝
+        let server_id = ServerId::new();
+        let state = RelayState::new_trusted(vec![crate::ws::RelayDaemonCredential::plain_token(
+            server_id,
+            "correct-daemon-token".to_owned(),
+        )]);
+        let app = router(state, false);
+        let wrong_token = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/update")
+                    .header("x-termd-server-id", server_id.0.to_string())
+                    .header("authorization", "TermdDaemon wrong-token")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(wrong_token.status(), StatusCode::UNAUTHORIZED);
+
+        // 正确凭证：受理（202）；后台更新任务在测试结束时随 runtime 丢弃，不访问外网断言。
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/update")
+                    .header("x-termd-server-id", server_id.0.to_string())
+                    .header("authorization", "TermdDaemon correct-daemon-token")
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    }
     use termd::auth::{
         AccessTokenProofInput, CredentialService, DaemonIdentity, current_unix_timestamp_millis,
     };

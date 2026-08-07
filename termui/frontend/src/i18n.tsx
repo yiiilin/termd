@@ -134,6 +134,9 @@ const enUS = {
   "updateCheck.latest": "Latest version",
   "updateCheck.upToDate": "You are on the latest version.",
   "updateCheck.openRelease": "View GitHub release",
+  "updateCheck.updateNow": "Update now",
+  "updateCheck.updating": "Updating…",
+  "updateCheck.restarting": "Applied; restarting the service…",
 
   "connection.wsUrl": "WS URL",
   "connection.panelAria": "connection",
@@ -541,6 +544,9 @@ const zhCN: Record<TranslationKey, string> = {
   "updateCheck.latest": "最新版本",
   "updateCheck.upToDate": "当前已是最新版本。",
   "updateCheck.openRelease": "查看 GitHub Release",
+  "updateCheck.updateNow": "立即更新",
+  "updateCheck.updating": "更新中…",
+  "updateCheck.restarting": "已受理，服务重启中…",
 
   "connection.wsUrl": "WS URL",
   "connection.panelAria": "连接",
