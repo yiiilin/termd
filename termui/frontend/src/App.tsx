@@ -91,7 +91,7 @@ import { createTranslator, I18nProvider, resolveLocale, translateSafeErrorMessag
 import { resolveTheme } from "./theme";
 import { panelDefaultsForBand, viewportBandForWidth, type ViewportBand } from "./responsive-layout";
 import type { BrowserPreferences } from "./protocol/types";
-import { recordTermdDiagnostic } from "./diagnostics";
+import { recordTermdDiagnostic, setDiagnosticUploadEnabled } from "./diagnostics";
 import { displayUrlWithoutQueryOrFragment, stripSensitiveUrlParts } from "./protocol/url";
 import { removeBrowserPushForServer, syncBrowserPushSubscriptions } from "./push-notifications";
 
@@ -1174,6 +1174,11 @@ export default function App() {
     },
     [setSafeError],
   );
+
+  useEffect(() => {
+    // 「上送分析日志」开关：开启后诊断事件批量回传 daemon 日志，默认关闭。
+    setDiagnosticUploadEnabled(Boolean(state.preferences?.uploadDiagnostics));
+  }, [state.preferences?.uploadDiagnostics]);
 
   const markBrowserNotificationPrompted = useCallback(() => {
     setState((current) => ({ ...current, browserNotificationPrompted: true }));

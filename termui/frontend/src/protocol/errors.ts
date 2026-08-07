@@ -4,6 +4,9 @@ const SECRET_PATTERNS = [/token/i, /secret/i, /private/i, /signature/i, /ciphert
 const FALLBACK_ERROR_CODE = "protocol_error";
 const FALLBACK_ERROR_MESSAGE = "protocol operation failed";
 
+/** 诊断字段/日志中的敏感键模式：命中即整支丢弃（递归）。 */
+export const SENSITIVE_FIELD_KEY_PATTERN = /token|secret|private|signature|ciphertext|authorization|bearer|preview/i;
+
 export class ProtocolClientError extends Error implements SafeError {
   public readonly code: string;
 

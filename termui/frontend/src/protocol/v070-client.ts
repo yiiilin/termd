@@ -1,5 +1,5 @@
 import { AccessTokenManager, applicationHttpUrl } from "./access-token";
-import { recordTermdDiagnostic, termdDiagnosticContextId } from "../diagnostics";
+import { recordTermdDiagnostic, registerDiagnosticUploadSender, termdDiagnosticContextId, type ClientDiagnosticsBatchPayload } from "../diagnostics";
 import { ProtocolClientError } from "./errors";
 import { buildAttachFramePayload, encodeSupervisorTerminalClientFrame } from "./supervisor-terminal";
 import type {
@@ -120,6 +120,7 @@ export class V070Client {
   private terminalBlobDecode = Promise.resolve();
   private receiveQueue: Envelope[] = [];
   private receiveWaiters: Array<{ resolve: (value: Envelope) => void; reject: (error: unknown) => void }> = [];
+  private readonly unregisterDiagnosticUpload: () => void;
   private readonly tokens: AccessTokenManager;
   private readonly transport: TransportLike;
   private readonly jsonRequest: JsonRequest;
@@ -144,6 +145,7 @@ export class V070Client {
     this.transport.onMetadataClose = () => this.handleMetadataClose();
     this.transport.onTerminalClose = () => this.handleTerminalClose();
     this.tokens.onRefresh(() => this.reconnectWithRefreshedToken());
+    this.unregisterDiagnosticUpload = registerDiagnosticUploadSender(this);
     recordTermdDiagnostic("workspace_client_created", {
       clientId: this.diagnosticId,
       serverId: this.serverId,
@@ -530,6 +532,25 @@ export class V070Client {
     return new Promise((resolve, reject) => this.receiveWaiters.push({ resolve, reject }));
   }
 
+  /**
+   * 上送一批评析日志（`client.diagnostics`）。
+   * 仅当连接存活且 metadata WebSocket 已打开时真正发送；返回是否发出。
+   */
+  sendClientDiagnostics(payload: ClientDiagnosticsBatchPayload): boolean {
+    if (this.isClosed || !this.metadataConnected) {
+      return false;
+    }
+    try {
+      this.transport.sendMetadata?.(JSON.stringify({
+        type: "client.diagnostics",
+        payload,
+      }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   interruptReceiveWaiters(): void {
     const error = new ProtocolClientError("connection_closed", "connection closed");
     for (const waiter of this.receiveWaiters.splice(0)) waiter.reject(error);
@@ -545,6 +566,7 @@ export class V070Client {
       terminalOpeningSessionId: this.terminalOpen?.sessionId,
     }, { console: true, stack: true });
     this.isClosed = true;
+    this.unregisterDiagnosticUpload();
     this.tokens.dispose();
     this.metadataConnectionGeneration += 1;
     this.metadataConnected = false;
@@ -609,25 +631,15 @@ export class V070Client {
 
   private reconnectWithRefreshedToken(): void {
     if (this.isClosed) return;
-    recordTermdDiagnostic("workspace_access_token_refresh_reconnect", {
+    // 中文注释：WS 握手后 daemon 不再校验 access token，已建立的连接不受 token 过期影响。
+    // 换发 token 时保留健康的 metadata/terminal 连接，避免周期性重连导致 snapshot
+    // 整屏重绘（xterm reset + 全量重放）造成的可见闪烁；连接若已断开，由各自的
+    // close 重连路径用新 token（AccessTokenManager 已更新）恢复。
+    recordTermdDiagnostic("workspace_access_token_refreshed", {
       clientId: this.diagnosticId,
-      reconnectMetadata: this.metadataConnected,
+      keptMetadata: this.metadataConnected,
       terminalSessionId: this.terminalSessionId,
-    }, { console: true, stack: true });
-    const reconnects: Promise<unknown>[] = [];
-    if (this.metadataConnected) {
-      this.metadataState = undefined;
-      this.metadataRevision = undefined;
-      this.metadataConnected = false;
-      this.requestMetadataReconnect();
-    }
-    if (this.terminalSessionId) {
-      reconnects.push(this.openTerminal({
-        type: "terminal.attach",
-        payload: { session_id: this.terminalSessionId },
-      }));
-    }
-    void Promise.all(reconnects).catch(() => this.interruptReceiveWaiters());
+    }, { console: true });
   }
 
   private handleMetadata(data: unknown): void {

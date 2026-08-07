@@ -66,6 +66,139 @@ describe("V070Client", () => {
     expect(offers).toEqual([offer]);
   });
 
+  it("sends diagnostic batches over the metadata socket once connected", async () => {
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
+    const transport = {
+      onMetadata: undefined as ((data: unknown) => void) | undefined,
+      onTerminal: undefined as ((data: unknown) => void) | undefined,
+      connectMetadata: vi.fn(async () => undefined),
+      reconnectMetadata: vi.fn(async () => undefined),
+      openTerminal: vi.fn(async () => undefined),
+      closeTerminal: vi.fn(),
+      close: vi.fn(),
+      sendTerminal: vi.fn(),
+      sendMetadata: vi.fn(),
+    };
+    const client = new V070Client(
+      {
+        server_id: "00000000-0000-0000-0000-000000000070",
+        daemon_public_key: "ed25519-v1:daemon",
+        url: "wss://relay.example/ws",
+        paired_at_ms: 1,
+        device_certificate: "device.certificate.signature",
+      },
+      device,
+      transport,
+    );
+
+    // metadata 未连接时拒绝上送，不产生消息
+    expect(client.sendClientDiagnostics({
+      context_id: "page-test-1",
+      context_started_at: 1_750_000_000_000,
+      events: [{ t: 1, name: "a" }],
+    })).toBe(false);
+    expect(transport.sendMetadata).not.toHaveBeenCalled();
+
+    // 收到 metadata snapshot 后连接就绪
+    transport.onMetadata?.(JSON.stringify({
+      type: "metadata.snapshot",
+      payload: { revision: 1, state: { sessions: [], clients: [], daemon: {} } },
+    }));
+    expect(client.sendClientDiagnostics({
+      context_id: "page-test-1",
+      context_started_at: 1_750_000_000_000,
+      events: [{ t: 12.5, name: "terminal_writer_sequence_gap", fields: { expected: 4 } }],
+    })).toBe(true);
+    expect(transport.sendMetadata).toHaveBeenCalledTimes(1);
+    const sent = JSON.parse(transport.sendMetadata.mock.calls[0][0]) as {
+      type: string;
+      payload: { context_id: string; events: Array<{ name: string }> };
+    };
+    expect(sent.type).toBe("client.diagnostics");
+    expect(sent.payload.context_id).toBe("page-test-1");
+    expect(sent.payload.events[0].name).toBe("terminal_writer_sequence_gap");
+
+    // close 后不再上送
+    client.close();
+    expect(client.sendClientDiagnostics({
+      context_id: "page-test-1",
+      context_started_at: 1_750_000_000_000,
+      events: [{ t: 2, name: "b" }],
+    })).toBe(false);
+    expect(transport.sendMetadata).toHaveBeenCalledTimes(1);
+  });
+
+  it("token 刷新后保留健康的 metadata/terminal 连接，不再重连", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ challenge: "challenge-a" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: "token-a",
+        expires_at_ms: 400_000,
+        refresh_at_ms: 340_000,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ challenge: "challenge-b" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: "token-b",
+        expires_at_ms: 700_000,
+        refresh_at_ms: 640_000,
+      }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
+    const transport = {
+      onMetadata: undefined as ((data: unknown) => void) | undefined,
+      onTerminal: undefined as ((data: unknown) => void) | undefined,
+      connectMetadata: vi.fn(async () => undefined),
+      reconnectMetadata: vi.fn(async () => undefined),
+      openTerminal: vi.fn(async () => undefined),
+      closeTerminal: vi.fn(),
+      close: vi.fn(),
+      sendTerminal: vi.fn(),
+      sendMetadata: vi.fn(),
+    };
+    const client = new V070Client(
+      {
+        server_id: "00000000-0000-0000-0000-000000000070",
+        daemon_public_key: "ed25519-v1:daemon",
+        url: "wss://relay.example/ws",
+        paired_at_ms: 1,
+        device_certificate: "device.certificate.signature",
+      },
+      device,
+      transport,
+    );
+
+    // metadata 与 terminal 连接均就绪
+    transport.onMetadata?.(JSON.stringify({
+      type: "metadata.snapshot",
+      payload: { revision: 1, state: { sessions: [], clients: [], daemon: {} } },
+    }));
+    const attach = client.attachSession("00000000-0000-0000-0000-000000000601");
+    transport.onTerminal?.(JSON.stringify({
+      type: "terminal.attached",
+      payload: { session_id: "00000000-0000-0000-0000-000000000601" },
+    }));
+    await attach;
+    // 首次获取 token（mock transport 不走真实握手，这里直接触发 AccessTokenManager）
+    await (client as unknown as { tokens: { get(): Promise<string> } }).tokens.get();
+    transport.reconnectMetadata.mockClear();
+    transport.connectMetadata.mockClear();
+    transport.openTerminal.mockClear();
+    transport.closeTerminal.mockClear();
+
+    // 推进到 refresh_at_ms：token 换发，但已建立的连接必须原样保留
+    //（WS 握手后 daemon 不再校验 token，重连只会造成 snapshot 整屏重绘闪烁）。
+    await vi.advanceTimersByTimeAsync(240_000);
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(transport.reconnectMetadata).not.toHaveBeenCalled();
+    expect(transport.connectMetadata).not.toHaveBeenCalled();
+    expect(transport.openTerminal).not.toHaveBeenCalled();
+    expect(transport.closeTerminal).not.toHaveBeenCalled();
+    expect(transport.close).not.toHaveBeenCalled();
+  });
+
   it("resolves and prepares file offers through authenticated HTTP routes", async () => {
     const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
     const transport = {

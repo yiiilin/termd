@@ -121,6 +121,10 @@ export function useTerminalOutputWriter(
   const needsPostWriteRefreshRef = useRef(false);
   const needsPostWriteScrollBottomRef = useRef(false);
   const snapshotRedrawInProgressRef = useRef(false);
+  /** snapshot 与本地已渲染内容一致时置位：跳过 reset+整屏重绘，仅推进 seq。 */
+  const skipSnapshotRedrawRef = useRef(false);
+  /** 最近一次实际整屏重绘的 snapshot（seq + 字节长度），用于跳过重复快照时的保守校验。 */
+  const lastRenderedSnapshotRef = useRef<{ baseSeq: number; byteLength: number } | undefined>(undefined);
   const idleRefreshEpochRef = useRef(0);
   const cancelTrackedFrameRef = useRef<(frameId: number | undefined) => void>(() => undefined);
   const idleRefreshFrameRef = useRef<number | undefined>(undefined);
@@ -156,6 +160,8 @@ export function useTerminalOutputWriter(
     needsPostWriteRefreshRef.current = false;
     needsPostWriteScrollBottomRef.current = false;
     snapshotRedrawInProgressRef.current = false;
+    skipSnapshotRedrawRef.current = false;
+    lastRenderedSnapshotRef.current = undefined;
   }, [cancelPendingIdleRefreshFrames, clearPendingWriteQueue]);
 
   const resetWriterState = useCallback(() => {
@@ -307,16 +313,33 @@ export function useTerminalOutputWriter(
         snapshotRedrawInProgressRef.current = false;
         lastTerminalSeqRef.current = item.baseSeq;
         options.onTerminalSeqRendered(item.baseSeq);
-        recordTermdDiagnostic("terminal_writer_snapshot_rendered", {
-          baseSeq: item.baseSeq,
-          bytes: item.bytes.byteLength,
-          pendingItems: pendingWriteItemsRef.current.length,
-          pendingBytes: pendingWriteBytesRef.current,
-        });
-        // 中文注释：snapshot 必须按生成时的 PTY 尺寸重放；但重放完成后要把当前
-        // 聚焦客户端重新 fit 到真实容器尺寸，否则后续输入会先按旧 24 行滚动，
-        // 再被 resize 扩成大屏，表现为内容悬在上半截。
-        options.onSnapshotRendered?.(item);
+        if (skipSnapshotRedrawRef.current) {
+          skipSnapshotRedrawRef.current = false;
+          recordTermdDiagnostic("terminal_writer_snapshot_skipped", {
+            baseSeq: item.baseSeq,
+            pendingItems: pendingWriteItemsRef.current.length,
+            pendingBytes: pendingWriteBytesRef.current,
+          });
+          // 中文注释：跳过重绘的 snapshot 没有按 daemon 尺寸重放过，不能调用
+          // onSnapshotRendered——其内部会用 snapshot 尺寸与本地尺寸不一致为由
+          // 排队 full-snapshot repair resync，反而再次触发清屏重绘，抵消 skip。
+          // seq 推进与诊断已在上面单独完成。
+        } else {
+          recordTermdDiagnostic("terminal_writer_snapshot_rendered", {
+            baseSeq: item.baseSeq,
+            bytes: item.bytes.byteLength,
+            pendingItems: pendingWriteItemsRef.current.length,
+            pendingBytes: pendingWriteBytesRef.current,
+          });
+          lastRenderedSnapshotRef.current = {
+            baseSeq: item.baseSeq,
+            byteLength: item.bytes.byteLength,
+          };
+          // 中文注释：snapshot 必须按生成时的 PTY 尺寸重放；但重放完成后要把当前
+          // 聚焦客户端重新 fit 到真实容器尺寸，否则后续输入会先按旧 24 行滚动，
+          // 再被 resize 扩成大屏，表现为内容悬在上半截。
+          options.onSnapshotRendered?.(item);
+        }
       } else if (item.kind === "output" || item.kind === "resize" || item.kind === "exit") {
         lastTerminalSeqRef.current = item.terminalSeq;
         options.onTerminalSeqRendered(item.terminalSeq);
@@ -345,6 +368,20 @@ export function useTerminalOutputWriter(
         return true;
       }
       if (item.kind === "snapshot") {
+        // 中文注释：本地已渲染到快照基线且快照与上次实际重绘一致时，snapshot 内容与
+        // 本地完全一致（同一 daemon 同一 session 的追加输出前缀）。跳过 reset+整屏
+        // 重绘——token 刷新重连等场景内容未变，reset 会造成可见闪烁。
+        // 字节长度校验是保守兜底：seq 相同但内容不同的快照（测试 mock 或异常实现）
+        // 不会误 skip。revealHistory 的 snapshot 携带更多 scrollback，必须整屏重绘。
+        if (
+          !item.revealHistory &&
+          sequenceCursor === item.baseSeq &&
+          lastRenderedSnapshotRef.current?.baseSeq === item.baseSeq &&
+          lastRenderedSnapshotRef.current.byteLength === item.bytes.byteLength
+        ) {
+          skipSnapshotRedrawRef.current = true;
+          return true;
+        }
         snapshotRedrawInProgressRef.current = true;
         options.sessionSizeRef.current = item.size;
         recordTermdDiagnostic("terminal_writer_snapshot_begin", {
@@ -443,6 +480,16 @@ export function useTerminalOutputWriter(
 
         if (item.kind !== "data" && item.kind !== "snapshot" && item.kind !== "output") {
           break;
+        }
+
+        if (item.kind === "snapshot" && skipSnapshotRedrawRef.current) {
+          // 中文注释：快照内容与本地已渲染内容一致，不写入 bytes、不触发 reset，
+          // 直接推进 seq 完成该 item，避免 token 刷新重连等场景下的整屏闪烁。
+          skipSnapshotRedrawRef.current = false;
+          renderedItems.push(item);
+          sequenceCursor = advanceSequenceCursor(item, sequenceCursor);
+          activeWriteRef.current = undefined;
+          continue;
         }
 
         const remaining = MAX_WRITE_BYTES - byteCount;

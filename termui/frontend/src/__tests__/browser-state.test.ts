@@ -200,8 +200,8 @@ describe("浏览器本地状态", () => {
 
   it("持久化客户端偏好，并对旧数据或异常值做安全归一化", async () => {
     const next = await saveBrowserPreferences({ language: "zh-CN", theme: "light" });
-    expect(next.preferences).toEqual({ language: "zh-CN", theme: "light", mobileShortcuts: [] });
-    expect((await loadBrowserState()).preferences).toEqual({ language: "zh-CN", theme: "light", mobileShortcuts: [] });
+    expect(next.preferences).toEqual({ language: "zh-CN", theme: "light", mobileShortcuts: [], uploadDiagnostics: false });
+    expect((await loadBrowserState()).preferences).toEqual({ language: "zh-CN", theme: "light", mobileShortcuts: [], uploadDiagnostics: false });
 
     await saveBrowserState({
       pairedServers: [],
@@ -211,7 +211,19 @@ describe("浏览器本地状态", () => {
       },
     } as unknown as BrowserState);
 
-    expect((await loadBrowserState()).preferences).toEqual({ language: "auto", theme: "system", mobileShortcuts: [] });
+    expect((await loadBrowserState()).preferences).toEqual({ language: "auto", theme: "system", mobileShortcuts: [], uploadDiagnostics: false });
+  });
+
+  it("持久化上送分析日志开关，默认关闭且只接受布尔值", async () => {
+    const next = await saveBrowserPreferences({ language: "auto", theme: "system", uploadDiagnostics: true });
+    expect(next.preferences?.uploadDiagnostics).toBe(true);
+    expect((await loadBrowserState()).preferences?.uploadDiagnostics).toBe(true);
+
+    await saveBrowserState({
+      ...(await loadBrowserState()),
+      preferences: { ...next.preferences, uploadDiagnostics: "yes" },
+    } as unknown as BrowserState);
+    expect((await loadBrowserState()).preferences?.uploadDiagnostics).toBe(false);
   });
 
   it("持久化移动端快捷键、丢弃旧通知偏好，并过滤异常快捷键", async () => {
@@ -229,6 +241,7 @@ describe("浏览器本地状态", () => {
       language: "en-US",
       theme: "dark",
       mobileShortcuts: [{ label: "PgUp", data: "\x1b[5~" }],
+      uploadDiagnostics: false,
     });
 
     await saveBrowserState({

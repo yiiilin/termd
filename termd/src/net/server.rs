@@ -62,6 +62,7 @@ use crate::pty::supervisor::SupervisorPtyBackend;
 use crate::state::web_push::{PushNotificationLocale, PushNotificationMode, PushSubscription};
 use crate::state::{StateError, StateStore};
 
+use super::client_diagnostics;
 #[cfg(test)]
 use super::protocol::V070TerminalOpen;
 use super::protocol::{
@@ -994,10 +995,16 @@ async fn run_metadata_websocket(
     {
         return;
     }
+    let mut client_diagnostics_budget = client_diagnostics::ClientDiagnosticsBudget::new();
     loop {
         tokio::select! {
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(raw))) => {
+                    let _ = client_diagnostics::handle_client_diagnostics_message(
+                        &device_id,
+                        &raw,
+                        &mut client_diagnostics_budget,
+                    );
                     let timestamp_ms = serde_json::from_str::<Value>(&raw).ok()
                         .filter(|value| value.get("type").and_then(Value::as_str) == Some("metadata.ping"))
                         .and_then(|value| value.get("payload")?.get("timestamp_ms")?.as_u64())
@@ -2400,6 +2407,7 @@ pub async fn serve_listener(
 ) -> Result<(), ServerError> {
     let _push_tasks = start_push_notification_tasks(protocol.clone()).await;
     let _browser_download_task = start_browser_download_monitor(protocol.clone());
+    let _status_refresh_task = start_v070_status_refresh(protocol.clone());
     axum::serve(
         listener,
         router(protocol, web_enabled).into_make_service_with_connect_info::<SocketAddr>(),
@@ -2444,6 +2452,25 @@ fn start_browser_download_monitor(protocol: SharedDaemonProtocol) -> BrowserDown
             }
         }
     }))
+}
+
+/// v070 metadata 状态采样间隔。UI 状态面板（CPU/内存/网络曲线）依赖周期性
+/// `metadata.update`；token 换发不再重连 metadata 后，不能靠连接重建刷新状态，
+/// 由 daemon 定期采样并通知所有订阅连接。
+const V070_STATUS_REFRESH_INTERVAL_SECS: u64 = 10;
+
+fn start_v070_status_refresh(protocol: SharedDaemonProtocol) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(V070_STATUS_REFRESH_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if protocol.lock().await.v070_metadata_has_subscribers() {
+                protocol.lock().await.notify_v070_metadata_changed();
+            }
+        }
+    })
 }
 
 async fn offer_completed_browser_downloads(
@@ -4805,20 +4832,154 @@ mod tests {
             ))
             .await
             .unwrap();
-        let pong = tokio::time::timeout(Duration::from_millis(250), metadata.next())
-            .await
-            .expect("metadata pong should arrive without polling")
-            .unwrap()
-            .unwrap()
-            .into_text()
-            .unwrap();
-        let pong: serde_json::Value = serde_json::from_str(&pong).unwrap();
+        // 周期状态采样 update 可能插队，循环过滤到 pong 为止。
+        let pong = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let message = metadata.next().await.unwrap().unwrap().into_text().unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(&message).unwrap();
+                if parsed["type"] == "metadata.pong" {
+                    return parsed;
+                }
+            }
+        })
+        .await
+        .expect("metadata pong should arrive without polling");
         assert_eq!(pong["type"], "metadata.pong");
         let echoed_timestamp_ms = pong["payload"]["timestamp_ms"].as_u64();
 
         drop(metadata);
         server.abort();
         assert_eq!(echoed_timestamp_ms, Some(timestamp_ms));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v070_metadata_client_diagnostics_keeps_connection_alive() {
+        let fixture = test_protocol("metadata-client-diagnostics");
+        let (_, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = fixture.protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+
+        let mut metadata_request = format!("ws://{addr}/ws/metadata")
+            .into_client_request()
+            .unwrap();
+        metadata_request.headers_mut().insert(
+            "sec-websocket-protocol",
+            format!("termd.v0.7, {access_token}").parse().unwrap(),
+        );
+        let (mut metadata, _) = tokio_tungstenite::connect_async(metadata_request)
+            .await
+            .expect("metadata websocket should upgrade");
+        let snapshot = metadata.next().await.unwrap().unwrap().into_text().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&snapshot).unwrap()["type"],
+            "metadata.snapshot"
+        );
+
+        metadata
+            .send(ClientWsMessage::Text(
+                serde_json::json!({
+                    "type": "client.diagnostics",
+                    "payload": {
+                        "context_id": "page-test123-abc",
+                        "context_started_at": 1_750_000_000_000_u64,
+                        "events": [
+                            {
+                                "t": 12.5,
+                                "name": "terminal_writer_sequence_gap",
+                                "fields": { "sequenceCursor": 3, "expected": 4 },
+                            },
+                            {
+                                "t": 13.0,
+                                "name": "terminal_pane_output_reset",
+                                "fields": { "outputResetVersion": 2 },
+                            },
+                        ],
+                    },
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        // 诊断消息被处理后 metadata 循环仍然存活：ping 依然能收到 pong。
+        // 周期状态采样 update 可能插队，循环过滤到 pong 为止。
+        let timestamp_ms = 1_710_000_000_123_u64;
+        metadata
+            .send(ClientWsMessage::Text(
+                serde_json::json!({
+                    "type": "metadata.ping",
+                    "payload": { "timestamp_ms": timestamp_ms }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let message = metadata.next().await.unwrap().unwrap().into_text().unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(&message).unwrap();
+                if parsed["type"] == "metadata.pong" {
+                    return parsed;
+                }
+            }
+        })
+        .await
+        .expect("metadata pong should still arrive after client.diagnostics");
+        assert_eq!(pong["type"], "metadata.pong");
+        let echoed_timestamp_ms = pong["payload"]["timestamp_ms"].as_u64();
+
+        drop(metadata);
+        server.abort();
+        assert_eq!(echoed_timestamp_ms, Some(timestamp_ms));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v070_metadata_status_refresh_pushes_periodic_updates() {
+        let fixture = test_protocol("metadata-status-refresh");
+        let (_, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_protocol = fixture.protocol.clone();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, server_protocol, false).await;
+        });
+
+        let mut metadata_request = format!("ws://{addr}/ws/metadata")
+            .into_client_request()
+            .unwrap();
+        metadata_request.headers_mut().insert(
+            "sec-websocket-protocol",
+            format!("termd.v0.7, {access_token}").parse().unwrap(),
+        );
+        let (mut metadata, _) = tokio_tungstenite::connect_async(metadata_request)
+            .await
+            .expect("metadata websocket should upgrade");
+        let snapshot = metadata.next().await.unwrap().unwrap().into_text().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&snapshot).unwrap()["type"],
+            "metadata.snapshot"
+        );
+
+        // 即使没有任何事件驱动变化，daemon 也会在采样间隔内推送含最新
+        // CPU/内存/网络状态的 metadata.update（token 换发不再重连后状态刷新的来源）。
+        let update = tokio::time::timeout(Duration::from_secs(15), metadata.next())
+            .await
+            .expect("periodic metadata.update should arrive within the sampling interval")
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let update: serde_json::Value = serde_json::from_str(&update).unwrap();
+        assert_eq!(update["type"], "metadata.update");
+        assert!(update["payload"]["revision"].as_u64().unwrap_or(0) >= 2);
+        assert!(update["payload"]["state"]["daemon"].is_object());
+
+        drop(metadata);
+        server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4895,23 +5056,28 @@ mod tests {
         assert!(snapshot["payload"]["cursor"]["row"].as_u64().unwrap() >= 1);
         assert!(snapshot["payload"]["cursor"]["col"].as_u64().unwrap() >= 1);
 
-        let metadata_update = tokio::time::timeout(Duration::from_millis(250), metadata.next())
-            .await
-            .expect("session creation should push metadata without a polling delay")
-            .unwrap()
-            .unwrap()
-            .into_text()
-            .unwrap();
-        let metadata_update: serde_json::Value = serde_json::from_str(&metadata_update).unwrap();
+        // 周期状态采样 update 可能插队；循环过滤到「包含新建 session」的 update。
+        let metadata_update = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let message = metadata.next().await.unwrap().unwrap().into_text().unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(&message).unwrap();
+                if parsed["type"] != "metadata.update" {
+                    continue;
+                }
+                let session_count = parsed["payload"]["state"]["sessions"]
+                    .as_array()
+                    .map(|sessions| sessions.len())
+                    .unwrap_or(0);
+                if session_count == 1 {
+                    return parsed;
+                }
+            }
+        })
+        .await
+        .expect("session creation should push metadata without a polling delay");
         assert_eq!(metadata_update["type"], "metadata.update");
-        assert_eq!(metadata_update["payload"]["revision"], 2);
-        assert_eq!(
-            metadata_update["payload"]["state"]["sessions"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
+        // 中文注释：revision 只要求推进——周期状态采样可能插队，具体序号不是契约。
+        assert!(metadata_update["payload"]["revision"].as_u64().unwrap_or(0) >= 2);
 
         let mut cwd_terminal_request = format!("ws://{addr}/ws/terminal")
             .into_client_request()

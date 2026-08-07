@@ -53,6 +53,29 @@ describe("SettingsDialog", () => {
     expect(screen.queryByRole("radiogroup", { name: "Notifications" })).not.toBeInTheDocument();
   });
 
+  it("toggles diagnostic log upload preference", async () => {
+    const user = userEvent.setup();
+    const onPreferencesChange = vi.fn();
+    render(<SettingsHarness onPreferencesChange={onPreferencesChange} />);
+
+    await user.click(screen.getByRole("button", { name: "Open settings" }));
+    const toggle = screen.getByRole("checkbox", { name: /diagnostic events/i });
+    expect(toggle).not.toBeChecked();
+    await user.click(toggle);
+    expect(onPreferencesChange).toHaveBeenCalledWith(expect.objectContaining({ uploadDiagnostics: true }));
+
+    await user.click(toggle);
+    expect(onPreferencesChange).toHaveBeenLastCalledWith(expect.objectContaining({ uploadDiagnostics: false }));
+  });
+
+  it("reflects an enabled upload preference", async () => {
+    const user = userEvent.setup();
+    render(<SettingsHarness initial={{ ...initialPreferences, uploadDiagnostics: true }} />);
+
+    await user.click(screen.getByRole("button", { name: "Open settings" }));
+    expect(screen.getByRole("checkbox", { name: /diagnostic events/i })).toBeChecked();
+  });
+
   it("keeps keyboard focus inside and restores it after Escape closes the dialog", async () => {
     const user = userEvent.setup();
     render(<SettingsHarness />);

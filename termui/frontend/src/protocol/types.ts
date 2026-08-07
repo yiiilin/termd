@@ -620,6 +620,8 @@ export interface BrowserPreferences {
   language: BrowserLanguagePreference;
   theme: BrowserThemePreference;
   mobileShortcuts?: BrowserMobileShortcut[];
+  /** 上送分析日志：把本页诊断事件批量回传 daemon 日志，默认关闭。 */
+  uploadDiagnostics?: boolean;
 }
 
 export interface BrowserState {

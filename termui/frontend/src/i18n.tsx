@@ -123,6 +123,8 @@ const enUS = {
   "settings.mobileShortcuts.error.nul": "Line {line}: data cannot contain NUL.",
   "settings.mobileShortcuts.error.invalidEscape": "Line {line}: unsupported or incomplete escape sequence.",
   "settings.mobileShortcuts.error.tooMany": "Line {line}: no more than 12 shortcuts are allowed.",
+  "settings.uploadDiagnostics": "Upload diagnostic logs",
+  "settings.uploadDiagnosticsHelp": "Send this page's diagnostic events to the termd daemon log when diagnosing issues. Off by default; sensitive fields are stripped before upload.",
   "settings.effective": "Current: {value}",
 
   "connection.wsUrl": "WS URL",
@@ -520,6 +522,8 @@ const zhCN: Record<TranslationKey, string> = {
   "settings.mobileShortcuts.error.nul": "第 {line} 行：数据不能包含 NUL。",
   "settings.mobileShortcuts.error.invalidEscape": "第 {line} 行：转义序列未知或不完整。",
   "settings.mobileShortcuts.error.tooMany": "第 {line} 行：最多允许 12 个快捷键。",
+  "settings.uploadDiagnostics": "上送分析日志",
+  "settings.uploadDiagnosticsHelp": "排查问题时把本页的诊断事件回传到 termd daemon 日志。默认关闭；上送前会剥离敏感字段。",
   "settings.effective": "当前：{value}",
 
   "connection.wsUrl": "WS URL",

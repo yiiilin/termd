@@ -1610,6 +1610,27 @@ label {
   color: var(--color-danger-text);
 }
 
+.settings-toggle-row {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 4px;
+  color: var(--color-text-subtle);
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+  user-select: none;
+}
+
+.settings-toggle-row input {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin: 2px 0 0;
+  accent-color: var(--color-accent);
+}
+
 .settings-footer {
   display: flex;
   justify-content: flex-end;

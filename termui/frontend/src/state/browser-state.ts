@@ -23,6 +23,7 @@ export const DEFAULT_BROWSER_PREFERENCES: BrowserPreferences = {
   language: "auto",
   theme: "system",
   mobileShortcuts: [],
+  uploadDiagnostics: false,
 };
 
 export async function loadBrowserState(): Promise<BrowserState> {
@@ -240,6 +241,7 @@ function normalizePreferences(value: unknown): BrowserPreferences {
     language,
     theme,
     mobileShortcuts,
+    uploadDiagnostics: source.uploadDiagnostics === true,
   };
 }
 

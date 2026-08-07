@@ -1643,9 +1643,15 @@ where
         })
     }
 
-    fn notify_v070_metadata_changed(&self) {
+    pub(crate) fn notify_v070_metadata_changed(&self) {
         let next = self.v070_metadata_signal.borrow().saturating_add(1);
         self.v070_metadata_signal.send_replace(next);
+    }
+
+    /// 是否有活跃的 v070 metadata 订阅者；没有时状态采样循环直接跳过，
+    /// 避免无人查看时白白读取 /proc 与序列化 payload。
+    pub(crate) fn v070_metadata_has_subscribers(&self) -> bool {
+        self.v070_metadata_signal.receiver_count() > 0
     }
 
     /// HTTP control plane 每次请求都会重建一条临时 connection scope。

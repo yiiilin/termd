@@ -34,6 +34,7 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, trace, warn};
 
+use super::client_diagnostics;
 use super::protocol::{
     JsonEnvelope, ProtocolConnection, ProtocolWireMessage, parse_v070_terminal_open,
 };
@@ -1274,10 +1275,16 @@ async fn run_relay_v070_metadata(
         serde_json::json!({"revision": revision, "state": previous}),
     )
     .await?;
+    let mut client_diagnostics_budget = client_diagnostics::ClientDiagnosticsBudget::new();
     loop {
         tokio::select! {
             inbound = receiver.next() => match inbound {
                 Some(Ok(Message::Text(raw))) => {
+                    let _ = client_diagnostics::handle_client_diagnostics_message(
+                        &device_id,
+                        &raw,
+                        &mut client_diagnostics_budget,
+                    );
                     let timestamp_ms = serde_json::from_str::<serde_json::Value>(&raw).ok()
                         .filter(|value| value.get("type").and_then(serde_json::Value::as_str) == Some("metadata.ping"))
                         .and_then(|value| value.get("payload")?.get("timestamp_ms")?.as_u64())
@@ -3087,12 +3094,125 @@ mod tests {
             serde_json::from_str(&message.into_text().unwrap()).unwrap();
         assert_eq!(snapshot["type"], "metadata.snapshot");
 
-        let pong = tokio::time::timeout(Duration::from_millis(250), write_rx.recv())
+        // 周期状态采样 update 可能插队，循环过滤到 pong 为止。
+        let pong = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let message = write_rx
+                    .recv()
+                    .await
+                    .expect("metadata writer should remain open");
+                let RelayDataWrite::Raw { message, .. } = message;
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&message.into_text().unwrap()).unwrap();
+                if parsed["type"] == "metadata.pong" {
+                    return parsed;
+                }
+            }
+        })
+        .await
+        .expect("metadata pong should be queued without polling");
+        assert_eq!(pong["type"], "metadata.pong");
+        let echoed_timestamp_ms = pong["payload"]["timestamp_ms"].as_u64();
+
+        relay_task.abort();
+        relay_peer.abort();
+        drop(protocol);
+        std::fs::remove_dir_all(state_dir).unwrap();
+        assert_eq!(echoed_timestamp_ms, Some(timestamp_ms));
+    }
+
+    #[tokio::test]
+    async fn relay_metadata_client_diagnostics_keeps_connection_alive() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "termd-relay-metadata-diagnostics-{}-{}",
+            std::process::id(),
+            ServerId::new().0
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("daemon-state.json");
+        let protocol = crate::net::server::default_protocol(
+            crate::config::DaemonConfig::default_for_state_path(&state_path),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let timestamp_ms = 1_710_000_000_456_u64;
+        let relay_peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "client.diagnostics",
+                        "payload": {
+                            "context_id": "page-relay-test-1",
+                            "context_started_at": 1_750_000_000_000_u64,
+                            "events": [
+                                { "t": 1.0, "name": "terminal_pane_output_reset", "fields": { "outputResetVersion": 2 } },
+                            ],
+                        },
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "metadata.ping",
+                        "payload": { "timestamp_ms": timestamp_ms }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
-            .expect("metadata pong should be queued without polling")
-            .expect("metadata writer should remain open");
-        let RelayDataWrite::Raw { message, .. } = pong;
-        let pong: serde_json::Value = serde_json::from_str(&message.into_text().unwrap()).unwrap();
+            .unwrap();
+        let (_relay_sender, mut receiver) = socket.split();
+        let (write_tx, mut write_rx) = mpsc::channel(4);
+        let (_writer_failed_tx, mut writer_failed_rx) = mpsc::channel(1);
+        let relay_protocol = protocol.clone();
+        let relay_task = tokio::spawn(async move {
+            run_relay_v070_metadata(
+                relay_protocol,
+                termd_proto::DeviceId::new(),
+                &mut receiver,
+                &write_tx,
+                &mut writer_failed_rx,
+            )
+            .await
+        });
+
+        let snapshot = write_rx
+            .recv()
+            .await
+            .expect("metadata snapshot should be queued");
+        let RelayDataWrite::Raw { message, .. } = snapshot;
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&message.into_text().unwrap()).unwrap();
+        assert_eq!(snapshot["type"], "metadata.snapshot");
+
+        // client.diagnostics 被处理后 metadata 循环仍存活：ping 应得到 pong。
+        // 周期状态采样 update 可能插队，循环过滤到 pong 为止。
+        let pong = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let message = write_rx
+                    .recv()
+                    .await
+                    .expect("metadata writer should remain open");
+                let RelayDataWrite::Raw { message, .. } = message;
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&message.into_text().unwrap()).unwrap();
+                if parsed["type"] == "metadata.pong" {
+                    return parsed;
+                }
+            }
+        })
+        .await
+        .expect("metadata pong should arrive after client.diagnostics");
         assert_eq!(pong["type"], "metadata.pong");
         let echoed_timestamp_ms = pong["payload"]["timestamp_ms"].as_u64();
 

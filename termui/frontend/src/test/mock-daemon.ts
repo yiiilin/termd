@@ -259,6 +259,12 @@ export class MockDaemon {
   public metadataPingMessages = 0;
   public readonly metadataPingReceivedAtMs: number[] = [];
   public readonly metadataPongSentAtMs: number[] = [];
+  /** 收到的 `client.diagnostics` 上送批次（设置里开启「上送分析日志」后产生）。 */
+  public readonly clientDiagnosticsMessages: Array<{
+    context_id: string;
+    event_count: number;
+    events: Array<{ name: string }>;
+  }> = [];
   public acceptedConnections = 0;
   public v070MetadataConnections = 0;
   public v070TerminalConnections = 0;
@@ -880,8 +886,22 @@ export class MockDaemon {
       if (isBinary) return;
       const message = JSON.parse(raw.toString()) as {
         type?: string;
-        payload?: { timestamp_ms?: unknown };
+        payload?: { timestamp_ms?: unknown; context_id?: unknown; events?: unknown };
       };
+      if (message.type === "client.diagnostics") {
+        const events = Array.isArray(message.payload?.events)
+          ? message.payload.events.filter((event): event is { name: string } => {
+              return typeof event === "object" && event !== null
+                && typeof (event as { name?: unknown }).name === "string";
+            })
+          : [];
+        this.clientDiagnosticsMessages.push({
+          context_id: typeof message.payload?.context_id === "string" ? message.payload.context_id : "",
+          event_count: events.length,
+          events,
+        });
+        return;
+      }
       if (message.type === "metadata.ping") {
         this.metadataPingMessages += 1;
         this.metadataPingReceivedAtMs.push(Date.now());

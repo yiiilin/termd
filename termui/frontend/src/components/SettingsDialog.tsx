@@ -1,4 +1,4 @@
-import { Keyboard, MonitorCog, Palette, Languages, X } from "lucide-react";
+import { Activity, Keyboard, MonitorCog, Palette, Languages, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { BrowserPreferences, BrowserLanguagePreference, BrowserThemePreference, EffectiveTheme } from "../protocol/types";
 import { useI18n, type Locale } from "../i18n";
@@ -145,6 +145,23 @@ export function SettingsDialog({
                 {mobileShortcutsError}
               </p>
             ) : null}
+          </fieldset>
+
+          <fieldset className="settings-fieldset">
+            <legend>
+              <Activity size={15} aria-hidden="true" />
+              <span>{t("settings.uploadDiagnostics")}</span>
+            </legend>
+            <label className="settings-toggle-row">
+              <input
+                type="checkbox"
+                checked={preferences.uploadDiagnostics === true}
+                onChange={(event) =>
+                  onPreferencesChange({ ...preferences, uploadDiagnostics: event.currentTarget.checked })
+                }
+              />
+              <span>{t("settings.uploadDiagnosticsHelp")}</span>
+            </label>
           </fieldset>
         </div>
 

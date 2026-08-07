@@ -771,6 +771,113 @@ describe("TerminalPane terminal sequence rendering", () => {
     expect(onTerminalSeqRendered.mock.calls).toEqual([[10], [11]]);
   });
 
+  it("已渲染到快照基线时跳过重复 snapshot 的 reset 与整屏重绘，tail 直接续写", async () => {
+    const encoder = new TextEncoder();
+    const onTerminalSeqRendered = vi.fn();
+    let drain!: () => void;
+    const queue: TerminalOutputItem[] = [];
+    const takeOutput = vi.fn(() => queue.splice(0));
+    const registerOutputDrain = vi.fn((drainFn: () => void) => {
+      drain = drainFn;
+      return () => undefined;
+    });
+    render(
+      <TerminalPane
+        attached
+        sessionSize={DEFAULT_TERMINAL_SIZE}
+        outputResetVersion={0}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onTerminalSeqRendered={onTerminalSeqRendered}
+        onInput={vi.fn()}
+        onResize={vi.fn()}
+        onCursorChange={vi.fn()}
+      />,
+    );
+
+    // 第一轮：建立渲染基线（token 刷新重连前的首次 attach）
+    queue.push({ kind: "snapshot", bytes: encoder.encode("first-snapshot\n"), baseSeq: 10, size: DEFAULT_TERMINAL_SIZE });
+    act(() => { drain(); });
+    await screen.findByText("first-snapshot", { exact: false });
+
+    // 第二轮：内容未变的重复 snapshot（重连）必须跳过 reset，tail 直接续写
+    queue.push({ kind: "snapshot", bytes: encoder.encode("first-snapshot\n"), baseSeq: 10, size: DEFAULT_TERMINAL_SIZE });
+    queue.push({ kind: "output", bytes: encoder.encode("tail-after-resume\n"), terminalSeq: 11 });
+    act(() => { drain(); });
+    const host = terminalHost();
+    await waitFor(() => expect(host.dataset.buffer).toContain("tail-after-resume"));
+
+    const stats = (globalThis as {
+      __TERMD_TEST_TERMINAL_STATS__?: {
+        operations: Array<{ op: string; cols?: number; rows?: number; text?: string }>;
+        writtenBytes: number;
+      };
+    }).__TERMD_TEST_TERMINAL_STATS__ ?? { operations: [], writtenBytes: 0 };
+    const resetCount = stats.operations.filter((operation) => operation.op === "reset").length;
+    // 只写入第一个 snapshot（"first-snapshot\n" 15 字节）+ tail（"tail-after-resume\n" 18 字节）；
+    // 重复的 snapshot 被跳过，其 15 字节不会再次写入 xterm。
+    expect(resetCount).toBe(1);
+    expect(stats.writtenBytes).toBe(15 + 18);
+    expect(onTerminalSeqRendered.mock.calls).toEqual([[10], [10], [11]]);
+  });
+
+  it("snapshot 基线推进后再次 attach 仍会整屏重绘", async () => {
+    const onTerminalSeqRendered = vi.fn();
+    const encoder = new TextEncoder();
+
+    // 第二个 snapshot 的基线前进（PTY 有新输出），必须 reset+重绘以保证内容完整。
+    renderTerminalPaneWithOutput(
+      [
+        { kind: "snapshot", bytes: encoder.encode("first-snapshot\n"), baseSeq: 10, size: DEFAULT_TERMINAL_SIZE },
+        { kind: "snapshot", bytes: encoder.encode("first-snapshot\nnew-output\n"), baseSeq: 11, size: DEFAULT_TERMINAL_SIZE },
+      ],
+      { onTerminalSeqRendered },
+    );
+
+    await screen.findByText("new-output", { exact: false });
+    const operations = (globalThis as {
+      __TERMD_TEST_TERMINAL_STATS__?: {
+        operations: Array<{ op: string; cols?: number; rows?: number; text?: string }>;
+      };
+    }).__TERMD_TEST_TERMINAL_STATS__?.operations ?? [];
+    expect(operations.filter((operation) => operation.op === "reset").length).toBe(2);
+    expect(onTerminalSeqRendered.mock.calls).toEqual([[10], [11]]);
+  });
+
+  it("revealHistory 快照即使基线一致也必须整屏重绘，用于恢复更早 scrollback", async () => {
+    const onTerminalSeqRendered = vi.fn();
+    const encoder = new TextEncoder();
+
+    // 用户滚轮拉历史的 snapshot 携带更多 scrollback：baseSeq 相同不代表屏幕内容相同，
+    // 必须 reset+重绘，不能走 skip 路径。
+    renderTerminalPaneWithOutput(
+      [
+        { kind: "snapshot", bytes: encoder.encode("first-snapshot\n"), baseSeq: 10, size: DEFAULT_TERMINAL_SIZE },
+        {
+          kind: "snapshot",
+          bytes: encoder.encode("ancient-history\nfirst-snapshot\n"),
+          baseSeq: 10,
+          size: DEFAULT_TERMINAL_SIZE,
+          revealHistory: true,
+        },
+      ],
+      { onTerminalSeqRendered },
+    );
+
+    await screen.findByText("ancient-history", { exact: false });
+    const operations = (globalThis as {
+      __TERMD_TEST_TERMINAL_STATS__?: {
+        operations: Array<{ op: string; cols?: number; rows?: number; text?: string }>;
+        writtenBytes: number;
+      };
+    }).__TERMD_TEST_TERMINAL_STATS__;
+    const stats = operations ?? { operations: [], writtenBytes: 0 };
+    expect(stats.operations.filter((operation) => operation.op === "reset").length).toBe(2);
+    // 第一个 snapshot 15 字节 + 第二个 snapshot（"ancient-history\n" 16 字节 + "first-snapshot\n" 15 字节）
+    expect(stats.writtenBytes).toBe(15 + 16 + 15);
+    expect(onTerminalSeqRendered.mock.calls).toEqual([[10], [10]]);
+  });
+
   it("snapshot 按自身尺寸重绘，并在 tail resize 后再写后续 output", async () => {
     const encoder = new TextEncoder();
     const onTerminalSeqRendered = vi.fn();

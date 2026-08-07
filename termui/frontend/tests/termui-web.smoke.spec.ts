@@ -817,8 +817,7 @@ test("mobile keyboard open 会重排 shell 高度且不写回 PTY", async ({ pag
   }
 });
 
-test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestInfo) => {
-  const daemon = await MockDaemon.start({
+test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestInfo) => {  const daemon = await MockDaemon.start({
     token: "secret-token",
     sessions: [
       {
@@ -1199,6 +1198,59 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
     }
     const localStorageText = await page.evaluate(() => JSON.stringify(window.localStorage));
     expect(localStorageText).not.toContain("secret-token");
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("开启上送分析日志后诊断事件批量回传 daemon", async ({ page }, testInfo: TestInfo) => {
+  test.skip(testInfo.project.name !== "chromium", "settings-only flow");
+  const secondSessionId = "00000000-0000-0000-0000-000000000503";
+  const daemon = await MockDaemon.start({
+    token: "secret-token",
+    sessions: [
+      {
+        session_id: "00000000-0000-0000-0000-000000000502",
+        name: "Upload Anchor",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+      {
+        session_id: secondSessionId,
+        name: "Second Shell",
+        state: "running",
+        size: { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+      },
+    ],
+    attachOutput: "upload-diag-ready\n",
+  });
+
+  try {
+    await page.goto("/");
+    await page.getByLabel("WS URL").fill(daemon.url);
+    await page.getByLabel("Pairing token").fill(pairingInviteCode(daemon));
+    await activateButton(page, "Pair");
+    await expectTerminalLine(page, "upload-diag-ready", 8_000);
+    expect(daemon.clientDiagnosticsMessages).toHaveLength(0);
+
+    // 打开设置 → 开启「上送分析日志」（默认关闭）
+    await page.getByRole("button", { name: "Settings" }).click();
+    const dialog = page.getByRole("dialog", { name: "Settings" });
+    const toggle = dialog.getByRole("checkbox", { name: /diagnostic events/i });
+    await expect(toggle).not.toBeChecked();
+    await toggle.check();
+    await dialog.getByRole("button", { name: "Close settings" }).click();
+
+    // 切换 session 产生一批终端诊断事件；定时 flush 应把批次回传到 daemon
+    await page.getByRole("button", { name: "Open Second Shell" }).click();
+    await expectTerminalLine(page, "upload-diag-ready", 8_000);
+
+    await expect.poll(() => daemon.clientDiagnosticsMessages.length).toBeGreaterThan(0);
+    const batch = daemon.clientDiagnosticsMessages[0];
+    expect(batch.context_id).toMatch(/^page-/);
+    expect(batch.event_count).toBeGreaterThan(0);
+    expect(batch.events.map((event) => event.name)).toContain("terminal_pane_create");
+    expect(JSON.stringify(batch)).not.toContain("secret-token");
   } finally {
     await daemon.stop();
   }
