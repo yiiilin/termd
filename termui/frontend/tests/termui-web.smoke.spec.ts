@@ -1203,6 +1203,20 @@ test("pair、list、attach 的浏览器 smoke", async ({ page }, testInfo: TestI
   }
 });
 
+test("版本号徽标点击后显示版本信息弹窗", async ({ page }) => {
+  // 未配对的管理页也显示版本号徽标；探测结果依赖外网，只断言稳定的弹窗交互。
+  await page.goto("/");
+  const badge = page.getByRole("button", { name: "Version update" });
+  await expect(badge).toBeVisible();
+  await expect(badge.getByText(/^v\d+\.\d+\.\d+$/)).toBeVisible();
+  await badge.click();
+  const dialog = page.getByRole("dialog", { name: "Version update" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText("Current version")).toBeVisible();
+  const releaseLink = dialog.getByRole("link", { name: "View GitHub release" });
+  await expect(releaseLink).toHaveAttribute("href", /^https:\/\/github\.com\/yiiilin\/termd\/releases/);
+});
+
 test("开启上送分析日志后诊断事件批量回传 daemon", async ({ page }, testInfo: TestInfo) => {
   test.skip(testInfo.project.name !== "chromium", "settings-only flow");
   const secondSessionId = "00000000-0000-0000-0000-000000000503";

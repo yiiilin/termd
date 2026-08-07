@@ -101,6 +101,7 @@ const SessionFilesPanel = lazy(() => import("./components/SessionFilesPanel").th
 const FileEditorDialog = lazy(() => import("./components/FileEditorDialog").then((module) => ({ default: module.FileEditorDialog })));
 const PairingQrScanner = lazy(() => import("./components/PairingQrScanner").then((module) => ({ default: module.PairingQrScanner })));
 const SettingsDialog = lazy(() => import("./components/SettingsDialog").then((module) => ({ default: module.SettingsDialog })));
+import { AppVersionBadge } from "./components/AppVersionBadge";
 const BrowserWorkspaceDialog = lazy(() => import("./components/BrowserWorkspaceDialog").then((module) => ({ default: module.BrowserWorkspaceDialog })));
 
 function LazyPanelFallback({ className = "panel" }: { className?: string }) {
@@ -4395,7 +4396,7 @@ export default function App() {
           <div className="admin-brand">
             <Cable size={18} aria-hidden="true" />
             <span>{t("app.adminTitle")}</span>
-            <span className="app-version">v{APP_VERSION}</span>
+            <AppVersionBadge />
           </div>
           <div className="admin-topbar-actions">
             <button type="button" className="icon-button" aria-label={t("app.settings")} onClick={() => setSettingsOpen(true)}>
@@ -4583,7 +4584,7 @@ export default function App() {
                 <div className="brand-title">
                   <Cable size={18} aria-hidden="true" />
                   <span>{t("app.termd")}</span>
-                  <span className="app-version">v{APP_VERSION}</span>
+                  <AppVersionBadge />
                 </div>
                 <button
                   type="button"
