@@ -3946,16 +3946,58 @@ fn parse_meminfo_kib(value: &str) -> u64 {
         .saturating_mul(1024)
 }
 
+/// 两次 CPU 采样之间的最小间隔（毫秒）。小于该间隔的连续调用复用上次计算值，
+/// 避免事件驱动 update 与周期推送交错时产生过小的 delta 窗口导致数值抖动。
+const MIN_CPU_SAMPLE_INTERVAL_MS: u64 = 1_000;
+
+struct CpuSampleState {
+    sample: CpuSample,
+    at_ms: u64,
+    last_percent: f32,
+}
+
+/// 进程级上一次 CPU 采样缓存。只被 `v070_metadata_payload` 在协议锁内调用；
+/// 临界区只拷贝两个 u64，不参与协议状态，用独立锁不会与协议锁交叉。
+static LAST_CPU_SAMPLE: std::sync::Mutex<Option<CpuSampleState>> = std::sync::Mutex::new(None);
+
 fn read_cpu_percent_snapshot() -> f32 {
+    let now_ms = current_unix_timestamp_millis().0;
     let Some(sample) = read_cpu_sample() else {
         return 0.0;
     };
-    if sample.total == 0 {
+    let mut guard = match LAST_CPU_SAMPLE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(state) = guard.as_mut() else {
+        *guard = Some(CpuSampleState {
+            sample,
+            at_ms: now_ms,
+            last_percent: 0.0,
+        });
+        return 0.0;
+    };
+    if now_ms.saturating_sub(state.at_ms) < MIN_CPU_SAMPLE_INTERVAL_MS {
+        return state.last_percent;
+    }
+    // 中文注释：/proc/stat 的 cpu 行是开机以来的累计计数器，直接相除会得到
+    // 「开机以来平均占用率」，长时间窗口内几乎恒定，状态面板看起来一动不动。
+    // 这里计算两次采样之间的增量，得到接近实时的占用率。
+    let percent = cpu_percent_between(state.sample, sample);
+    state.sample = sample;
+    state.at_ms = now_ms;
+    state.last_percent = percent;
+    percent
+}
+
+fn cpu_percent_between(previous: CpuSample, current: CpuSample) -> f32 {
+    let total_delta = current.total.saturating_sub(previous.total);
+    let idle_delta = current.idle.saturating_sub(previous.idle);
+    if total_delta == 0 {
         return 0.0;
     }
-    let busy = sample.total.saturating_sub(sample.idle);
-    // 状态面板不能在 protocol mutex 下 sleep 采样；这里展示启动以来的粗略占用率。
-    ((busy as f64 / sample.total as f64) * 100.0).clamp(0.0, 100.0) as f32
+    let busy_delta = total_delta.saturating_sub(idle_delta);
+    ((busy_delta as f64 / total_delta as f64) * 100.0).clamp(0.0, 100.0) as f32
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3985,6 +4027,88 @@ fn read_cpu_sample() -> Option<CpuSample> {
 #[cfg(target_os = "linux")]
 fn read_physical_network_bytes() -> (u64, u64) {
     read_physical_network_bytes_from_sys_class_net(Path::new("/sys/class/net"))
+}
+
+#[cfg(test)]
+mod cpu_sample_tests {
+    use super::*;
+
+    #[test]
+    fn cpu_percent_between_uses_delta_instead_of_boot_cumulative_average() {
+        // 开机累计值很大，直接相除会得到近恒定的小数（模拟旧实现的问题）；
+        // delta 计算只看两次采样之间的变化。
+        let previous = CpuSample {
+            total: 1_000_000,
+            idle: 950_000,
+        };
+        // 窗口内 busy 增加 40_000，idle 增加 60_000
+        let current = CpuSample {
+            total: 1_100_000,
+            idle: 1_010_000,
+        };
+        let percent = cpu_percent_between(previous, current);
+        assert!(
+            (percent - 40.0).abs() < 0.01,
+            "expected 40% busy delta, got {percent}"
+        );
+    }
+
+    #[test]
+    fn cpu_percent_between_handles_idle_only_and_unchanged_windows() {
+        // 窗口内全 idle
+        let idle_only = cpu_percent_between(
+            CpuSample {
+                total: 100,
+                idle: 80,
+            },
+            CpuSample {
+                total: 200,
+                idle: 180,
+            },
+        );
+        assert_eq!(idle_only, 0.0);
+
+        // 计数器没有推进（两次调用过于接近）
+        let unchanged = cpu_percent_between(
+            CpuSample {
+                total: 100,
+                idle: 80,
+            },
+            CpuSample {
+                total: 100,
+                idle: 80,
+            },
+        );
+        assert_eq!(unchanged, 0.0);
+    }
+
+    #[test]
+    fn cpu_percent_between_clamps_and_handles_full_busy() {
+        let full = cpu_percent_between(
+            CpuSample {
+                total: 100,
+                idle: 0,
+            },
+            CpuSample {
+                total: 200,
+                idle: 0,
+            },
+        );
+        assert_eq!(full, 100.0);
+
+        // idle 计数器回绕保护（saturating_sub 不 panic）
+        let wrapped = cpu_percent_between(
+            CpuSample {
+                total: 200,
+                idle: 150,
+            },
+            CpuSample {
+                total: 100,
+                idle: 50,
+            },
+        );
+        assert!(wrapped.is_finite());
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
