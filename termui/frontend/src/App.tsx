@@ -102,6 +102,7 @@ const FileEditorDialog = lazy(() => import("./components/FileEditorDialog").then
 const PairingQrScanner = lazy(() => import("./components/PairingQrScanner").then((module) => ({ default: module.PairingQrScanner })));
 const SettingsDialog = lazy(() => import("./components/SettingsDialog").then((module) => ({ default: module.SettingsDialog })));
 import { AppVersionBadge } from "./components/AppVersionBadge";
+import { ClientsDialog } from "./components/ClientsDialog";
 const BrowserWorkspaceDialog = lazy(() => import("./components/BrowserWorkspaceDialog").then((module) => ({ default: module.BrowserWorkspaceDialog })));
 
 function LazyPanelFallback({ className = "panel" }: { className?: string }) {
@@ -1102,12 +1103,13 @@ export default function App() {
       setSessionCreateMenuOpen(false);
     }
   }, [connectionReady, isMobileLayout]);
-  const { triggerRef: clientsTriggerRef, popoverRef: clientsPopoverRef } =
-    useDismissiblePopover<HTMLButtonElement, HTMLDivElement>({
-      open: connectionReady && !isMobileLayout && clientsOpen,
-      onClose: () => setClientsOpen(false),
-      focusFirst: false,
-    });
+  useEffect(() => {
+    if (clientsOpen) {
+      recordTermdDiagnostic("app_clients_popover_mounted", {
+        clientsCount: daemonClients.length,
+      }, { console: true });
+    }
+  }, [clientsOpen, daemonClients.length]);
   const commitOpenAdmin = useCallback((options: { editConnection?: boolean } = {}) => {
     setActiveSurface("admin");
     setMobilePanel(undefined);
@@ -1200,6 +1202,37 @@ export default function App() {
       return false;
     }
   }, [authenticatedWorkspaceClient]);
+
+  const handlePasteImage = useCallback(async (file: File) => {
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      const base64 = dataUrl.split(",")[1];
+      if (!base64) {
+        return undefined;
+      }
+      const client = await authenticatedWorkspaceClient(APP_CONNECTION_TIMEOUT_MS);
+      const response = await client.postAuthorized("/api/paste/image", {
+        session_id: attachedSessionId,
+        data_base64: base64,
+      });
+      if (!response.ok) {
+        return undefined;
+      }
+      const body = (await response.json()) as {
+        path?: unknown;
+        clipboard_set?: unknown;
+      };
+      if (typeof body.path !== "string" || body.path.length === 0) {
+        return undefined;
+      }
+      return {
+        path: body.path,
+        clipboardSet: body.clipboard_set === true,
+      };
+    } catch {
+      return undefined;
+    }
+  }, [authenticatedWorkspaceClient, attachedSessionId]);
 
   const markBrowserNotificationPrompted = useCallback(() => {
     setState((current) => ({ ...current, browserNotificationPrompted: true }));
@@ -4802,29 +4835,25 @@ export default function App() {
                 <span className="toolbar-action-label">{t("app.browser")}</span>
               </button>
               <button
-                ref={clientsTriggerRef}
                 type="button"
                 className="icon-button toolbar-clients-button"
                 aria-label={t("app.clients")}
                 title={t("app.clients")}
-                aria-controls="daemon-clients-popover"
+                aria-controls="daemon-clients-dialog"
                 aria-expanded={clientsOpen}
-                onClick={() => setClientsOpen((open) => !open)}
+                onClick={() => {
+                  recordTermdDiagnostic("app_clients_toggle", {
+                    opening: !clientsOpen,
+                    clientsCount: daemonClients.length,
+                    connectionReady,
+                    isMobileLayout,
+                  }, { console: true });
+                  setClientsOpen((open) => !open);
+                }}
               >
                 <UsersRound size={16} aria-hidden="true" />
                 <span className="toolbar-action-label">{t("app.clients")}</span>
               </button>
-              {clientsOpen ? (
-                <div ref={clientsPopoverRef} className="clients-popover toolbar-clients-popover" id="daemon-clients-popover">
-                  <Suspense fallback={<LazyPanelFallback className="daemon-clients" />}>
-                    <DaemonClientsPanel
-                      clients={daemonClients}
-                      sessions={sessions}
-                      currentDeviceId={state.device?.device_id}
-                    />
-                  </Suspense>
-                </div>
-              ) : null}
               <button
                 type="button"
                 className="icon-button toolbar-admin-button"
@@ -4903,6 +4932,7 @@ export default function App() {
                 mobileShortcuts={preferences.mobileShortcuts}
                 onInput={handleTerminalInput}
                 onResize={handleResize}
+                onPasteImage={handlePasteImage}
               />
               {connectionReady && showDesktopFilesPanel ? (
                 <>
@@ -5165,6 +5195,14 @@ export default function App() {
               onClose={() => setSettingsOpen(false)}
             />
           </Suspense>
+        ) : null}
+        {clientsOpen ? (
+          <ClientsDialog
+            clients={daemonClients}
+            sessions={sessions}
+            currentDeviceId={state.device?.device_id}
+            onClose={() => setClientsOpen(false)}
+          />
         ) : null}
         {browserWorkspaceOpen && activeServer && state.device ? (
           <Suspense fallback={<LazyModalFallback className="browser-workspace-dialog" />}>
@@ -5961,6 +5999,16 @@ function formatDuration(seconds: number): string {
 function appendCpuSample(samples: number[], sample: number): number[] {
   const boundedSample = Number.isFinite(sample) ? Math.max(0, Math.min(100, sample)) : 0;
   return [...samples, boundedSample].slice(-CPU_HISTORY_LIMIT);
+}
+
+/** 把图片 File 读成 data URL（用于 base64 上送 daemon 保存）。 */
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
 }
 
 function cpuBarChartRects(samples: number[], width: number, height: number, count: number) {

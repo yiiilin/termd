@@ -1,5 +1,5 @@
-import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { Copy } from "lucide-react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { Copy, X } from "lucide-react";
 import type { BrowserMobileShortcut, EffectiveTheme, TerminalSize } from "../protocol/types";
 import { useI18n } from "../i18n";
 import { terminalTheme } from "../theme";
@@ -74,8 +74,22 @@ interface DeferredTerminalFrameHandle {
   rescueHidden: (force?: boolean) => void;
 }
 
-function resolveTerminalSurfaceElement(host: HTMLElement | null | undefined): HTMLElement | undefined {
-  if (!host) {
+/** 从粘贴事件中取第一个图片文件（浏览器剪贴板里的图片）。 */
+function firstPastedImageFile(event: ClipboardEvent): File | undefined {
+  const files = event.clipboardData?.files;
+  if (!files) {
+    return undefined;
+  }
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files.item(index);
+    if (file && file.type.startsWith("image/")) {
+      return file;
+    }
+  }
+  return undefined;
+}
+
+function resolveTerminalSurfaceElement(host: HTMLElement | null | undefined): HTMLElement | undefined {  if (!host) {
     return undefined;
   }
   for (const selector of TERMINAL_SURFACE_SELECTOR_FALLBACKS) {
@@ -124,8 +138,17 @@ interface TerminalPaneProps {
   mobileShortcuts?: BrowserMobileShortcut[];
   onInput: (data: string) => void;
   onResize: (size: TerminalSize) => void;
+  /** 粘贴图片时的保存回调：上传到 daemon 并返回文件路径。 */
+  onPasteImage?: (file: File) => Promise<PasteImageResult | undefined>;
   /** @deprecated Cursor is derived locally from snapshot and PTY output. */
   onCursorChange?: (presence: { row: number; col: number; focused: boolean }) => void;
+}
+
+export interface PasteImageResult {
+  /** 保存到 daemon 机器的绝对路径（agent 可读）。 */
+  path: string;
+  /** 是否已写入 daemon 系统剪贴板（Codex TUI Ctrl+V 可直接附加）。 */
+  clipboardSet: boolean;
 }
 
 interface FocusTerminalInputSinkOptions {
@@ -245,6 +268,8 @@ export function TerminalPane(props: TerminalPaneProps) {
     startClientY: number;
   } | undefined>(undefined);
   const terminalSnapshotRedrawGenerationRef = useRef(0);
+  /** 切换清屏遮罩的强制揭幕定时器（attach 失败时防止终端一直黑屏）。 */
+  const snapshotRedrawMaskTimeoutRef = useRef<number | undefined>(undefined);
   const terminalResizeStabilizationTimerRef = useRef<number | undefined>(undefined);
   const terminalResizeRequestKeyRef = useRef<string | undefined>(undefined);
   const terminalResizeReportFrameRef = useRef<number | undefined>(undefined);
@@ -320,6 +345,11 @@ export function TerminalPane(props: TerminalPaneProps) {
   );
   const [copyToastVisible, setCopyToastVisible] = useState(false);
   const [terminalSelectionAvailable, setTerminalSelectionAvailable] = useState(false);
+  const [pastedImage, setPastedImage] = useState<{
+    objectUrl: string;
+    path: string;
+    clipboardSet: boolean;
+  } | undefined>(undefined);
   const [mobileDirectionActive, setMobileDirectionActive] = useState(false);
   const [mobileQuickKeysExpanded, setMobileQuickKeysExpanded] = useState(false);
   const [mobileModifiers, setMobileModifiers] = useState<ModifierState>(EMPTY_MOBILE_MODIFIERS);
@@ -2019,8 +2049,33 @@ export function TerminalPane(props: TerminalPaneProps) {
     }, TERMINAL_SCROLL_REPORT_INTERVAL_MS - elapsed);
   };
 
-  const sendTerminalControl = (data: string) => {
-    recordTermdDiagnostic("terminal_pane_send_terminal_control", {
+  const dismissPastedImage = useCallback(() => {
+    setPastedImage((current) => {
+      if (current) {
+        URL.revokeObjectURL(current.objectUrl);
+      }
+      return undefined;
+    });
+  }, []);
+
+  // 中文注释：粘贴图片 → daemon 保存为文件（agent 可读路径）+ 尽力写入系统
+  // 剪贴板（Codex TUI 的 Ctrl+V 走 arboard 读本机剪贴板），然后把路径插入输入。
+  const handlePastedImage = useCallback(async (file: File) => {
+    if (!props.onPasteImage) {
+      return;
+    }
+    const result = await props.onPasteImage(file);
+    if (!result) {
+      return;
+    }
+    const objectUrl = URL.createObjectURL(file);
+    setPastedImage({ objectUrl, path: result.path, clipboardSet: result.clipboardSet });
+    // 插入单引号包裹的路径；用户在 agent 里补 @ / --attach / /add 前缀。
+    sendTerminalControl(`'${result.path}'`);
+    queueCursorReport({ immediate: true });
+  }, [props.onPasteImage]);
+
+  const sendTerminalControl = (data: string) => {    recordTermdDiagnostic("terminal_pane_send_terminal_control", {
       chunkLength: data.length,
       mobileInputMode: mobileInputModeRef.current,
       passiveInputFocus: passiveInputFocusRef.current,
@@ -3095,6 +3150,14 @@ export function TerminalPane(props: TerminalPaneProps) {
       if (event.defaultPrevented) {
         return;
       }
+      const imageFile = firstPastedImageFile(event);
+      if (imageFile) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        void handlePastedImage(imageFile);
+        return;
+      }
       const text = event.clipboardData?.getData("text");
       if (!text) {
         return;
@@ -3825,6 +3888,10 @@ export function TerminalPane(props: TerminalPaneProps) {
     }
     return () => {
       disposed = true;
+      if (snapshotRedrawMaskTimeoutRef.current !== undefined) {
+        window.clearTimeout(snapshotRedrawMaskTimeoutRef.current);
+        snapshotRedrawMaskTimeoutRef.current = undefined;
+      }
       cleanupMountedRenderer?.();
       cleanupMountedRenderer = undefined;
     };
@@ -3858,7 +3925,21 @@ export function TerminalPane(props: TerminalPaneProps) {
     // 中文注释：同一 session 的 full snapshot / resync 不能再销毁整棵 xterm DOM。
     // 否则 helper textarea 会被替换，浏览器会把输入焦点直接打掉，表现成“闪一下再失焦”。
     // 这里原地 reset，并推进 writer generation 让旧 write callback 全部失效。
+    // 切换/重建前先盖住终端表面：清屏到新快照渲染之间有一个空屏窗口，
+    // 直接暴露会表现为“页面突然从头刷一遍”；遮罩在 snapshot 渲染后（或超时）揭开。
     const shouldRestoreTerminalFocusAfterReset = terminalInputHasDomFocus();
+    beginSnapshotRedrawMask();
+    if (snapshotRedrawMaskTimeoutRef.current !== undefined) {
+      window.clearTimeout(snapshotRedrawMaskTimeoutRef.current);
+    }
+    snapshotRedrawMaskTimeoutRef.current = window.setTimeout(() => {
+      snapshotRedrawMaskTimeoutRef.current = undefined;
+      // attach 失败/快照迟迟不来时强制揭幕，避免终端一直黑屏。
+      const currentHost = hostRef.current;
+      if (currentHost) {
+        delete currentHost.dataset.termdSnapshotRedraw;
+      }
+    }, 6000);
     resetWriterState();
     invalidateBottomScrollFollow();
     resetMobileCursorViewportWindow();
@@ -3930,6 +4011,28 @@ export function TerminalPane(props: TerminalPaneProps) {
               className="terminal-host"
               ref={hostRef}
             />
+            {pastedImage ? (
+              <div className="terminal-paste-notice" role="status" aria-label={t("pasteImage.saved")}>
+                <img className="terminal-paste-thumb" src={pastedImage.objectUrl} alt="" />
+                <div className="terminal-paste-info">
+                  <strong>{t("pasteImage.saved")}</strong>
+                  <code>{pastedImage.path}</code>
+                  <span>
+                    {pastedImage.clipboardSet
+                      ? t("pasteImage.clipboardHint")
+                      : t("pasteImage.pathHint")}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="icon-button terminal-paste-dismiss"
+                  aria-label={t("settings.close")}
+                  onClick={dismissPastedImage}
+                >
+                  <X size={14} aria-hidden="true" />
+                </button>
+              </div>
+            ) : null}
           </div>
         </div>
       </div>

@@ -10,7 +10,10 @@ use std::fs;
 use std::io::{self, Read, SeekFrom};
 use std::net::{AddrParseError, IpAddr, SocketAddr};
 use std::ops::Deref;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,8 +70,8 @@ use super::client_diagnostics;
 use super::protocol::V070TerminalOpen;
 use super::protocol::{
     DaemonProtocol, FileOfferDownloadError, ProtocolConnection, ProtocolError,
-    cleanup_persisted_session_file_http_uploads, file_offer_download_cookie_name,
-    parse_v070_terminal_open,
+    absolute_path_string, cleanup_persisted_session_file_http_uploads,
+    file_offer_download_cookie_name, parse_v070_terminal_open,
 };
 use super::signature::Ed25519SignatureVerifier;
 use recovery::warn_about_orphaned_supervisors;
@@ -272,6 +275,7 @@ fn update_api_router() -> Router<SharedDaemonProtocol> {
         .route("/api/update/check", post(update_check))
         .route("/api/update/apply", post(update_apply))
         .route("/api/update/relay", post(update_relay))
+        .route("/api/paste/image", post(paste_image))
 }
 
 /// Local daemon-control routes. This router is served only over the Unix socket.
@@ -3055,6 +3059,221 @@ fn relay_http_base(endpoint: &str) -> Option<String> {
     }
 }
 
+/// 粘贴图片的请求体上限（base64 后约膨胀 33%，10MB 原图 → ~13.4MB body）。
+const PASTE_IMAGE_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+const PASTE_IMAGE_MAX_RAW_BYTES: usize = 10 * 1024 * 1024;
+/// 粘贴文件保留天数；daemon 启动时清理过期文件。
+const PASTE_IMAGE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+#[derive(Deserialize)]
+struct PasteImageRequest {
+    /// 当前 attached session；缺失时保存到 daemon 状态目录的 paste 子目录。
+    session_id: Option<SessionId>,
+    /// 原始图片字节（base64）。
+    data_base64: String,
+}
+
+/// 粘贴图片：保存到 session 工作目录（agent 可读），并尽力写入系统剪贴板
+/// （供 arboard 类 agent——Codex TUI 的 Ctrl+V——直接读取）。
+/// 文件名与扩展名完全由服务端生成（魔数白名单），不信任客户端输入。
+async fn paste_image(
+    State(protocol): State<SharedDaemonProtocol>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if let Err(response) = authenticated_device(&protocol, &headers).await {
+        return response;
+    }
+    let body_bytes = match to_bytes(body, PASTE_IMAGE_MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "pasted image exceeds the 16 MiB request limit",
+                false,
+            );
+        }
+    };
+    let request: PasteImageRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "request body must be a JSON object with data_base64",
+                false,
+            );
+        }
+    };
+    let raw = match base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &request.data_base64,
+    ) {
+        Ok(raw) if !raw.is_empty() && raw.len() <= PASTE_IMAGE_MAX_RAW_BYTES => raw,
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_image",
+                "data_base64 must decode to 1..=10 MiB of image bytes",
+                false,
+            );
+        }
+    };
+    let Some(extension) = image_extension_by_magic(&raw) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_image",
+            "only PNG, JPEG, WebP and GIF images are supported",
+            false,
+        );
+    };
+
+    let (target_dir, fallback_dir) = {
+        let guard = protocol.lock().await;
+        let session_dir = guard.session_paste_directory(request.session_id);
+        let state_dir = guard
+            .config()
+            .state_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        (session_dir, state_dir.join("paste"))
+    };
+    let directory = target_dir.clone().unwrap_or_else(|| fallback_dir.clone());
+    if let Err(error) = fs::create_dir_all(&directory) {
+        tracing::warn!(path = %directory.display(), %error, "failed to create paste directory");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "paste_save_failed",
+            "failed to create the paste directory",
+            false,
+        );
+    }
+    let file_name = format!(
+        "termd-paste-{}-{}.{extension}",
+        current_unix_timestamp_millis().0,
+        rand_suffix()
+    );
+    let file_path = directory.join(&file_name);
+    let write_result = fs::write(&file_path, &raw)
+        .and_then(|()| fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600)));
+    if let Err(error) = write_result {
+        tracing::warn!(path = %file_path.display(), %error, "failed to write pasted image");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "paste_save_failed",
+            "failed to save the pasted image",
+            false,
+        );
+    }
+
+    // 尽力写入系统剪贴板（X11 xclip）：daemon 无头服务下通常失败，静默降级为仅路径。
+    let clipboard_set = write_image_to_clipboard(&file_path, extension);
+
+    // 异步清理过期粘贴文件（不在请求路径里做 IO）。
+    let fallback = fallback_dir;
+    let session_dir_cleanup = target_dir;
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut dirs = Vec::new();
+            if let Some(dir) = session_dir_cleanup {
+                dirs.push(dir);
+            }
+            dirs.push(fallback);
+            for dir in dirs {
+                prune_paste_files(&dir);
+            }
+        })
+        .await;
+    });
+
+    Json(serde_json::json!({
+        "path": absolute_path_string(&file_path),
+        "file_name": file_name,
+        "clipboard_set": clipboard_set,
+    }))
+    .into_response()
+}
+
+/// 根据魔数识别图片格式；只接受常见位图格式。
+fn image_extension_by_magic(raw: &[u8]) -> Option<&'static str> {
+    if raw.len() >= 8 && raw.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("png")
+    } else if raw.len() >= 3 && raw.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("jpg")
+    } else if raw.len() >= 12 && raw.starts_with(b"RIFF") && &raw[8..12] == b"WEBP" {
+        Some("webp")
+    } else if raw.len() >= 6 && raw.starts_with(b"GIF8") {
+        Some("gif")
+    } else {
+        None
+    }
+}
+
+fn rand_suffix() -> String {
+    use rand_core::RngCore;
+    let mut bytes = [0_u8; 6];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// 尽力把图片写入 X11 剪贴板（Codex TUI 等用 arboard 读本机剪贴板的 agent）。
+fn write_image_to_clipboard(path: &std::path::Path, extension: &str) -> bool {
+    let mime = match extension {
+        "png" => "image/png",
+        "jpg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => return false,
+    };
+    for display in ["", ":0", ":100"] {
+        let mut command = Command::new("xclip");
+        command
+            .arg("-selection")
+            .arg("clipboard")
+            .arg("-t")
+            .arg(mime)
+            .arg("-i")
+            .arg(path);
+        if !display.is_empty() {
+            command.arg("-display").arg(display);
+        }
+        match command.status() {
+            Ok(status) if status.success() => return true,
+            _ => continue,
+        }
+    }
+    false
+}
+
+/// 清理超过 TTL 的粘贴文件（幂等；目录不存在时静默）。
+fn prune_paste_files(directory: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let now_ms = current_unix_timestamp_millis().0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("termd-paste-") {
+            continue;
+        }
+        if let Ok(metadata) = entry.metadata()
+            && let Ok(modified) = metadata.modified()
+            && let Ok(age) = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| now_ms.saturating_sub(duration.as_secs() * 1000))
+        {
+            if age > PASTE_IMAGE_TTL_SECS * 1000 {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 async fn handle_v070_json_control_request(
     protocol: SharedDaemonProtocol,
     method: String,
@@ -5488,6 +5707,90 @@ mod tests {
             .expect("router should respond");
         // 未配置 relay 端点 → 400；已认证的调用不会拿到 401。
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn paste_image_requires_authentication_and_valid_image_magic() {
+        let fixture = test_protocol("paste-image-auth");
+        let app = router(fixture.protocol.clone(), false);
+
+        // 无凭证 → 401
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/paste/image")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let (_, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        // 非图片魔数 → 400
+        let not_image = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/paste/image")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {access_token}"))
+                    .body(Body::from(serde_json::json!({
+                        "data_base64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"#!/bin/sh\nrm -rf /"),
+                    }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(not_image.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn paste_image_saves_png_to_fallback_directory() {
+        let fixture = test_protocol("paste-image-save");
+        let (_, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        // 最小 PNG 文件头（合法魔数）
+        let png: Vec<u8> = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89,
+        ];
+        let response = router(fixture.protocol.clone(), false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/paste/image")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", format!("Bearer {access_token}"))
+                    .body(Body::from(serde_json::json!({
+                        "data_base64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png),
+                    }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let path = body["path"].as_str().expect("path should be present");
+        assert!(path.contains("termd-paste-"), "unexpected path: {path}");
+        assert!(path.ends_with(".png"));
+        assert!(
+            std::path::Path::new(path).exists(),
+            "saved file should exist"
+        );
+        // 保存内容与上传一致
+        let saved = std::fs::read(path).expect("saved file should be readable");
+        assert_eq!(saved, png);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

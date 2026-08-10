@@ -137,6 +137,9 @@ const enUS = {
   "updateCheck.updateNow": "Update now",
   "updateCheck.updating": "Updating…",
   "updateCheck.restarting": "Applied; restarting the service…",
+  "pasteImage.saved": "Image saved",
+  "pasteImage.clipboardHint": "Also copied to the system clipboard: press Ctrl+V in the agent to attach it.",
+  "pasteImage.pathHint": "Path inserted. Reference it in the agent with @path / --attach / /add.",
 
   "connection.wsUrl": "WS URL",
   "connection.panelAria": "connection",
@@ -547,6 +550,9 @@ const zhCN: Record<TranslationKey, string> = {
   "updateCheck.updateNow": "立即更新",
   "updateCheck.updating": "更新中…",
   "updateCheck.restarting": "已受理，服务重启中…",
+  "pasteImage.saved": "图片已保存",
+  "pasteImage.clipboardHint": "已同时写入系统剪贴板：在 agent 里按 Ctrl+V 即可附加。",
+  "pasteImage.pathHint": "路径已插入输入，在 agent 里用 @路径 / --attach / /add 引用。",
 
   "connection.wsUrl": "WS URL",
   "connection.panelAria": "连接",

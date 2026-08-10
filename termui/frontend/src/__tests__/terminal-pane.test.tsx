@@ -1933,6 +1933,193 @@ describe("TerminalPane terminal sequence rendering", () => {
     }
   });
 
+  it("粘贴图片时保存到 daemon、插入路径并显示预览条", async () => {
+    const onInput = vi.fn();
+    const onPasteImage = vi.fn(async () => ({
+      path: "/workspace/termd-paste-123.png",
+      clipboardSet: false,
+    }));
+    render(
+      <TerminalPane
+        attached
+        sessionSize={DEFAULT_TERMINAL_SIZE}
+        outputResetVersion={0}
+        takeOutput={vi.fn<() => TerminalOutputItem[]>(() => [])}
+        registerOutputDrain={vi.fn(() => () => undefined)}
+        onInput={onInput}
+        onResize={vi.fn()}
+        onCursorChange={vi.fn()}
+        onPasteImage={onPasteImage}
+      />,
+    );
+    const terminalInput = await waitFor(() => {
+      const element = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(element).not.toBeNull();
+      return element!;
+    });
+
+    const png = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], "clipboard.png", { type: "image/png" });
+    const pasteEvent = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;
+    Object.defineProperty(pasteEvent, "clipboardData", {
+      configurable: true,
+      value: {
+        files: { length: 1, item: () => png },
+        getData: () => "",
+      },
+    });
+    terminalInput.dispatchEvent(pasteEvent);
+
+    expect(pasteEvent.defaultPrevented).toBe(true);
+    await waitFor(() => expect(onPasteImage).toHaveBeenCalledWith(png));
+    await waitFor(() => expect(onInput).toHaveBeenCalledWith("'/workspace/termd-paste-123.png'"));
+    const notice = document.querySelector(".terminal-paste-notice");
+    expect(notice).not.toBeNull();
+    expect(notice!.textContent).toContain("/workspace/termd-paste-123.png");
+
+    // 关闭预览条
+    fireEvent.click(notice!.querySelector("button")!);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(document.querySelector(".terminal-paste-notice")).toBeNull();
+  });
+
+  it("粘贴纯文本不触发图片保存", async () => {
+    const onInput = vi.fn();
+    const onPasteImage = vi.fn();
+    render(
+      <TerminalPane
+        attached
+        sessionSize={DEFAULT_TERMINAL_SIZE}
+        outputResetVersion={0}
+        takeOutput={vi.fn<() => TerminalOutputItem[]>(() => [])}
+        registerOutputDrain={vi.fn(() => () => undefined)}
+        onInput={onInput}
+        onResize={vi.fn()}
+        onCursorChange={vi.fn()}
+        onPasteImage={onPasteImage}
+      />,
+    );
+    const terminalInput = await waitFor(() => {
+      const element = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Terminal input"]');
+      expect(element).not.toBeNull();
+      return element!;
+    });
+
+    const pasteEvent = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;
+    Object.defineProperty(pasteEvent, "clipboardData", {
+      configurable: true,
+      value: {
+        files: { length: 0, item: () => null },
+        getData: (type: string) => (type === "text" ? "plain-text-paste" : ""),
+      },
+    });
+    terminalInput.dispatchEvent(pasteEvent);
+
+    expect(pasteEvent.defaultPrevented).toBe(true);
+    await waitFor(() => expect(onInput).toHaveBeenCalledWith("plain-text-paste"));
+    expect(onPasteImage).not.toHaveBeenCalled();
+  });
+
+  it("切换清屏时终端表面被遮罩盖住，snapshot 渲染后揭幕", async () => {
+    const encoder = new TextEncoder();
+    let drain!: () => void;
+    const queue: TerminalOutputItem[] = [];
+    const takeOutput = vi.fn(() => queue.splice(0));
+    const registerOutputDrain = vi.fn((drainFn: () => void) => {
+      drain = drainFn;
+      return () => undefined;
+    });
+    const { rerender } = render(
+      <TerminalPane
+        attached
+        sessionSize={DEFAULT_TERMINAL_SIZE}
+        outputResetVersion={0}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onInput={vi.fn()}
+        onResize={vi.fn()}
+        onCursorChange={vi.fn()}
+      />,
+    );
+
+    queue.push({ kind: "snapshot", bytes: encoder.encode("session-a\n"), baseSeq: 10, size: DEFAULT_TERMINAL_SIZE });
+    act(() => { drain(); });
+    await screen.findByText("session-a", { exact: false });
+    const host = terminalHost();
+    // 首次渲染完成：遮罩已揭幕
+    await waitFor(() => expect(host.dataset.termdSnapshotRedraw).toBeUndefined());
+
+    // 切换 session：outputResetVersion 递增 → 清屏并盖遮罩
+    queue.push({ kind: "snapshot", bytes: encoder.encode("session-b\n"), baseSeq: 20, size: DEFAULT_TERMINAL_SIZE });
+    rerender(
+      <TerminalPane
+        attached
+        sessionSize={DEFAULT_TERMINAL_SIZE}
+        outputResetVersion={1}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onInput={vi.fn()}
+        onResize={vi.fn()}
+        onCursorChange={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(host.dataset.termdSnapshotRedraw).toBe("true"));
+
+    // 新快照渲染完成 → 揭幕
+    await screen.findByText("session-b", { exact: false });
+    await waitFor(() => expect(host.dataset.termdSnapshotRedraw).toBeUndefined());
+  });
+
+  it("切换遮罩在快照迟迟不来时超时强制揭幕", async () => {
+    vi.useFakeTimers();
+    let drain!: () => void;
+    const queue: TerminalOutputItem[] = [];
+    const takeOutput = vi.fn(() => queue.splice(0));
+    const registerOutputDrain = vi.fn((drainFn: () => void) => {
+      drain = drainFn;
+      return () => undefined;
+    });
+    const { rerender } = render(
+      <TerminalPane
+        attached
+        sessionSize={DEFAULT_TERMINAL_SIZE}
+        outputResetVersion={0}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onInput={vi.fn()}
+        onResize={vi.fn()}
+        onCursorChange={vi.fn()}
+      />,
+    );
+    const host = terminalHost();
+
+    // 切换后没有任何输出（attach 失败场景）
+    rerender(
+      <TerminalPane
+        attached
+        sessionSize={DEFAULT_TERMINAL_SIZE}
+        outputResetVersion={1}
+        takeOutput={takeOutput}
+        registerOutputDrain={registerOutputDrain}
+        onInput={vi.fn()}
+        onResize={vi.fn()}
+        onCursorChange={vi.fn()}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(host.dataset.termdSnapshotRedraw).toBe("true");
+
+    // 6 秒后强制揭幕
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6100);
+    });
+    expect(host.dataset.termdSnapshotRedraw).toBeUndefined();
+    vi.useRealTimers();
+  });
+
   it("Shift+Insert 读剪贴板失败时仍保留原生 paste 路径", async () => {
     const onInput = vi.fn();
     const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");

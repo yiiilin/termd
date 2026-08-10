@@ -8336,12 +8336,14 @@ describe("termui web 工作台", () => {
 
     await user.click(clientsTrigger);
     await screen.findByLabelText("daemon clients");
+    // modal 内 Tab 在对话框内循环焦点，不会关闭面板
     await user.tab();
-    expect(screen.queryByLabelText("daemon clients")).toBeNull();
-    expect(screen.getByRole("button", { name: "Daemons" })).toHaveFocus();
+    expect(screen.getByLabelText("daemon clients")).toBeInTheDocument();
 
+    await user.keyboard("{Escape}");
     await user.click(clientsTrigger);
     await screen.findByLabelText("daemon clients");
+    // 点击对话框外部（backdrop）关闭
     await user.click(screen.getByRole("button", { name: "Daemons" }));
     expect(screen.queryByLabelText("daemon clients")).toBeNull();
 

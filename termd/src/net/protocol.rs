@@ -3370,6 +3370,20 @@ where
             .map_err(ProtocolError::from)
     }
 
+    /// 图片粘贴的保存目录：优先当前 session 的工作目录（agent 就在那里运行），
+    /// 缺失时回退到 client history 记录的文件面板位置。
+    pub fn session_paste_directory(&self, session_id: Option<SessionId>) -> Option<PathBuf> {
+        let session_id = session_id?;
+        if let Some(cwd) = self.session_terminal_cwds.get(&session_id) {
+            return Some(cwd.clone());
+        }
+        self.client_history
+            .session_files_path(session_id)
+            .ok()
+            .flatten()
+            .map(PathBuf::from)
+    }
+
     fn refresh_session_terminal_cwd(
         &mut self,
         session_id: SessionId,
@@ -6307,7 +6321,7 @@ fn metadata_created_at_ms(metadata: &fs::Metadata) -> Option<UnixTimestampMillis
     Some(UnixTimestampMillis(millis))
 }
 
-fn absolute_path_string(path: &Path) -> String {
+pub(crate) fn absolute_path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
