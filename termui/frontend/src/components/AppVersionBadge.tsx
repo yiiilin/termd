@@ -31,17 +31,20 @@ export interface AppVersionBadgeProps {
   onUpdateTermd?: () => Promise<boolean>;
   /** 已认证的 relay 一键更新回调（经 daemon 代理）；返回是否受理。 */
   onUpdateRelay?: () => Promise<boolean>;
+  /** 是否已连接 daemon（未连接时更新按钮禁用）。 */
+  canUpdate?: boolean;
 }
 
 /**
  * 版本号徽标：显示运行组件的实际版本，后台探测 GitHub 最新 release；
  * 有新版本时版本号右上角显示黄色小点。经 relay 访问时额外显示 relay 版本，
- * 两个组件各自可一键更新。
+ * 两个组件各自可一键更新（需已连接 daemon）。
  */
 export function AppVersionBadge({
   termdVersion,
   onUpdateTermd,
   onUpdateRelay,
+  canUpdate = false,
 }: AppVersionBadgeProps) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
@@ -52,11 +55,19 @@ export function AppVersionBadge({
 
   const effectiveTermdVersion = termdVersion || APP_VERSION;
 
+  const runCheck = useCallback((force = false) => {
+    setCheckState("checking");
+    void checkLatestRelease({ force }).then((result) => {
+      setUpdateInfo(result);
+      setCheckState(result ? "done" : "failed");
+    });
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     // 延迟首次探测，避免与首屏加载抢带宽；此后每小时检查一次。
     // 结果缓存在 localStorage（1 小时），缓存有效时复用、不重复请求 GitHub API。
-    const runCheck = () => {
+    const runPeriodicCheck = () => {
       void checkLatestRelease().then((result) => {
         if (cancelled) {
           return;
@@ -65,8 +76,8 @@ export function AppVersionBadge({
         setCheckState(result ? "done" : "failed");
       });
     };
-    const initialTimer = window.setTimeout(runCheck, CHECK_DELAY_MS);
-    const interval = window.setInterval(runCheck, CHECK_INTERVAL_MS);
+    const initialTimer = window.setTimeout(runPeriodicCheck, CHECK_DELAY_MS);
+    const interval = window.setInterval(runPeriodicCheck, CHECK_INTERVAL_MS);
     return () => {
       cancelled = true;
       window.clearTimeout(initialTimer);
@@ -178,8 +189,20 @@ export function AppVersionBadge({
               </button>
             </header>
             <div className="version-check-body">
-              <UpdateComponentRow state={termdState} onUpdate={() => requestUpdate("termd")} t={t} />
-              {relayState ? <UpdateComponentRow state={relayState} onUpdate={() => requestUpdate("termrelay")} t={t} /> : null}
+              <UpdateComponentRow
+                state={termdState}
+                canUpdate={canUpdate}
+                onUpdate={() => requestUpdate("termd")}
+                t={t}
+              />
+              {relayState ? (
+                <UpdateComponentRow
+                  state={relayState}
+                  canUpdate={canUpdate}
+                  onUpdate={() => requestUpdate("termrelay")}
+                  t={t}
+                />
+              ) : null}
               <p className="version-check-note">
                 {checkState === "checking"
                   ? t("updateCheck.checking")
@@ -191,6 +214,15 @@ export function AppVersionBadge({
               </p>
             </div>
             <footer className="version-check-footer">
+              <button
+                type="button"
+                className="version-check-check-button"
+                disabled={checkState === "checking"}
+                onClick={() => runCheck(true)}
+              >
+                <RefreshCw size={13} aria-hidden="true" />
+                {checkState === "checking" ? t("updateCheck.checkingShort") : t("updateCheck.checkNow")}
+              </button>
               <a
                 href={updateInfo?.releaseUrl ?? "https://github.com/yiiilin/termd/releases"}
                 target="_blank"
@@ -210,12 +242,14 @@ export function AppVersionBadge({
 
 function UpdateComponentRow({
   state,
+  canUpdate,
   onUpdate,
   t,
 }: {
   state: UpdateComponentState;
+  canUpdate: boolean;
   onUpdate: () => void;
-  t: (key: "updateCheck.updateNow" | "updateCheck.updating" | "updateCheck.restarting") => string;
+  t: (key: "updateCheck.updateNow" | "updateCheck.updating" | "updateCheck.restarting" | "updateCheck.needConnection") => string;
 }) {
   return (
     <div className="version-check-component">
@@ -234,13 +268,14 @@ function UpdateComponentRow({
             <button
               type="button"
               className="version-check-update-button"
-              disabled={state.updateState === "requesting"}
+              disabled={state.updateState === "requesting" || !canUpdate}
               onClick={onUpdate}
             >
               <RefreshCw size={13} aria-hidden="true" />
               {state.updateState === "requesting" ? t("updateCheck.updating") : t("updateCheck.updateNow")}
             </button>
           )}
+          {!canUpdate ? <span className="version-check-need-connection">{t("updateCheck.needConnection")}</span> : null}
         </div>
       ) : null}
     </div>

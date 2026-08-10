@@ -29,6 +29,7 @@ function renderBadge(props: {
   termdVersion?: string;
   onUpdateTermd?: () => Promise<boolean>;
   onUpdateRelay?: () => Promise<boolean>;
+  canUpdate?: boolean;
 } = {}) {
   return render(
     <I18nProvider locale="en-US">
@@ -85,7 +86,7 @@ describe("AppVersionBadge", () => {
       { match: /\/version$/, response: new Response(JSON.stringify({ component: "termd", version: packageMetadata.version }), { status: 200 }) },
     ]);
     const onUpdateTermd = vi.fn(async () => true);
-    renderBadge({ termdVersion: packageMetadata.version, onUpdateTermd });
+    renderBadge({ termdVersion: packageMetadata.version, onUpdateTermd, canUpdate: true });
 
     const badge = screen.getByRole("button", { name: "Version update" });
     await settleCheck();
@@ -111,7 +112,7 @@ describe("AppVersionBadge", () => {
     ]);
     const onUpdateTermd = vi.fn(async () => true);
     const onUpdateRelay = vi.fn(async () => true);
-    renderBadge({ termdVersion: "0.9.6", onUpdateTermd, onUpdateRelay });
+    renderBadge({ termdVersion: "0.9.6", onUpdateTermd, onUpdateRelay, canUpdate: true });
 
     const badge = screen.getByRole("button", { name: "Version update" });
     await settleCheck();
@@ -132,6 +133,67 @@ describe("AppVersionBadge", () => {
     });
     expect(onUpdateRelay).toHaveBeenCalledTimes(1);
     expect(onUpdateTermd).not.toHaveBeenCalled();
+  });
+
+  it("弹窗内「检测版本」按钮强制重新请求 GitHub（跳过缓存）", async () => {
+    vi.useFakeTimers();
+    const fetchMock = installFetchMock([
+      { match: /api\.github\.com/, response: releaseResponse("v0.9.6") },
+      { match: /\/version$/, response: new Response(JSON.stringify({ component: "termd", version: "0.9.6" }), { status: 200 }) },
+    ]);
+    renderBadge({ termdVersion: "0.9.6" });
+    await settleCheck();
+    const githubCalls = () => fetchMock.mock.calls.filter(([input]) => String(input).includes("api.github.com")).length;
+    expect(githubCalls()).toBe(1);
+
+    const badge = screen.getByRole("button", { name: "Version update" });
+    await openDialog(badge);
+    const dialog = screen.getByRole("dialog", { name: "Version update" });
+    const checkButton = within(dialog).getByRole("button", { name: "Check for updates" });
+    fireEvent.click(checkButton);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    // 即使缓存未过期，手动检测也强制重新请求
+    expect(githubCalls()).toBe(2);
+  });
+
+  it("未连接 daemon 时更新按钮禁用并提示，连接后可用", async () => {
+    vi.useFakeTimers();
+    installFetchMock([
+      { match: /api\.github\.com/, response: releaseResponse("v99.0.0") },
+      { match: /\/version$/, response: new Response(JSON.stringify({ component: "termd", version: packageMetadata.version }), { status: 200 }) },
+    ]);
+    const onUpdateTermd = vi.fn(async () => true);
+    const { rerender } = renderBadge({ termdVersion: packageMetadata.version, onUpdateTermd, canUpdate: false });
+    const badge = screen.getByRole("button", { name: "Version update" });
+    await settleCheck();
+    await openDialog(badge);
+    const dialog = screen.getByRole("dialog", { name: "Version update" });
+    const updateButton = within(dialog).getByRole("button", { name: "Update now" });
+    expect(updateButton).toBeDisabled();
+    expect(within(dialog).getByText("Connect to the daemon to update")).toBeInTheDocument();
+    fireEvent.click(updateButton);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(onUpdateTermd).not.toHaveBeenCalled();
+
+    // 连接就绪后按钮可用
+    rerender(
+      <I18nProvider locale="en-US">
+        <AppVersionBadge
+          termdVersion={packageMetadata.version}
+          onUpdateTermd={onUpdateTermd}
+          canUpdate
+        />
+      </I18nProvider>,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(within(dialog).getByRole("button", { name: "Update now" })).toBeEnabled();
+    expect(within(dialog).queryByText("Connect to the daemon to update")).toBeNull();
   });
 
   it("探测失败不显示黄点，弹窗提示无法获取最新版本", async () => {

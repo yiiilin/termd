@@ -99,15 +99,16 @@ function writeCachedCheck(result: VersionCheckResult | undefined): void {
 }
 
 /**
- * 查询最新 release。优先返回未过期的本地缓存；未过期的失败缓存（cooldown）
- * 直接返回 undefined 不再请求；网络/解析失败写冷却缓存并静默返回 undefined。
+ * 查询最新 release。优先返回未过期的本地缓存（`force` 时跳过缓存直接请求）；
+ * 未过期的失败缓存（cooldown）直接返回 undefined 不再请求；网络/解析失败
+ * 写冷却缓存并静默返回 undefined。
  */
-export async function checkLatestRelease(): Promise<VersionCheckResult | undefined> {
+export async function checkLatestRelease(options: { force?: boolean } = {}): Promise<VersionCheckResult | undefined> {
   const cached = readCachedCheck();
-  if (cached.status === "valid") {
+  if (cached.status === "valid" && !options.force) {
     return cached.result;
   }
-  if (cached.status === "cooldown") {
+  if (cached.status === "cooldown" && !options.force) {
     return undefined;
   }
   try {

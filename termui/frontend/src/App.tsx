@@ -4453,6 +4453,7 @@ export default function App() {
               termdVersion={daemonStatus?.version ?? undefined}
               onUpdateTermd={handleTermdUpdate}
               onUpdateRelay={handleRelayUpdate}
+              canUpdate={connectionReady}
             />
           </div>
           <div className="admin-topbar-actions">
@@ -4645,6 +4646,7 @@ export default function App() {
                     termdVersion={daemonStatus?.version ?? undefined}
                     onUpdateTermd={handleTermdUpdate}
                     onUpdateRelay={handleRelayUpdate}
+                    canUpdate={connectionReady}
                   />
                 </div>
                 <button

@@ -506,7 +506,38 @@ label {
 
 .version-check-footer {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  gap: 10px;
+}
+
+.version-check-check-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--color-border-control);
+  border-radius: 6px;
+  padding: 4px 10px;
+  background: var(--color-surface-raised);
+  color: var(--color-text-strong);
+  font-size: 12px;
+  cursor: pointer;
+  min-height: 0;
+}
+
+.version-check-check-button:hover:not(:disabled) {
+  border-color: var(--color-border-hover);
+  background: var(--color-surface-active);
+}
+
+.version-check-check-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.version-check-need-connection {
+  font-size: 11px;
+  color: var(--color-warning-text);
 }
 
 .version-check-release-link {
