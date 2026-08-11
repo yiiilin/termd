@@ -165,6 +165,11 @@ pub fn check_update(
     }
     let release: ReleaseInfo = response.json()?;
     let latest = release.tag_name.trim().trim_start_matches('v').to_owned();
+    tracing::info!(
+        latest = %latest,
+        current = %current_version,
+        "update check: GitHub latest release"
+    );
     if !is_newer_version(&latest, current_version) {
         return Err(UpdateError::NoNewerRelease {
             current: current_version.to_owned(),
@@ -267,9 +272,19 @@ pub fn apply_update(request: ApplyRequest) -> Result<ApplyOutcome, UpdateError> 
     let bytes = response.bytes()?;
     fs::write(&downloaded, &bytes)?;
     fs::set_permissions(&downloaded, fs::Permissions::from_mode(0o755))?;
+    tracing::info!(
+        bytes = bytes.len(),
+        asset_url = %request.asset_url,
+        "update: downloaded release asset"
+    );
 
     // 版本校验
     let actual = probe_version(&downloaded);
+    tracing::info!(
+        actual = ?actual,
+        expected = %request.expected_version,
+        "update: downloaded binary version probe"
+    );
     let matches = match actual.as_deref() {
         Some(actual_out) => {
             parse_semver(actual_out) == parse_semver(&request.expected_version)
