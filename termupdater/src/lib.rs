@@ -79,15 +79,27 @@ pub struct UpdateInfo {
     pub asset_url: String,
 }
 
-/// 解析 semver 数字段；带 `v` 前缀或 pre-release 后缀时忽略对应部分。
+/// 从字符串中提取第一个可解析的 semver 数字段（`major.minor.patch`）。
+/// 容忍常见前缀（`v0.9.12`、`termd 0.9.12`）与 pre-release 后缀（`0.9.12-beta`）。
 pub fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
-    let trimmed = version.trim().trim_start_matches('v');
-    let core = trimmed.split(['-', '+']).next()?;
-    let mut parts = core.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    Some((major, minor, patch))
+    let bytes = version.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if !bytes[idx].is_ascii_digit() {
+            idx += 1;
+            continue;
+        }
+        let core = version[idx..].split(['-', '+']).next()?;
+        let mut parts = core.split('.');
+        let major = parts.next()?.parse().ok();
+        let minor = parts.next()?.parse().ok();
+        let patch = parts.next()?.parse().ok();
+        if let (Some(major), Some(minor), Some(patch)) = (major, minor, patch) {
+            return Some((major, minor, patch));
+        }
+        idx += 1;
+    }
+    None
 }
 
 /// `latest` 是否严格大于 `current`。
@@ -252,7 +264,13 @@ pub fn apply_update(request: ApplyRequest) -> Result<ApplyOutcome, UpdateError> 
 
     // 版本校验
     let actual = probe_version(&downloaded);
-    if actual.as_deref() != Some(request.expected_version.as_str()) {
+    let matches = match actual.as_deref() {
+        Some(actual_out) => {
+            parse_semver(actual_out) == parse_semver(&request.expected_version)
+        }
+        None => false,
+    };
+    if !matches {
         let _ = fs::remove_file(&downloaded);
         return Err(UpdateError::VersionCheckFailed {
             expected: request.expected_version,
@@ -387,6 +405,8 @@ mod tests {
         assert_eq!(parse_semver("v0.9.7"), Some((0, 9, 7)));
         assert_eq!(parse_semver("0.10.0-rc.1"), Some((0, 10, 0)));
         assert_eq!(parse_semver("garbage"), None);
+        assert_eq!(parse_semver("termd 0.9.12"), Some((0, 9, 12)));
+        assert_eq!(parse_semver("v0.9.12"), Some((0, 9, 12)));
         assert_eq!(parse_semver("0.9"), None);
     }
 
