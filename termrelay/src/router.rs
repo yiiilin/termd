@@ -242,6 +242,10 @@ fn http_api_tunnel_router() -> Router<RelayState> {
             post(relay_http_tunnel).options(relay_http_tunnel_preflight),
         )
         .route(
+            "/api/update/*path",
+            post(relay_http_tunnel).options(relay_http_tunnel_preflight),
+        )
+        .route(
             "/api/auth/*path",
             post(relay_http_tunnel).options(relay_http_tunnel_preflight),
         )
