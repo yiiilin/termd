@@ -22,7 +22,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 pub const GITHUB_REPO: &str = "yiiilin/termd";
-const LATEST_RELEASE_API_URL: &str = "https://api.github.com/repos/yiiilin/termd/releases/latest";
+const LATEST_RELEASE_API_PATH: &str = "/repos/yiiilin/termd/releases/latest";
 const UPDATE_LOCK_PATH: &str = "/tmp/termupdater.lock";
 /// 下载总时长上限：慢速但持续的下载（如 200KB/s 下 50MB 需 ~4 分钟）不会超时；
 /// 30 分钟兜底防止无限期挂起。
@@ -148,8 +148,14 @@ pub fn check_update(
     current_version: &str,
 ) -> Result<UpdateInfo, UpdateError> {
     let client = build_client()?;
+    // `?t=` 时间戳绕过 GitHub API 的 CDN 缓存：/releases/latest 的边缘节点缓存
+    // 可能滞后几分钟，导致更新器拿到旧 latest 而下载旧资产。
+    let latest_api_url = format!(
+        "https://api.github.com{LATEST_RELEASE_API_PATH}?t={}",
+        unix_timestamp_secs()
+    );
     let response = client
-        .get(LATEST_RELEASE_API_URL)
+        .get(&latest_api_url)
         .header("accept", "application/vnd.github+json")
         .send()?;
     if !response.status().is_success() {
