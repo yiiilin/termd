@@ -338,6 +338,7 @@ pub fn is_http_tunnel_path_allowed(method: &str, path: &str) -> bool {
     (method.eq_ignore_ascii_case("POST") && auth_path)
         || (method.eq_ignore_ascii_case("POST") && is_http_control_tunnel_path_allowed(path))
         || is_http_file_tunnel_path_allowed(method, path)
+        || (method.eq_ignore_ascii_case("POST") && path.starts_with("/api/update/"))
         || (method.eq_ignore_ascii_case("GET") && path == "/api/push/config")
         || (method.eq_ignore_ascii_case("PUT") && path == "/api/push/subscription")
         || (method.eq_ignore_ascii_case("DELETE") && path == "/api/push/subscription")
