@@ -2938,12 +2938,13 @@ async fn update_apply(
         );
     };
     let service_name = std::env::var("TERMD_SERVICE_NAME").unwrap_or_else(|_| "termd".to_owned());
+    let service_name_for_log = service_name.clone();
     let asset_url = info.asset_url.clone();
     let expected = info.latest.clone();
     // 后台执行下载/替换；延迟重启让上面的响应先送达浏览器。
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        let _ = tokio::task::spawn_blocking(move || {
+        let outcome = tokio::task::spawn_blocking(move || {
             termupdater::apply_update(termupdater::ApplyRequest {
                 binary_path,
                 service_name,
@@ -2952,6 +2953,21 @@ async fn update_apply(
             })
         })
         .await;
+        match outcome {
+            Ok(Ok(result)) => {
+                tracing::info!(
+                    replaced = result.replaced,
+                    service = %service_name_for_log,
+                    "termd update applied; restarting service"
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, "termd update failed");
+            }
+            Err(_) => {
+                tracing::error!("termd update task panicked");
+            }
+        }
     });
     Json(serde_json::json!({
         "current": current,
