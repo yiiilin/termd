@@ -560,7 +560,8 @@ fn relay_http_admission_requirement(path: &str) -> Option<RelayHttpAdmissionRequ
         path if path.starts_with("/api/control/")
             || path.starts_with("/api/browser/")
             || path.starts_with("/api/files/")
-            || path.starts_with("/api/push/") =>
+            || path.starts_with("/api/push/")
+            || path.starts_with("/api/update/") =>
         {
             Some(RelayHttpAdmissionRequirement::Signed {
                 scheme: "Bearer",
