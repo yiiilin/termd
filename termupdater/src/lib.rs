@@ -24,7 +24,11 @@ use thiserror::Error;
 pub const GITHUB_REPO: &str = "yiiilin/termd";
 const LATEST_RELEASE_API_URL: &str = "https://api.github.com/repos/yiiilin/termd/releases/latest";
 const UPDATE_LOCK_PATH: &str = "/tmp/termupdater.lock";
-const DOWNLOAD_TIMEOUT_SECS: u64 = 120;
+/// 下载总时长上限：慢速但持续的下载（如 200KB/s 下 50MB 需 ~4 分钟）不会超时；
+/// 30 分钟兜底防止无限期挂起。
+const DOWNLOAD_TOTAL_TIMEOUT_SECS: u64 = 1800;
+/// 连接建立的超时。
+const DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Error)]
 pub enum UpdateError {
@@ -97,16 +101,41 @@ pub fn is_newer_version(latest: &str, current: &str) -> bool {
     latest_parts > current_parts
 }
 
+/// 构建更新下载用的 HTTP client。
+///
+/// 读取标准环境变量代理（`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` 及其小写变体，
+/// 与 daemon relay 连接的代理约定一致）；`NO_PROXY`/`no_proxy` 用于排除内网直连。
+/// 超时采用「连接 30s + 读空闲 120s + 总上限 30min」，慢速但持续的下载不会超时。
+fn build_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
+    const PROXY_ENV_VARS: [&str; 6] = [
+        "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+    ];
+    const NO_PROXY_ENV_VARS: [&str; 2] = ["NO_PROXY", "no_proxy"];
+
+    let mut builder = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(DOWNLOAD_TOTAL_TIMEOUT_SECS))
+        .user_agent("termd-updater");
+    if let Some(proxy_url) = PROXY_ENV_VARS.iter().find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty())) {
+        let mut proxy = reqwest::Proxy::all(&proxy_url)?;
+        if let Some(no_proxy) = NO_PROXY_ENV_VARS
+            .iter()
+            .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+        {
+            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(&no_proxy));
+        }
+        builder = builder.proxy(proxy);
+    }
+    builder.build()
+}
+
 /// 查询 GitHub 最新 release 中与目标组件/架构匹配的资产。
 pub fn check_update(
     binary_name: &str,
     arch: &str,
     current_version: &str,
 ) -> Result<UpdateInfo, UpdateError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
-        .user_agent("termd-updater")
-        .build()?;
+    let client = build_client()?;
     let response = client
         .get(LATEST_RELEASE_API_URL)
         .header("accept", "application/vnd.github+json")
@@ -210,10 +239,7 @@ pub fn apply_update(request: ApplyRequest) -> Result<ApplyOutcome, UpdateError> 
     ));
 
     // 下载
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
-        .user_agent("termd-updater")
-        .build()?;
+    let client = build_client()?;
     let response = client.get(&request.asset_url).send()?;
     if !response.status().is_success() {
         return Err(UpdateError::ApiRequest(
