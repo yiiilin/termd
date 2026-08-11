@@ -21,10 +21,112 @@ type ViewerStatus = "connecting" | "connected" | "disconnected" | "stopped" | "e
 const FILE_OFFER_RETRY_BASE_DELAY_MS = 500;
 const FILE_OFFER_RETRY_MAX_DELAY_MS = 8_000;
 
+/** X11 keysym 常用值（与 noVNC KeyTable 一致）。 */
+const X11_KEYSYMS: Record<string, number> = {
+  Enter: 0xff0d,
+  Backspace: 0xff08,
+  Tab: 0xff09,
+  Escape: 0xff1b,
+  Delete: 0xffff,
+  Insert: 0xff63,
+  Home: 0xff50,
+  End: 0xff57,
+  PageUp: 0xff55,
+  PageDown: 0xff56,
+  ArrowLeft: 0xff51,
+  ArrowUp: 0xff52,
+  ArrowRight: 0xff53,
+  ArrowDown: 0xff54,
+  ShiftLeft: 0xffe1,
+  ShiftRight: 0xffe2,
+  ControlLeft: 0xffe3,
+  ControlRight: 0xffe4,
+  AltLeft: 0xffe9,
+  AltRight: 0xffea,
+  MetaLeft: 0xffe7,
+  MetaRight: 0xffe8,
+  CapsLock: 0xffe5,
+  NumLock: 0xff7f,
+  ScrollLock: 0xff14,
+  ContextMenu: 0xff67,
+};
+
+function functionKeyKeysym(key: string): number | undefined {
+  const match = /^F(\d{1,2})$/.exec(key);
+  if (!match) {
+    return undefined;
+  }
+  const index = Number(match[1]);
+  if (index < 1 || index > 35) {
+    return undefined;
+  }
+  return 0xffbe + index - 1;
+}
+
+/**
+/** 运行时 RFB 带 sendKey；@novnc/novnc 的类型声明未覆盖它。 */
+export type BrowserRfb = RFB & {
+  sendKey(keysym: number, code: string, down: boolean): void;
+};
+
+/**
+ * 把移动端软键盘的按键映射为 X11 keysym（noVNC 的 sendKey 需要）。
+ * ASCII 与 Latin-1（U+0020–U+00FF）keysym 与 Unicode 码点一致；
+ * 其余 Unicode 字符使用 X11 的 Unicode 映射（0x01000000 | 码点）；
+ * 功能键查表；组合按键（如 Shift+字母）由浏览器提供最终字符。
+ */
+export function browserViewerKeyToKeysym(key: string): number | undefined {
+  if (key.length === 1) {
+    const codepoint = key.codePointAt(0);
+    if (codepoint === undefined) {
+      return undefined;
+    }
+    return codepoint > 0xff ? 0x01000000 | codepoint : codepoint;
+  }
+  return X11_KEYSYMS[key] ?? functionKeyKeysym(key);
+}
+
+/** 把 input 键盘事件转发给 RFB（移动端软键盘）。 */
+export function forwardBrowserViewerKey(
+  rfb: BrowserRfb,
+  down: boolean,
+  event: { key: string; code: string; isComposing?: boolean },
+): boolean {
+  if (event.isComposing || event.key === "Dead" || event.key === "Process") {
+    return false;
+  }
+  const keysym = browserViewerKeyToKeysym(event.key);
+  if (keysym === undefined) {
+    return false;
+  }
+  rfb.sendKey(keysym, event.code, down);
+  return true;
+}
+
+/** 把输入法组合文本逐字符发送给 RFB（中文等 IME 的最终结果）。 */
+export function forwardBrowserViewerComposition(rfb: BrowserRfb, text: string): void {
+  for (const character of text) {
+    const codepoint = character.codePointAt(0);
+    if (codepoint === undefined) {
+      continue;
+    }
+    const keysym = codepoint > 0xff ? 0x01000000 | codepoint : codepoint;
+    rfb.sendKey(keysym, "", true);
+    rfb.sendKey(keysym, "", false);
+  }
+}
+
 export default function BrowserViewer({ browserId, serverId }: BrowserViewerProps) {
   const [browserState, setBrowserState] = useState<BrowserState>();
   const [loadError, setLoadError] = useState<SafeError>();
   const [systemTheme, setSystemTheme] = useState<EffectiveTheme>(() => preferredSystemTheme());
+
+  // 移动端（粗指针设备）才启用隐藏 input 唤起系统软键盘；
+  // 桌面端保持 noVNC 对 canvas 的原生键盘处理。
+  const coarsePointer = useMemo(
+    () => window.matchMedia?.("(pointer: coarse)").matches ?? false,
+    [],
+  );
 
   useEffect(() => {
     let active = true;
@@ -78,7 +180,7 @@ export default function BrowserViewer({ browserId, serverId }: BrowserViewerProp
   return (
     <I18nProvider locale={locale}>
       {server && device && !contextError ? (
-        <BrowserViewerSurface browserId={browserId} server={server} device={device} />
+        <BrowserViewerSurface browserId={browserId} server={server} device={device} coarsePointer={coarsePointer} />
       ) : (
         <div className="browser-viewer-fatal" role="alert">
           <span>{contextError?.message ?? t("browser.error.request")}</span>
@@ -93,15 +195,18 @@ function BrowserViewerSurface({
   browserId,
   server,
   device,
+  coarsePointer,
 }: {
   browserId: UUID;
   server: NonNullable<BrowserState["pairedServers"]>[number];
   device: NonNullable<BrowserState["device"]>;
+  coarsePointer: boolean;
 }) {
   const { t } = useI18n();
   const targetRef = useRef<HTMLDivElement>(null);
-  const rfbRef = useRef<RFB | undefined>(undefined);
+  const rfbRef = useRef<BrowserRfb | undefined>(undefined);
   const fileOfferClientRef = useRef<V070Client | undefined>(undefined);
+  const keyboardInputRef = useRef<HTMLInputElement>(null);
   const client = useMemo(
     () => new BrowserWorkspaceClient(server, device),
     [device.device_id, server.server_id, server.url],
@@ -185,7 +290,7 @@ function BrowserViewerSurface({
         shared: true,
         wsProtocols: ["termd.rfb.v1", token],
       });
-      rfbRef.current = rfb;
+      rfbRef.current = rfb as BrowserRfb;
       rfb.scaleViewport = true;
       rfb.resizeSession = false;
       rfb.clipViewport = false;
@@ -322,7 +427,47 @@ function BrowserViewerSurface({
           </button>
         </div>
       </header>
-      <div ref={targetRef} className="browser-viewer-canvas" aria-label={t("browser.remoteCanvas")} />
+      <div
+        ref={targetRef}
+        className="browser-viewer-canvas"
+        aria-label={t("browser.remoteCanvas")}
+        onClick={() => {
+          // 移动端：点击画面时聚焦隐藏 input 唤起系统软键盘；
+          // noVNC 的鼠标事件仍正常落在 canvas 上。
+          if (coarsePointer) {
+            keyboardInputRef.current?.focus();
+          }
+        }}
+      />
+      {/* 隐藏 input 必须位于 canvas 容器之外：RFB 连接时会对容器
+          replaceChildren()，容器内的 input 会被移除且 React 不知情。 */}
+      {coarsePointer ? (
+        <input
+          ref={keyboardInputRef}
+          className="browser-viewer-keyboard-input"
+          aria-hidden="true"
+          autoCapitalize="off"
+          autoCorrect="off"
+          autoComplete="off"
+          spellCheck={false}
+          enterKeyHint="go"
+          onKeyDown={(event) => {
+            const handled = forwardBrowserViewerKey(rfbRef.current!, true, event);
+            if (handled) {
+              event.preventDefault();
+            }
+          }}
+          onKeyUp={(event) => {
+            forwardBrowserViewerKey(rfbRef.current!, false, event);
+          }}
+          onCompositionEnd={(event) => {
+            const rfb = rfbRef.current;
+            if (rfb && event.data) {
+              forwardBrowserViewerComposition(rfb, event.data);
+            }
+          }}
+        />
+      ) : null}
       <FileOfferCenter
         offers={fileOffers}
         onDownload={(offerId) => void downloadFileOffer(offerId)}

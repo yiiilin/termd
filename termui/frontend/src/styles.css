@@ -1608,6 +1608,25 @@ label {
   height: 100%;
 }
 
+/* 移动端软键盘唤起：隐藏 input 覆盖在画面内，点击画面时聚焦它；
+   保持可见性（iOS 对 display:none/不可聚焦元素不弹键盘），但不可见且不拦截鼠标。 */
+.browser-viewer-keyboard-input {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0.01;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  color: transparent;
+  font-size: 16px;
+  pointer-events: none;
+  z-index: 1;
+}
+
 .browser-viewer-overlay {
   position: absolute;
   z-index: 4;

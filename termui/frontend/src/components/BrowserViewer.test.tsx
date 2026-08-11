@@ -1,7 +1,11 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BrowserState, FileOfferPayload } from "../protocol/types";
-import BrowserViewer from "./BrowserViewer";
+import BrowserViewer, {
+  browserViewerKeyToKeysym,
+  forwardBrowserViewerComposition,
+  forwardBrowserViewerKey,
+} from "./BrowserViewer";
 
 const viewerMocks = vi.hoisted(() => ({
   instances: [] as Array<EventTarget & {
@@ -33,6 +37,7 @@ vi.mock("@novnc/novnc", () => ({
     viewOnly = false;
     disconnect = vi.fn();
     sendCtrlAltDel = vi.fn();
+    sendKey = vi.fn();
 
     constructor(_target: HTMLElement, readonly url: string, readonly options: { wsProtocols?: string[] }) {
       super();
@@ -185,5 +190,92 @@ describe("BrowserViewer", () => {
 
     unmount();
     vi.useRealTimers();
+  });
+
+  describe("mobile keyboard forwarding", () => {
+    it("maps printable keys and function keys to X11 keysyms", () => {
+      expect(browserViewerKeyToKeysym("a")).toBe(0x61);
+      expect(browserViewerKeyToKeysym("A")).toBe(0x41);
+      expect(browserViewerKeyToKeysym("中")).toBe(0x01000000 | "中".codePointAt(0)!);
+      expect(browserViewerKeyToKeysym(" ")).toBe(0x20);
+      expect(browserViewerKeyToKeysym("Enter")).toBe(0xff0d);
+      expect(browserViewerKeyToKeysym("Backspace")).toBe(0xff08);
+      expect(browserViewerKeyToKeysym("ArrowLeft")).toBe(0xff51);
+      expect(browserViewerKeyToKeysym("ShiftLeft")).toBe(0xffe1);
+      expect(browserViewerKeyToKeysym("F1")).toBe(0xffbe);
+      expect(browserViewerKeyToKeysym("F12")).toBe(0xffc9);
+      expect(browserViewerKeyToKeysym("Meta")).toBeUndefined();
+    });
+
+    it("forwards keydown and keyup to RFB and reports handling", () => {
+      const rfb = new EventTarget() as never;
+      const sendKey = vi.fn();
+      (rfb as unknown as { sendKey: typeof sendKey }).sendKey = sendKey;
+
+      const handledDown = forwardBrowserViewerKey(
+        rfb as never,
+        true,
+        { key: "a", code: "KeyA", isComposing: false },
+      );
+      expect(handledDown).toBe(true);
+      expect(sendKey).toHaveBeenLastCalledWith(0x61, "KeyA", true);
+
+      const handledUp = forwardBrowserViewerKey(
+        rfb as never,
+        false,
+        { key: "a", code: "KeyA", isComposing: false },
+      );
+      expect(handledUp).toBe(true);
+      expect(sendKey).toHaveBeenLastCalledWith(0x61, "KeyA", false);
+    });
+
+    it("skips composing events so the IME can finish", () => {
+      const rfb = new EventTarget() as never;
+      const sendKey = vi.fn();
+      (rfb as unknown as { sendKey: typeof sendKey }).sendKey = sendKey;
+
+      const handled = forwardBrowserViewerKey(
+        rfb as never,
+        true,
+        { key: "a", code: "KeyA", isComposing: true },
+      );
+      expect(handled).toBe(false);
+      expect(sendKey).not.toHaveBeenCalled();
+    });
+
+    it("forwards composition text as key press pairs", () => {
+      const rfb = new EventTarget() as never;
+      const sendKey = vi.fn();
+      (rfb as unknown as { sendKey: typeof sendKey }).sendKey = sendKey;
+
+      forwardBrowserViewerComposition(rfb as never, "你好");
+      expect(sendKey).toHaveBeenCalledTimes(4);
+      expect(sendKey).toHaveBeenNthCalledWith(1, 0x01000000 | "你".codePointAt(0)!, "", true);
+      expect(sendKey).toHaveBeenNthCalledWith(2, 0x01000000 | "你".codePointAt(0)!, "", false);
+      expect(sendKey).toHaveBeenNthCalledWith(3, 0x01000000 | "好".codePointAt(0)!, "", true);
+      expect(sendKey).toHaveBeenNthCalledWith(4, 0x01000000 | "好".codePointAt(0)!, "", false);
+    });
+
+    it("keeps the keyboard input alive when RFB replaces canvas children", async () => {
+      const { unmount } = render(<BrowserViewer browserId={browserId} serverId={serverId} />);
+      await waitFor(() => expect(viewerMocks.instances).toHaveLength(1));
+
+      const canvas = document.querySelector(".browser-viewer-canvas");
+      const input = document.querySelector<HTMLInputElement>(".browser-viewer-keyboard-input");
+      expect(canvas).not.toBeNull();
+      expect(input).not.toBeNull();
+      // input 必须在 canvas 容器之外：RFB 连接时对容器 replaceChildren()，
+      // 容器内的 input 会被移除且 React 不知情（ref 指向 detached 节点）。
+      expect(canvas!.contains(input)).toBe(false);
+
+      // 模拟 noVNC 连接时清空容器（真实 RFB 构造时执行 replaceChildren）。
+      canvas!.replaceChildren();
+
+      fireEvent.click(canvas!);
+      expect(document.activeElement).toBe(input);
+      expect(document.querySelector(".browser-viewer-keyboard-input")).not.toBeNull();
+
+      unmount();
+    });
   });
 });
