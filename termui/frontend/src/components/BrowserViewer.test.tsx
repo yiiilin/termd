@@ -270,10 +270,24 @@ describe("BrowserViewer", () => {
 
       // 模拟 noVNC 连接时清空容器（真实 RFB 构造时执行 replaceChildren）。
       canvas!.replaceChildren();
+      const rfb = viewerMocks.instances[0] as unknown as EventTarget;
+      rfb.dispatchEvent(new Event("connect"));
+      const keyboardButton = screen.getByRole("button", { name: "Show keyboard" });
+      await waitFor(() => expect(keyboardButton).toBeEnabled());
 
+      // 点击画面不自动唤起键盘（画面点击是鼠标语义）。
       fireEvent.click(canvas!);
+      expect(document.activeElement).not.toBe(input);
+
+      // 点击键盘按钮打开软键盘。
+      fireEvent.click(keyboardButton);
       expect(document.activeElement).toBe(input);
+      expect(input!.readOnly).toBe(false);
       expect(document.querySelector(".browser-viewer-keyboard-input")).not.toBeNull();
+
+      // 再点收起软键盘（readonly + blur）。
+      fireEvent.click(keyboardButton);
+      expect(input!.readOnly).toBe(true);
 
       unmount();
     });

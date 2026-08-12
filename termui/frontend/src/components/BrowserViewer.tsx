@@ -217,6 +217,25 @@ function BrowserViewerSurface({
   const [stopDialogOpen, setStopDialogOpen] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [fileOffers, setFileOffers] = useState<VisibleFileOffer[]>([]);
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+
+  // 移动端：键盘按钮开关系统软键盘。收起时把 input 置为 readonly——
+  // 这是 iOS/Android 上可靠收起软键盘的标准做法（blur 在某些浏览器不生效）。
+  const toggleKeyboard = useCallback(() => {
+    const input = keyboardInputRef.current;
+    if (!input) {
+      return;
+    }
+    if (keyboardOpen) {
+      input.readOnly = true;
+      input.blur();
+      setKeyboardOpen(false);
+    } else {
+      input.readOnly = false;
+      input.focus();
+      setKeyboardOpen(true);
+    }
+  }, [keyboardOpen]);
 
   useEffect(() => () => client.dispose(), [client]);
 
@@ -388,11 +407,17 @@ function BrowserViewerSurface({
         <div className="browser-viewer-actions">
           <button
             type="button"
-            className="icon-button"
-            aria-label={t("browser.sendCtrlAltDel")}
-            title={t("browser.sendCtrlAltDel")}
+            className={`icon-button${coarsePointer && keyboardOpen ? " browser-viewer-keyboard-active" : ""}`}
+            aria-label={coarsePointer ? t("browser.toggleKeyboard") : t("browser.sendCtrlAltDel")}
+            title={coarsePointer ? t("browser.toggleKeyboard") : t("browser.sendCtrlAltDel")}
             disabled={status !== "connected"}
-            onClick={() => rfbRef.current?.sendCtrlAltDel()}
+            onClick={() => {
+              if (coarsePointer) {
+                toggleKeyboard();
+              } else {
+                rfbRef.current?.sendCtrlAltDel();
+              }
+            }}
           >
             <Keyboard size={16} aria-hidden="true" />
           </button>
@@ -431,13 +456,6 @@ function BrowserViewerSurface({
         ref={targetRef}
         className="browser-viewer-canvas"
         aria-label={t("browser.remoteCanvas")}
-        onClick={() => {
-          // 移动端：点击画面时聚焦隐藏 input 唤起系统软键盘；
-          // noVNC 的鼠标事件仍正常落在 canvas 上。
-          if (coarsePointer) {
-            keyboardInputRef.current?.focus();
-          }
-        }}
       />
       {/* 隐藏 input 必须位于 canvas 容器之外：RFB 连接时会对容器
           replaceChildren()，容器内的 input 会被移除且 React 不知情。 */}
@@ -451,6 +469,7 @@ function BrowserViewerSurface({
           autoComplete="off"
           spellCheck={false}
           enterKeyHint="go"
+          readOnly={!keyboardOpen}
           onKeyDown={(event) => {
             const handled = forwardBrowserViewerKey(rfbRef.current!, true, event);
             if (handled) {

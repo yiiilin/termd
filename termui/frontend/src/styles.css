@@ -1594,6 +1594,12 @@ label {
   color: var(--color-danger-soft);
 }
 
+/* 移动端软键盘开关的激活态 */
+.browser-viewer-keyboard-active {
+  color: var(--color-accent, var(--color-info));
+  background: color-mix(in srgb, var(--color-accent, var(--color-info)) 14%, transparent);
+}
+
 .browser-viewer-canvas {
   position: relative;
   min-width: 0;
