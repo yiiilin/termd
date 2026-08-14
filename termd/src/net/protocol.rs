@@ -30,7 +30,7 @@ use base64::{
     engine::general_purpose::{self, URL_SAFE_NO_PAD},
 };
 use rand_core::{OsRng, RngCore};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use termd_proto::{
@@ -41,7 +41,8 @@ use termd_proto::{
     METHOD_DAEMON_CLIENT_FORGET, METHOD_SESSION_CLOSE, METHOD_SESSION_FILE_DELETE,
     METHOD_SESSION_FILE_READ, METHOD_SESSION_FILE_WRITE, METHOD_SESSION_FILES, METHOD_SESSION_GIT,
     METHOD_SESSION_GIT_ACTION, METHOD_SESSION_GIT_DIFF, METHOD_SESSION_RENAME,
-    METHOD_SESSION_REORDER, METHOD_SESSION_SEARCH, MessageType, ServerId, SessionAttachPayload,
+    METHOD_SESSION_REORDER, METHOD_SESSION_SEARCH, METHOD_SESSION_TERMINAL_SNAPSHOT, MessageType,
+    ServerId, SessionAttachPayload,
     SessionAttachedPayload, SessionClosePayload, SessionClosedPayload,
     SessionCreateInSessionCwdPayload, SessionCreatePayload, SessionCreatedPayload,
     SessionFileDeletePayload, SessionFileDeletedPayload, SessionFileDownloadPreparePayload,
@@ -566,6 +567,26 @@ pub struct FileOfferDownloadGrant {
     pub file: fs::File,
     pub content_sha256: [u8; 32],
     pub expires_at_ms: UnixTimestampMillis,
+}
+
+/// 当前连接上请求 session 权威 terminal snapshot/tail（scrollback 预取，不重连）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSnapshotControlPayload {
+    pub session_id: SessionId,
+    /// 客户端已渲染到的 terminal seq；提供时返回该序号之后的 journal tail。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_terminal_seq: Option<u64>,
+}
+
+/// terminal snapshot/tail 请求的响应。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSnapshotControlResult {
+    pub session_id: SessionId,
+    /// 快照/tail 覆盖到的最高 terminal seq（空 tail 时等于 last_terminal_seq）。
+    pub base_seq: u64,
+    /// 首个帧为 `snapshot` 时表示全量快照（含最多 1000 行热历史），
+    /// 否则为按序排列的 `output`/`resize`/`exit` tail 帧。
+    pub frames: Vec<PtyTerminalFrame>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1402,7 +1423,7 @@ where
         let Some(internal_session_id) = self.session_index.get(&session_id).cloned() else {
             return V070Cursor { row: 1, col: 1 };
         };
-        let Ok(frames) = self.runtime.terminal_snapshot(&internal_session_id, None) else {
+        let Ok((_base_seq, frames)) = self.runtime.terminal_snapshot(&internal_session_id, None) else {
             return V070Cursor { row: 1, col: 1 };
         };
         let mut screen = TerminalScreen::new(size.rows, size.cols);
@@ -2172,6 +2193,32 @@ where
                 line_count,
                 matches,
                 truncated,
+            },
+        )?])
+    }
+
+    /// 在当前连接上请求 session 的权威 terminal snapshot/tail（含滚动历史）。
+    ///
+    /// 中文注释：这是 scrollback 预取/历史修复的「不打断连接」路径——daemon 直接用本地
+    /// terminal mirror 生成快照帧，不重连、不经过 supervisor IPC、不重置客户端终端。
+    /// `last_terminal_seq` 提供时返回该序号之后的 journal tail（同 attach tail 规则）；
+    /// 缺省时返回含最多 1000 行热历史的 screen snapshot。
+    fn terminal_snapshot_control(
+        &mut self,
+        connection: &ProtocolConnection,
+        payload: TerminalSnapshotControlPayload,
+    ) -> Result<Vec<JsonEnvelope>, ProtocolError> {
+        let attached = self.require_attached_session(connection, payload.session_id)?;
+        let (base_seq, frames) = self
+            .runtime
+            .terminal_snapshot(&attached.internal_session_id, payload.last_terminal_seq)
+            .map_err(map_runtime_error)?;
+        Ok(vec![envelope_value(
+            MessageType::SessionTerminalSnapshot,
+            TerminalSnapshotControlResult {
+                session_id: payload.session_id,
+                base_seq,
+                frames,
             },
         )?])
     }
@@ -3765,6 +3812,17 @@ where
             .map_err(map_runtime_error)
     }
 
+    /// 测试用：读取 daemon 本地 terminal mirror 的权威 snapshot/tail。
+    #[cfg(test)]
+    pub(crate) fn read_public_terminal_snapshot_for_test(
+        &mut self,
+        internal_session_id: &str,
+    ) -> Result<(u64, Vec<crate::pty::PtyTerminalFrame>), ProtocolError> {
+        self.runtime
+            .terminal_snapshot(internal_session_id, None)
+            .map_err(map_runtime_error)
+    }
+
     fn runtime_size_proto(&self, internal_session_id: &str) -> Result<TerminalSize, ProtocolError> {
         self.runtime
             .size(internal_session_id)
@@ -4467,6 +4525,9 @@ impl ProtocolConnection {
             }
             METHOD_SESSION_FILE_DELETE => {
                 protocol.delete_session_file(self, decode_payload(payload)?)
+            }
+            METHOD_SESSION_TERMINAL_SNAPSHOT => {
+                protocol.terminal_snapshot_control(self, decode_payload(payload)?)
             }
             METHOD_DAEMON_CLIENT_FORGET => {
                 protocol.forget_daemon_client(self, decode_payload(payload)?)

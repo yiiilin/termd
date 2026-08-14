@@ -1792,8 +1792,8 @@ impl PtySession for SupervisorPtySession {
     fn terminal_snapshot(
         &mut self,
         last_terminal_seq: Option<u64>,
-    ) -> PtyResult<Vec<PtyTerminalFrame>> {
-        let (_base_seq, frames) = self
+    ) -> PtyResult<(u64, Vec<PtyTerminalFrame>)> {
+        let (base_seq, frames) = self
             .terminal_mirror
             .lock()
             .expect("terminal mirror mutex poisoned")
@@ -1801,7 +1801,7 @@ impl PtySession for SupervisorPtySession {
         if let Some(PtyTerminalFrame::Snapshot { size, .. }) = frames.first() {
             *self.cached_size.lock().expect("cached size mutex poisoned") = *size;
         }
-        Ok(frames)
+        Ok((base_seq, frames))
     }
 
     fn read_terminal_frame(&mut self) -> PtyResult<Option<PtyTerminalFrame>> {
@@ -8707,10 +8707,11 @@ mod tests {
             exited: Arc::new(AtomicBool::new(false)),
         };
 
-        let frames = session
+        let (base_seq, frames) = session
             .terminal_snapshot(Some(7))
             .expect("terminal snapshot should be served from daemon mirror");
 
+        assert_eq!(base_seq, 8);
         assert_eq!(
             frames,
             vec![PtyTerminalFrame::Output {

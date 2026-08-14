@@ -387,6 +387,17 @@ export class V070Client {
     return this.jsonRequest(`/api/control/session/${sessionId}/files`, path ? { path } : {});
   }
 
+  /**
+   * 在当前连接上请求 session 的权威 terminal snapshot/tail（含滚动历史）。
+   * 与 attach 不同，此请求不重连、不清屏；`lastTerminalSeq` 提供时返回该序号
+   * 之后的 journal tail，否则返回含热历史的完整 screen snapshot。
+   */
+  async requestTerminalSnapshot(sessionId: UUID, lastTerminalSeq?: number): Promise<any> {
+    return this.jsonRequest(`/api/control/session/${sessionId}/terminal_snapshot`, {
+      last_terminal_seq: lastTerminalSeq ?? null,
+    });
+  }
+
   async getSessionGit(sessionId: UUID): Promise<any> {
     return this.jsonRequest(`/api/control/session/${sessionId}/git`, {});
   }

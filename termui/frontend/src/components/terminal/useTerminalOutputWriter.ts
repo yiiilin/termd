@@ -382,6 +382,21 @@ export function useTerminalOutputWriter(
           skipSnapshotRedrawRef.current = true;
           return true;
         }
+        if (item.appendOnly) {
+          // 中文注释：scrollback 预取的追加模式——当前屏幕与快照尾部一致，
+          // 直接写入字节（xterm 自行把历史行滚动进 scrollback）并贴底，
+          // 不清屏、不重置、不闪。尺寸不一致时退化为整屏重绘（内容需重排）。
+          options.sessionSizeRef.current = item.size;
+          if (options.sameTerminalDimensions(options.terminal, item.size)) {
+            recordTermdDiagnostic("terminal_writer_snapshot_append", {
+              baseSeq: item.baseSeq,
+              bytes: item.bytes.byteLength,
+            });
+            needsPostWriteRefreshRef.current = true;
+            needsPostWriteScrollBottomRef.current = true;
+            return true;
+          }
+        }
         snapshotRedrawInProgressRef.current = true;
         options.sessionSizeRef.current = item.size;
         recordTermdDiagnostic("terminal_writer_snapshot_begin", {

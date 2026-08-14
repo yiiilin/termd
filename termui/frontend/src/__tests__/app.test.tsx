@@ -15,6 +15,7 @@ import App, {
   mobileTitlePullDistanceForDelta,
   networkRateFromSamples,
   pairingWsUrlCandidates,
+  terminalSnapshotFramesToOutputItems,
 } from "../App";
 import { decodeSupervisorTerminalClientFrame } from "../protocol/supervisor-terminal";
 import type {
@@ -10516,5 +10517,41 @@ describe("termui web 工作台", () => {
     expect(alert).toHaveTextContent("pairing payload does not match the connected daemon");
     expect(screen.getByLabelText("Pairing token")).toHaveValue("");
     expectPairingTokenOnlyInRelayAdmission(daemon);
+  });
+});
+
+describe("terminalSnapshotFramesToOutputItems", () => {
+  const size = { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+
+  it("converts snapshot frames to appendOnly items and keeps tail frames in order", () => {
+    const items = terminalSnapshotFramesToOutputItems([
+      { kind: "snapshot", base_seq: 10, size, data: btoa("screen-bytes") },
+      { kind: "output", terminal_seq: 11, data: btoa("more") },
+      { kind: "resize", terminal_seq: 12, size },
+      { kind: "exit", terminal_seq: 13, code: 0 },
+    ]);
+    expect(items).toHaveLength(4);
+    expect(items[0]).toMatchObject({ kind: "snapshot", appendOnly: true, baseSeq: 10, size });
+    expect(items[0].kind === "snapshot" && Array.from(items[0].bytes)).toEqual(Array.from(new TextEncoder().encode("screen-bytes")));
+    expect(items[1]).toMatchObject({ kind: "output", terminalSeq: 11 });
+    expect(items[1].kind === "output" && Array.from(items[1].bytes)).toEqual(Array.from(new TextEncoder().encode("more")));
+    expect(items[2]).toEqual({ kind: "resize", terminalSeq: 12, size });
+    expect(items[3]).toEqual({ kind: "exit", terminalSeq: 13 });
+  });
+
+  it("drops malformed frames instead of crashing", () => {
+    const items = terminalSnapshotFramesToOutputItems([
+      null,
+      "junk",
+      { kind: "snapshot" },
+      { kind: "output", terminal_seq: 1 },
+      { kind: "resize", terminal_seq: 2, size: { rows: 24, cols: 80 } },
+      { kind: "unknown" },
+    ]);
+    // snapshot 无 size 被丢弃；output 缺 data 视为空输出保留；resize 有效保留；未知 kind 丢弃。
+    expect(items).toEqual([
+      { kind: "output", bytes: new Uint8Array(0), terminalSeq: 1 },
+      { kind: "resize", terminalSeq: 2, size: { rows: 24, cols: 80 } },
+    ]);
   });
 });

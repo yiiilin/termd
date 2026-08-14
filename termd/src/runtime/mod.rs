@@ -721,11 +721,12 @@ impl<B: PtyBackend> SessionRuntime<B> {
     ///
     /// 中文注释：`last_terminal_seq` 是客户端已完成渲染的 session 级序号；
     /// runtime 只透传给 PTY supervisor，不把它和 packet stream seq 混在一起。
+    /// 返回 `(base_seq, frames)`：base_seq 是快照/tail 覆盖到的最高 terminal seq。
     pub fn terminal_snapshot(
         &mut self,
         session_id: &str,
         last_terminal_seq: Option<u64>,
-    ) -> RuntimeResult<Vec<PtyTerminalFrame>> {
+    ) -> RuntimeResult<(u64, Vec<PtyTerminalFrame>)> {
         self.ensure_open_session(session_id)?;
         Ok(self
             .runtime_session_mut(session_id)?

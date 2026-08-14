@@ -224,6 +224,7 @@ function activateMobileDirectionGesture(frame: HTMLElement, pointerId: number, s
 
 function renderTerminalPaneWithOutput(items: TerminalOutputItem[], options: {
   onTerminalResync?: (lastTerminalSeq?: number) => void;
+  onRequestScrollbackSnapshot?: (lastTerminalSeq?: number) => Promise<boolean>;
   onTerminalSeqRendered?: (terminalSeq: number) => void;
 } = {}) {
   const queue = [...items];
@@ -240,6 +241,7 @@ function renderTerminalPaneWithOutput(items: TerminalOutputItem[], options: {
       takeOutput={takeOutput}
       registerOutputDrain={registerOutputDrain}
       onTerminalResync={options.onTerminalResync}
+      onRequestScrollbackSnapshot={options.onRequestScrollbackSnapshot}
       onTerminalSeqRendered={options.onTerminalSeqRendered}
       onInput={vi.fn()}
       onResize={vi.fn()}
@@ -876,6 +878,42 @@ describe("TerminalPane terminal sequence rendering", () => {
     // 第一个 snapshot 15 字节 + 第二个 snapshot（"ancient-history\n" 16 字节 + "first-snapshot\n" 15 字节）
     expect(stats.writtenBytes).toBe(15 + 16 + 15);
     expect(onTerminalSeqRendered.mock.calls).toEqual([[10], [10]]);
+  });
+
+  it("appendOnly 快照（scrollback 预取）不 reset、不清屏，直接写入并贴底", async () => {
+    const onTerminalSeqRendered = vi.fn();
+    const encoder = new TextEncoder();
+
+    // 首次 attach 建立基线；随后 scrollback 预取返回相同内容 + 更早历史，
+    // 走 appendOnly：不 reset、不 resize，字节直接写入（xterm 自行滚动出历史）。
+    renderTerminalPaneWithOutput(
+      [
+        { kind: "snapshot", bytes: encoder.encode("first-snapshot\n"), baseSeq: 10, size: DEFAULT_TERMINAL_SIZE },
+        {
+          kind: "snapshot",
+          bytes: encoder.encode("ancient-history\nfirst-snapshot\n"),
+          baseSeq: 11,
+          size: DEFAULT_TERMINAL_SIZE,
+          appendOnly: true,
+        },
+        { kind: "output", bytes: encoder.encode("tail-after-append\n"), terminalSeq: 12 },
+      ],
+      { onTerminalSeqRendered },
+    );
+
+    const host = terminalHost();
+    await waitFor(() => expect(host.dataset.buffer).toContain("tail-after-append"));
+
+    const stats = (globalThis as {
+      __TERMD_TEST_TERMINAL_STATS__?: {
+        operations: Array<{ op: string; cols?: number; rows?: number; text?: string }>;
+        writtenBytes: number;
+      };
+    }).__TERMD_TEST_TERMINAL_STATS__ ?? { operations: [], writtenBytes: 0 };
+    // 只有首个 snapshot 触发 reset；appendOnly 快照只写字节。
+    expect(stats.operations.filter((operation) => operation.op === "reset").length).toBe(1);
+    expect(stats.writtenBytes).toBe(15 + 16 + 15 + 18);
+    expect(onTerminalSeqRendered.mock.calls).toEqual([[10], [11], [12]]);
   });
 
   it("snapshot 按自身尺寸重绘，并在 tail resize 后再写后续 output", async () => {
@@ -2902,6 +2940,7 @@ describe("TerminalPane terminal sequence rendering", () => {
     vi.useFakeTimers();
     try {
       const onTerminalResync = vi.fn();
+      const onRequestScrollbackSnapshot = vi.fn().mockResolvedValue(true);
       const fullscreenRedraw = "x".repeat(9 * 1024);
 
       renderTerminalPaneWithOutput(
@@ -2909,7 +2948,7 @@ describe("TerminalPane terminal sequence rendering", () => {
           { kind: "snapshot", bytes: new Uint8Array(), baseSeq: 0, size: DEFAULT_TERMINAL_SIZE },
           { kind: "output", bytes: new TextEncoder().encode(fullscreenRedraw), terminalSeq: 1 },
         ],
-        { onTerminalResync },
+        { onTerminalResync, onRequestScrollbackSnapshot },
       );
 
       await act(async () => {
@@ -2921,8 +2960,9 @@ describe("TerminalPane terminal sequence rendering", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1000 + animationFrameMs * 2);
       });
-      expect(onTerminalResync).toHaveBeenCalledTimes(1);
-      expect(onTerminalResync).toHaveBeenNthCalledWith(1, undefined);
+      // 自动预取：在当前连接上请求权威 snapshot，不触发重连 resync。
+      expect(onRequestScrollbackSnapshot).toHaveBeenCalledTimes(1);
+      expect(onTerminalResync).toHaveBeenCalledTimes(0);
 
       const frame = screen.getByTestId("terminal-pane").querySelector<HTMLElement>(".terminal-frame");
       expect(frame).not.toBeNull();
@@ -2932,16 +2972,16 @@ describe("TerminalPane terminal sequence rendering", () => {
         await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
       });
 
-      // 中文注释：自动预取可能已经启动 full snapshot；用户随后上滚时必须把
+      // 中文注释：自动预取可能已经启动 snapshot；用户随后上滚时必须把
       // 已在路上的 snapshot 升级成 reveal，否则真实浏览器会拿到历史但仍停在底部。
-      expect(onTerminalResync).toHaveBeenCalledTimes(2);
-      expect(onTerminalResync).toHaveBeenNthCalledWith(2, undefined, { revealHistory: true });
+      expect(onTerminalResync).toHaveBeenCalledTimes(1);
+      expect(onTerminalResync).toHaveBeenNthCalledWith(1, undefined, { revealHistory: true });
 
       fireEvent.wheel(frame!, { deltaY: -900 });
       await act(async () => {
         await vi.advanceTimersByTimeAsync(animationFrameMs * 4);
       });
-      expect(onTerminalResync).toHaveBeenCalledTimes(2);
+      expect(onTerminalResync).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }

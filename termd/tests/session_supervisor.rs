@@ -266,7 +266,7 @@ fn terminal_snapshot_until_contains(
     let mut last_frames = Vec::new();
 
     while Instant::now() < deadline {
-        let frames = runtime
+        let (_base_seq, frames) = runtime
             .terminal_snapshot(session_id, last_terminal_seq)
             .expect("AttachSync should return terminal frames");
         if frames.iter().any(|frame| frame_contains(frame, needle)) {
@@ -1038,7 +1038,7 @@ fn supervisor_terminal_snapshot_survives_last_client_detach() {
     runtime.detach(session_id, "dev-a").unwrap();
 
     runtime.attach(session_id, "dev-b").unwrap();
-    let frames = runtime.terminal_snapshot(session_id, None).unwrap();
+    let (_base_seq, frames) = runtime.terminal_snapshot(session_id, None).unwrap();
     assert!(
         frames.iter().any(|frame| matches!(frame, PtyTerminalFrame::Snapshot { data, .. } if data.windows(b"booted".len()).any(|window| window == b"booted"))),
         "snapshot after detach should still come from live supervisor"
@@ -1069,7 +1069,7 @@ fn supervisor_terminal_snapshot_preserves_active_sgr_style_after_reattach() {
     runtime.detach(session_id, "dev-a").unwrap();
 
     runtime.attach(session_id, "dev-b").unwrap();
-    let frames = runtime.terminal_snapshot(session_id, None).unwrap();
+    let (_base_seq, frames) = runtime.terminal_snapshot(session_id, None).unwrap();
     let snapshot = frames
         .iter()
         .find_map(|frame| {
@@ -1125,7 +1125,7 @@ fn supervisor_attach_sync_returns_tail_from_journal_without_snapshot() {
         .terminal_seq()
         .expect("tail output should have a session terminal seq");
 
-    let tail = runtime
+    let (tail_base_seq, tail) = runtime
         .terminal_snapshot(session_id, Some(first_seq))
         .expect("AttachSync should return terminal tail");
 
@@ -1144,6 +1144,10 @@ fn supervisor_attach_sync_returns_tail_from_journal_without_snapshot() {
             .any(|frame| frame.terminal_seq() == Some(second_seq)
                 && frame_contains(frame, b"second-sync")),
         "tail should include the output after the rendered seq: {tail:?}"
+    );
+    assert_eq!(
+        tail_base_seq, second_seq,
+        "tail base_seq should be the highest covered terminal seq"
     );
 
     runtime.close(session_id).unwrap();
@@ -1186,7 +1190,7 @@ fn supervisor_reconnect_attach_sync_does_not_replay_rendered_terminal_frame() {
     restarted.reconnect_session(&persisted[0]).unwrap();
     restarted.attach(session_id, "dev-b").unwrap();
 
-    let sync = restarted
+    let (_base_seq, sync) = restarted
         .terminal_snapshot(session_id, Some(rendered_seq))
         .expect("reconnected daemon should AttachSync with last rendered seq");
     assert!(
@@ -2232,7 +2236,7 @@ fn naturally_exited_supervisor_is_closed_and_not_reconnectable() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         runtime.snapshot(session_id).unwrap();
-        let frames = runtime.terminal_snapshot(session_id, Some(0)).unwrap();
+        let (_base_seq, frames) = runtime.terminal_snapshot(session_id, Some(0)).unwrap();
         if frames
             .iter()
             .any(|frame| matches!(frame, PtyTerminalFrame::Exit { code: Some(7), .. }))

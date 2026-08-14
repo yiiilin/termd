@@ -72,6 +72,7 @@ pub enum MessageType {
     SessionFileWritten,
     SessionFileDelete,
     SessionFileDeleted,
+    SessionTerminalSnapshot,
     SessionFileDownloadPrepare,
     SessionFileDownloadReady,
     SessionFileDownloadChunk,
@@ -307,6 +308,7 @@ pub const METHOD_SESSION_GIT_DIFF: &str = "session.git_diff";
 pub const METHOD_SESSION_FILE_READ: &str = "session.file_read";
 pub const METHOD_SESSION_FILE_WRITE: &str = "session.file_write";
 pub const METHOD_SESSION_FILE_DELETE: &str = "session.file_delete";
+pub const METHOD_SESSION_TERMINAL_SNAPSHOT: &str = "session.terminal_snapshot";
 pub const METHOD_SESSION_FILE_DOWNLOAD_PREPARE: &str = "session.file_download_prepare";
 pub const METHOD_SESSION_FILE_DOWNLOAD_CHUNK: &str = "session.file_download_chunk";
 pub const METHOD_SESSION_FILE_UPLOAD_STREAM: &str = "session.file_upload";
@@ -421,6 +423,7 @@ pub fn is_http_control_tunnel_path_allowed(path: &str) -> bool {
                         | "file_read"
                         | "file_write"
                         | "file_delete"
+                        | "terminal_snapshot"
                 )
         }
         _ => false,
@@ -1993,6 +1996,7 @@ mod tests {
             (MessageType::SessionFileWritten, "session_file_written"),
             (MessageType::SessionFileDelete, "session_file_delete"),
             (MessageType::SessionFileDeleted, "session_file_deleted"),
+            (MessageType::SessionTerminalSnapshot, "session_terminal_snapshot"),
             (
                 MessageType::SessionFileDownloadPrepare,
                 "session_file_download_prepare",

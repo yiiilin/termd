@@ -20,6 +20,7 @@ import {
   X,
 } from "lucide-react";
 import { V070Client } from "./protocol/v070-client";
+import { base64ToBytes } from "./protocol/wire";
 import { ProtocolClientError, toSafeError } from "./protocol/errors";
 import { migrateDeviceCertificate, pairDeviceOverHttp } from "./protocol/pairing-client";
 import { parsePairingQrPayload } from "./protocol/pairing-payload";
@@ -130,6 +131,55 @@ const MAX_FILES_PANEL_WIDTH = 640;
 const CONNECTION_AUTO_RETRY_DELAY_MS = 1500;
 const CONNECTION_AUTO_RETRY_LIMIT = 3;
 const ATTACH_RECONNECT_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 20000];
+
+/**
+ * 把 daemon 的 `terminal_snapshot` control 响应帧转换为终端输出项。
+ * snapshot 帧走 appendOnly（不重置、不清屏），tail 帧按序透传。
+ */
+export function terminalSnapshotFramesToOutputItems(frames: unknown[]): TerminalOutputItem[] {
+  const items: TerminalOutputItem[] = [];
+  for (const wire of frames) {
+    if (!wire || typeof wire !== "object") {
+      continue;
+    }
+    const kind = "kind" in wire ? wire.kind : undefined;
+    if (kind === "snapshot") {
+      const data = "data" in wire && typeof wire.data === "string" ? wire.data : "";
+      const baseSeq = "base_seq" in wire && typeof wire.base_seq === "number" ? wire.base_seq : 0;
+      const size = "size" in wire && isTerminalSize(wire.size) ? wire.size : undefined;
+      if (!size) {
+        continue;
+      }
+      items.push({ kind: "snapshot", appendOnly: true, bytes: base64ToBytes(data), baseSeq, size });
+    } else if (kind === "output") {
+      const data = "data" in wire && typeof wire.data === "string" ? wire.data : "";
+      const terminalSeq = "terminal_seq" in wire && typeof wire.terminal_seq === "number" ? wire.terminal_seq : 0;
+      items.push({ kind: "output", bytes: base64ToBytes(data), terminalSeq });
+    } else if (kind === "resize") {
+      const terminalSeq = "terminal_seq" in wire && typeof wire.terminal_seq === "number" ? wire.terminal_seq : 0;
+      const size = "size" in wire && isTerminalSize(wire.size) ? wire.size : undefined;
+      if (!size) {
+        continue;
+      }
+      items.push({ kind: "resize", terminalSeq, size });
+    } else if (kind === "exit") {
+      const terminalSeq = "terminal_seq" in wire && typeof wire.terminal_seq === "number" ? wire.terminal_seq : 0;
+      items.push({ kind: "exit", terminalSeq });
+    }
+  }
+  return items;
+}
+
+function isTerminalSize(value: unknown): value is TerminalSize {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      "rows" in value &&
+      typeof value.rows === "number" &&
+      "cols" in value &&
+      typeof value.cols === "number",
+  );
+}
 const ATTACH_SWITCH_COALESCE_DELAY_MS = 80;
 const DAEMON_METADATA_RETRY_DELAY_MS = 1500;
 const TEXT_FILE_EDITOR_MAX_BYTES = 1024 * 1024;
@@ -2571,6 +2621,39 @@ export default function App() {
     applyConfirmedSessionSize(sessionId, size);
   }, [applyConfirmedSessionSize]);
 
+  /**
+   * 在当前已连接的 attach client 上请求权威 terminal snapshot/tail（含滚动历史），
+   * 并把返回的帧以「追加模式」送入输出队列——不重连、不清屏。
+   * 返回是否成功入队；调用方据此决定是否保留预取 pending 状态。
+   */
+  const handleScrollbackSnapshotRequest = useCallback(async (lastTerminalSeq?: number): Promise<boolean> => {
+    const sessionId = attachedSessionRef.current;
+    const client = attachClientRef.current;
+    if (!sessionId || !client || client.isClosed) {
+      return false;
+    }
+    try {
+      const result = await client.requestTerminalSnapshot(sessionId, lastTerminalSeq);
+      if (
+        !result ||
+        typeof result.base_seq !== "number" ||
+        !Array.isArray(result.frames)
+      ) {
+        return false;
+      }
+      const items = terminalSnapshotFramesToOutputItems(result.frames);
+      if (items.length > 0) {
+        for (const item of items) {
+          enqueueTerminalOutput(item);
+        }
+      }
+      // 空 tail（本地已是最新）：无内容可写，但请求本身成功。
+      return true;
+    } catch {
+      return false;
+    }
+  }, [enqueueTerminalOutput]);
+
   const performAttach = useCallback(
     async (sessionId: UUID, options: AttachUiOptions = {}, progressAttemptId?: number) => {
       const shouldCloseMobilePanel = options.closeMobilePanel ?? true;
@@ -4929,6 +5012,7 @@ export default function App() {
                 registerOutputDrain={registerTerminalOutputDrain}
                 onOutputResetApplied={handleTerminalOutputResetApplied}
                 onTerminalResync={handleTerminalResync}
+                onRequestScrollbackSnapshot={handleScrollbackSnapshotRequest}
                 onTerminalSeqRendered={handleTerminalSeqRendered}
                 onTerminalSizeRendered={handleTerminalSizeRendered}
                 mobileShortcuts={preferences.mobileShortcuts}

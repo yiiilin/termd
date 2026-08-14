@@ -665,20 +665,23 @@ pub trait PtySession: Send {
     /// 本地 backend 默认只返回当前尺寸和 pid，不提供 retained output。
     fn snapshot(&mut self) -> PtyResult<PtySnapshot>;
 
-    /// 获取结构化 terminal snapshot/tail。
+    /// 获取结构化 terminal snapshot/tail，返回 `(base_seq, frames)`。
     ///
     /// 中文注释：普通 backend 没有 session 级 terminal_seq，只能退化为一个 base_seq=0
     /// 的 snapshot；supervisor backend 会覆盖为权威 1000 行热历史和 journal tail。
     fn terminal_snapshot(
         &mut self,
         _last_terminal_seq: Option<u64>,
-    ) -> PtyResult<Vec<PtyTerminalFrame>> {
+    ) -> PtyResult<(u64, Vec<PtyTerminalFrame>)> {
         let snapshot = self.snapshot()?;
-        Ok(vec![PtyTerminalFrame::Snapshot {
-            base_seq: 0,
-            size: snapshot.size,
-            data: snapshot.retained_output,
-        }])
+        Ok((
+            0,
+            vec![PtyTerminalFrame::Snapshot {
+                base_seq: 0,
+                size: snapshot.size,
+                data: snapshot.retained_output,
+            }],
+        ))
     }
 
     /// 读取一个结构化 terminal live frame。

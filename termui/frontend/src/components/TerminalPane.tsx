@@ -133,6 +133,8 @@ interface TerminalPaneProps {
   registerOutputDrain: (drain: () => void) => () => void;
   onOutputResetApplied?: (version: number) => void;
   onTerminalResync?: (lastTerminalSeq?: number, options?: TerminalResyncOptions) => void;
+  /** 在当前连接上请求权威 snapshot/tail（含滚动历史），不重连不清屏。返回是否成功。 */
+  onRequestScrollbackSnapshot?: (lastTerminalSeq?: number) => Promise<boolean>;
   onTerminalSeqRendered?: (terminalSeq: number) => void;
   onTerminalSizeRendered?: (size: TerminalSize) => void;
   mobileShortcuts?: BrowserMobileShortcut[];
@@ -169,6 +171,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const onInputRef = useRef(props.onInput);
   const onResizeRef = useRef(props.onResize);
   const onTerminalResyncRef = useRef(props.onTerminalResync);
+  const onRequestScrollbackSnapshotRef = useRef(props.onRequestScrollbackSnapshot);
   const onTerminalSeqRenderedRef = useRef(props.onTerminalSeqRendered);
   const onTerminalSizeRenderedRef = useRef(props.onTerminalSizeRendered);
   const onOutputResetAppliedRef = useRef(props.onOutputResetApplied);
@@ -1695,7 +1698,20 @@ export function TerminalPane(props: TerminalPaneProps) {
       onTerminalResyncRef.current(undefined, { revealHistory: true });
       return;
     }
-    onTerminalResyncRef.current(undefined);
+    // 自动预取：在当前连接上请求权威 snapshot（含热历史），不重连不清屏。
+    // 成功或失败都结束 pending；成功后快照帧会经输出队列渲染，并触发
+    // noteTerminalOutputRendered 清零 scrollback 计数器。
+    const requestScrollback = onRequestScrollbackSnapshotRef.current;
+    if (!requestScrollback) {
+      terminalServerScrollbackResyncPendingRef.current = false;
+      onTerminalResyncRef.current(undefined);
+      return;
+    }
+    void requestScrollback().then((ok) => {
+      if (!ok) {
+        terminalServerScrollbackResyncPendingRef.current = false;
+      }
+    });
   };
   const handleTerminalWheel = (event: WheelEvent) => {
     const deltaLines = terminalDeltaLinesFromWheel(event);

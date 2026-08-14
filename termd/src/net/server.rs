@@ -5810,6 +5810,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v070_terminal_snapshot_control_returns_screen_snapshot_without_reconnect() {
+        let fixture = test_protocol("v070-terminal-snapshot-control");
+        let (device_id, access_token) = v070_access_token_for_test(&fixture.protocol).await;
+        let session_id = {
+            let mut protocol = fixture.protocol.lock().await;
+            let mut connection = ProtocolConnection::authenticated_v070_terminal(device_id);
+            let opened = protocol
+                .open_v070_terminal(
+                    &mut connection,
+                    V070TerminalOpen::Create(SessionCreatePayload {
+                        command: vec!["sh".into(), "-lc".into(), "printf snapshot-control-probe".into()],
+                        size: TerminalSize::new(24, 80),
+                    }),
+                )
+                .unwrap();
+            let session_id = opened.created.unwrap().session_id;
+            // 等待 PTY 输出到达 daemon mirror。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut seen = false;
+            while std::time::Instant::now() < deadline {
+                let (_base_seq, frames) = protocol
+                    .read_public_terminal_snapshot_for_test(&session_id.0.to_string())
+                    .unwrap();
+                if frames.iter().any(|frame| {
+                    frame
+                        .bytes_for_legacy_read()
+                        .is_some_and(|data| data.windows(b"snapshot-control-probe".len()).any(|w| w == b"snapshot-control-probe"))
+                }) {
+                    seen = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(seen, "PTY output should reach the daemon mirror");
+            connection.close(&mut protocol);
+            session_id
+        };
+
+        let response = router(fixture.protocol.clone(), false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/control/session/{}/terminal_snapshot", session_id.0))
+                    .header("authorization", format!("Bearer {access_token}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{\"last_terminal_seq\": null}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(body["base_seq"].is_number(), "base_seq should be present");
+        let frames = body["frames"].as_array().expect("frames should be an array");
+        let has_snapshot = frames.iter().any(|frame| frame["kind"] == "snapshot");
+        assert!(has_snapshot, "full snapshot request should return a snapshot frame");
+        let snapshot_data = frames
+            .iter()
+            .find(|frame| frame["kind"] == "snapshot")
+            .and_then(|frame| frame["data"].as_str())
+            .expect("snapshot data should be base64");
+        let snapshot_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, snapshot_data)
+            .expect("snapshot data should decode as base64");
+        assert!(
+            snapshot_bytes
+                .windows(b"snapshot-control-probe".len())
+                .any(|window| window == b"snapshot-control-probe"),
+            "snapshot data should include the PTY output; got {snapshot_data}"
+        );
+    }
+
+    #[tokio::test]
     async fn v070_close_session_uses_one_bearer_authenticated_json_request() {
         let fixture = test_protocol("v070-json-close");
         let (device_id, access_token) = v070_access_token_for_test(&fixture.protocol).await;
