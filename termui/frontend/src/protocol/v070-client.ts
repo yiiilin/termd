@@ -36,7 +36,7 @@ interface TransportLike {
   close(reason?: string): void;
 }
 
-type JsonRequest = (path: string, payload: unknown) => Promise<any>;
+type JsonRequest = (path: string, payload: unknown, timeoutMs?: number) => Promise<any>;
 type HttpRequest = (path: string, init?: RequestInit) => Promise<Response>;
 export type PushApiPath = "/api/push/config" | "/api/push/subscription";
 
@@ -61,6 +61,8 @@ interface PendingTerminalActivity {
 }
 const FILE_CHUNK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
+/** Git 快照请求的超时：多个 worktree 的 status 检查是并行执行的，但大仓库仍可能较慢。 */
+const GIT_REQUEST_TIMEOUT_MS = 20_000;
 const METADATA_RECONNECT_BASE_DELAY_MS = 100;
 const METADATA_RECONNECT_MAX_DELAY_MS = 2_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -399,7 +401,9 @@ export class V070Client {
   }
 
   async getSessionGit(sessionId: UUID): Promise<any> {
-    return this.jsonRequest(`/api/control/session/${sessionId}/git`, {});
+    // 中文注释：Git 快照可能要在多个 worktree 上跑 status，耗时随 worktree 数量增长，
+    // 默认 5s 请求超时容易在 worktree/分支较多时截断。给 git 请求更长窗口。
+    return this.jsonRequest(`/api/control/session/${sessionId}/git`, {}, GIT_REQUEST_TIMEOUT_MS);
   }
 
   async applySessionGitAction(sessionId: UUID, worktreePath: string, filePath: string, action: string): Promise<any> {
@@ -926,13 +930,13 @@ export class V070Client {
     if (this.terminalSessionId !== sessionId) throw new ProtocolClientError("not_attached", "session is not attached");
   }
 
-  private async requestJson(path: string, payload: unknown): Promise<any> {
+  private async requestJson(path: string, payload: unknown, timeoutMs?: number): Promise<any> {
     const token = await this.tokens.get();
     const response = await this.fetchWithTimeout(applicationHttpUrl(this.server.url, path), {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-termd-server-id": this.server.server_id },
       body: JSON.stringify(payload),
-    });
+    }, timeoutMs);
     const body = await response.json();
     if (!response.ok) throw new ProtocolClientError(body?.error?.code ?? "http_error", body?.error?.message ?? "request failed");
     return body;
@@ -951,7 +955,7 @@ export class V070Client {
     return this.fetchWithTimeout(input, request);
   }
 
-  private async fetchWithTimeout(input: string, init: RequestInit): Promise<Response> {
+  private async fetchWithTimeout(input: string, init: RequestInit, timeoutMs?: number): Promise<Response> {
     const controller = new AbortController();
     const callerSignal = init.signal;
     let timedOut = false;
@@ -964,7 +968,7 @@ export class V070Client {
     const timeout = globalThis.setTimeout(() => {
       timedOut = true;
       controller.abort();
-    }, Math.max(1, this.requestTimeoutMs));
+    }, Math.max(1, timeoutMs ?? this.requestTimeoutMs));
     try {
       return await fetch(input, { ...init, signal: controller.signal });
     } catch (caught) {

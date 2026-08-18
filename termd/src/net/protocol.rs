@@ -123,7 +123,7 @@ const SESSION_FILE_RPC_MAX_BYTES: usize = 1024 * 1024;
 const SESSION_FILE_READ_MAX_BYTES: u64 = SESSION_FILE_RPC_MAX_BYTES as u64;
 const SESSION_FILE_WRITE_MAX_BYTES: usize = SESSION_FILE_RPC_MAX_BYTES;
 const SESSION_FILE_WRITE_MAX_BASE64_BYTES: usize = SESSION_FILE_WRITE_MAX_BYTES.div_ceil(3) * 4;
-const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const GIT_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const GIT_COMMAND_DRAIN_MAX_READS: usize = 16;
 const GIT_COMMAND_STDOUT_MAX_BYTES: usize = 1024 * 1024;
@@ -4977,11 +4977,59 @@ fn read_session_git_snapshot(
             return session_git_error(session_id, cwd_text, session_git_snapshot_error(error));
         }
     };
-    let mut worktrees = Vec::new();
-    for worktree in worktree_infos {
-        let (staged, unstaged) =
-            match read_git_worktree_changes(&worktree.path, active_upload_targets) {
-                Ok(changes) => changes,
+    let mut worktrees = Vec::with_capacity(worktree_infos.len());
+    // 中文注释：worktree 过多时逐个串行跑 `git status` 会让面板请求总耗时随数量线性
+    // 增长（每个 100ms-2s），轻易超过前端 5s 请求超时导致面板整体变空。
+    // 这里并行执行各 worktree 的状态检查，总耗时趋近于最慢单个。
+    {
+        let current_root_ref = &current_root;
+        let active_upload_targets_ref = active_upload_targets;
+        let parallel_results: Vec<
+            Result<
+                (PathBuf, Option<String>, Option<String>, bool, Vec<SessionGitFileChangePayload>, Vec<SessionGitFileChangePayload>),
+                GitSnapshotError,
+            >,
+        > = std::thread::scope(|scope| {
+            let handles: Vec<_> = worktree_infos
+                .iter()
+                .map(|worktree| {
+                    let path = worktree.path.clone();
+                    let targets = active_upload_targets_ref.to_vec();
+                    let branch = worktree.branch.clone();
+                    let head = worktree.head.clone();
+                    scope.spawn(move || {
+                        let changes = read_git_worktree_changes(&path, &targets);
+                        (path, branch, head, changes)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    let (path, branch, head, changes) =
+                        handle.join().expect("git status thread panicked");
+                    let is_current = same_path(&path, current_root_ref);
+                    match changes {
+                        Ok((staged, unstaged)) => {
+                            Ok((path, branch, head, is_current, staged, unstaged))
+                        }
+                        Err(error) => Err(error),
+                    }
+                })
+                .collect()
+        });
+        for result in parallel_results {
+            match result {
+                Ok((path, branch, head, is_current, staged, unstaged)) => {
+                    worktrees.push(SessionGitWorktreePayload {
+                        path: absolute_path_string(&path),
+                        branch,
+                        head,
+                        is_current,
+                        staged,
+                        unstaged,
+                    });
+                }
                 Err(error) => {
                     return session_git_error(
                         session_id,
@@ -4989,16 +5037,8 @@ fn read_session_git_snapshot(
                         session_git_snapshot_error(error),
                     );
                 }
-            };
-        let is_current = same_path(&worktree.path, &current_root);
-        worktrees.push(SessionGitWorktreePayload {
-            path: absolute_path_string(&worktree.path),
-            branch: worktree.branch,
-            head: worktree.head,
-            is_current,
-            staged,
-            unstaged,
-        });
+            }
+        }
     }
     let graph = match read_git_graph(&canonical_repo_root) {
         Ok(graph) => graph,
