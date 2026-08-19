@@ -1996,7 +1996,10 @@ mod tests {
             (MessageType::SessionFileWritten, "session_file_written"),
             (MessageType::SessionFileDelete, "session_file_delete"),
             (MessageType::SessionFileDeleted, "session_file_deleted"),
-            (MessageType::SessionTerminalSnapshot, "session_terminal_snapshot"),
+            (
+                MessageType::SessionTerminalSnapshot,
+                "session_terminal_snapshot",
+            ),
             (
                 MessageType::SessionFileDownloadPrepare,
                 "session_file_download_prepare",

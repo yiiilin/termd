@@ -5820,7 +5820,11 @@ mod tests {
                 .open_v070_terminal(
                     &mut connection,
                     V070TerminalOpen::Create(SessionCreatePayload {
-                        command: vec!["sh".into(), "-lc".into(), "printf snapshot-control-probe".into()],
+                        command: vec![
+                            "sh".into(),
+                            "-lc".into(),
+                            "printf snapshot-control-probe".into(),
+                        ],
                         size: TerminalSize::new(24, 80),
                     }),
                 )
@@ -5834,9 +5838,10 @@ mod tests {
                     .read_public_terminal_snapshot_for_test(&session_id.0.to_string())
                     .unwrap();
                 if frames.iter().any(|frame| {
-                    frame
-                        .bytes_for_legacy_read()
-                        .is_some_and(|data| data.windows(b"snapshot-control-probe".len()).any(|w| w == b"snapshot-control-probe"))
+                    frame.bytes_for_legacy_read().is_some_and(|data| {
+                        data.windows(b"snapshot-control-probe".len())
+                            .any(|w| w == b"snapshot-control-probe")
+                    })
                 }) {
                     seen = true;
                     break;
@@ -5852,7 +5857,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(format!("/api/control/session/{}/terminal_snapshot", session_id.0))
+                    .uri(format!(
+                        "/api/control/session/{}/terminal_snapshot",
+                        session_id.0
+                    ))
                     .header("authorization", format!("Bearer {access_token}"))
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from("{\"last_terminal_seq\": null}"))
@@ -5866,16 +5874,22 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert!(body["base_seq"].is_number(), "base_seq should be present");
-        let frames = body["frames"].as_array().expect("frames should be an array");
+        let frames = body["frames"]
+            .as_array()
+            .expect("frames should be an array");
         let has_snapshot = frames.iter().any(|frame| frame["kind"] == "snapshot");
-        assert!(has_snapshot, "full snapshot request should return a snapshot frame");
+        assert!(
+            has_snapshot,
+            "full snapshot request should return a snapshot frame"
+        );
         let snapshot_data = frames
             .iter()
             .find(|frame| frame["kind"] == "snapshot")
             .and_then(|frame| frame["data"].as_str())
             .expect("snapshot data should be base64");
-        let snapshot_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, snapshot_data)
-            .expect("snapshot data should decode as base64");
+        let snapshot_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, snapshot_data)
+                .expect("snapshot data should decode as base64");
         assert!(
             snapshot_bytes
                 .windows(b"snapshot-control-probe".len())

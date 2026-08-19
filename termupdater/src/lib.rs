@@ -120,15 +120,25 @@ pub fn is_newer_version(latest: &str, current: &str) -> bool {
 /// 超时采用「连接 30s + 读空闲 120s + 总上限 30min」，慢速但持续的下载不会超时。
 fn build_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
     const PROXY_ENV_VARS: [&str; 6] = [
-        "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
     ];
     const NO_PROXY_ENV_VARS: [&str; 2] = ["NO_PROXY", "no_proxy"];
 
     let mut builder = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(DOWNLOAD_CONNECT_TIMEOUT_SECS))
+        .connect_timeout(std::time::Duration::from_secs(
+            DOWNLOAD_CONNECT_TIMEOUT_SECS,
+        ))
         .timeout(std::time::Duration::from_secs(DOWNLOAD_TOTAL_TIMEOUT_SECS))
         .user_agent("termd-updater");
-    if let Some(proxy_url) = PROXY_ENV_VARS.iter().find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty())) {
+    if let Some(proxy_url) = PROXY_ENV_VARS
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+    {
         let mut proxy = reqwest::Proxy::all(&proxy_url)?;
         if let Some(no_proxy) = NO_PROXY_ENV_VARS
             .iter()
@@ -286,9 +296,7 @@ pub fn apply_update(request: ApplyRequest) -> Result<ApplyOutcome, UpdateError> 
         "update: downloaded binary version probe"
     );
     let matches = match actual.as_deref() {
-        Some(actual_out) => {
-            parse_semver(actual_out) == parse_semver(&request.expected_version)
-        }
+        Some(actual_out) => parse_semver(actual_out) == parse_semver(&request.expected_version),
         None => false,
     };
     if !matches {
