@@ -42,16 +42,15 @@ use termd_proto::{
     METHOD_SESSION_FILE_READ, METHOD_SESSION_FILE_WRITE, METHOD_SESSION_FILES, METHOD_SESSION_GIT,
     METHOD_SESSION_GIT_ACTION, METHOD_SESSION_GIT_DIFF, METHOD_SESSION_RENAME,
     METHOD_SESSION_REORDER, METHOD_SESSION_SEARCH, METHOD_SESSION_TERMINAL_SNAPSHOT, MessageType,
-    ServerId, SessionAttachPayload,
-    SessionAttachedPayload, SessionClosePayload, SessionClosedPayload,
-    SessionCreateInSessionCwdPayload, SessionCreatePayload, SessionCreatedPayload,
-    SessionFileDeletePayload, SessionFileDeletedPayload, SessionFileDownloadPreparePayload,
-    SessionFileDownloadReadyPayload, SessionFileDownloadStreamReadyPayload,
-    SessionFileEntryPayload, SessionFileHttpDownloadPayload, SessionFileHttpUploadReadyPayload,
-    SessionFileHttpUploadStreamPayload, SessionFileKind, SessionFileReadPayload,
-    SessionFileReadResultPayload, SessionFileUploadPayload, SessionFileUploadProgressPayload,
-    SessionFileWritePayload, SessionFileWrittenPayload, SessionFilesPayload,
-    SessionFilesResultPayload, SessionGitActionKind, SessionGitActionPayload,
+    ServerId, SessionAttachPayload, SessionAttachedPayload, SessionClosePayload,
+    SessionClosedPayload, SessionCreateInSessionCwdPayload, SessionCreatePayload,
+    SessionCreatedPayload, SessionFileDeletePayload, SessionFileDeletedPayload,
+    SessionFileDownloadPreparePayload, SessionFileDownloadReadyPayload,
+    SessionFileDownloadStreamReadyPayload, SessionFileEntryPayload, SessionFileHttpDownloadPayload,
+    SessionFileHttpUploadReadyPayload, SessionFileHttpUploadStreamPayload, SessionFileKind,
+    SessionFileReadPayload, SessionFileReadResultPayload, SessionFileUploadPayload,
+    SessionFileUploadProgressPayload, SessionFileWritePayload, SessionFileWrittenPayload,
+    SessionFilesPayload, SessionFilesResultPayload, SessionGitActionKind, SessionGitActionPayload,
     SessionGitActionResultPayload, SessionGitDiffPayload, SessionGitDiffResultPayload,
     SessionGitFileChangePayload, SessionGitPayload, SessionGitResultPayload,
     SessionGitWorktreePayload, SessionId, SessionListPayload, SessionListResultPayload,
@@ -1423,7 +1422,8 @@ where
         let Some(internal_session_id) = self.session_index.get(&session_id).cloned() else {
             return V070Cursor { row: 1, col: 1 };
         };
-        let Ok((_base_seq, frames)) = self.runtime.terminal_snapshot(&internal_session_id, None) else {
+        let Ok((_base_seq, frames)) = self.runtime.terminal_snapshot(&internal_session_id, None)
+        else {
             return V070Cursor { row: 1, col: 1 };
         };
         let mut screen = TerminalScreen::new(size.rows, size.cols);
@@ -4986,7 +4986,14 @@ fn read_session_git_snapshot(
         let active_upload_targets_ref = active_upload_targets;
         let parallel_results: Vec<
             Result<
-                (PathBuf, Option<String>, Option<String>, bool, Vec<SessionGitFileChangePayload>, Vec<SessionGitFileChangePayload>),
+                (
+                    PathBuf,
+                    Option<String>,
+                    Option<String>,
+                    bool,
+                    Vec<SessionGitFileChangePayload>,
+                    Vec<SessionGitFileChangePayload>,
+                ),
                 GitSnapshotError,
             >,
         > = std::thread::scope(|scope| {
@@ -5524,21 +5531,33 @@ fn read_git_worktrees(repo_root: &Path) -> Result<Vec<GitWorktreeInfo>, GitSnaps
 fn parse_git_worktrees(output: &str) -> Vec<GitWorktreeInfo> {
     let mut worktrees = Vec::new();
     let mut current: Option<GitWorktreeInfo> = None;
+    let mut prunable = false;
     for line in output.lines() {
         if line.trim().is_empty() {
+            // 中文注释：`git worktree list --porcelain` 会把 gitdir 已失效（目录被删/移动）的
+            // worktree 标记为 `prunable`。这些路径上跑 `git status` 必然失败，且任何单个
+            // worktree 失败都会让整个 git 面板返回 error；因此解析时就丢弃这类记录，
+            // 与 `git worktree prune` 后的结果一致，且不修改用户仓库状态。
             if let Some(worktree) = current.take() {
-                worktrees.push(normalize_git_worktree(worktree));
+                if !prunable {
+                    worktrees.push(normalize_git_worktree(worktree));
+                }
             }
+            prunable = false;
             continue;
         }
         if let Some(path) = line.strip_prefix("worktree ") {
-            if let Some(worktree) = current.replace(GitWorktreeInfo {
+            if let Some(worktree) = current.take() {
+                if !prunable {
+                    worktrees.push(normalize_git_worktree(worktree));
+                }
+            }
+            prunable = false;
+            current = Some(GitWorktreeInfo {
                 path: PathBuf::from(path),
                 branch: None,
                 head: None,
-            }) {
-                worktrees.push(normalize_git_worktree(worktree));
-            }
+            });
         } else if let Some(head) = line.strip_prefix("HEAD ") {
             if let Some(worktree) = current.as_mut()
                 && head.bytes().any(|byte| byte != b'0')
@@ -5549,10 +5568,14 @@ fn parse_git_worktrees(output: &str) -> Vec<GitWorktreeInfo> {
             && let Some(worktree) = current.as_mut()
         {
             worktree.branch = Some(short_branch_name(branch));
+        } else if line.starts_with("prunable") {
+            prunable = true;
         }
     }
-    if let Some(worktree) = current {
-        worktrees.push(normalize_git_worktree(worktree));
+    if let Some(worktree) = current.take() {
+        if !prunable {
+            worktrees.push(normalize_git_worktree(worktree));
+        }
     }
 
     worktrees
@@ -5563,6 +5586,85 @@ fn normalize_git_worktree(mut worktree: GitWorktreeInfo) -> GitWorktreeInfo {
         worktree.path = path;
     }
     worktree
+}
+
+#[cfg(test)]
+mod git_worktree_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_git_worktrees_skips_prunable_dead_worktrees() {
+        // `git worktree list --porcelain` 对 gitdir 已失效（例如 /tmp 下的临时
+        // asset worktree 被删）的登记项会输出 `prunable <reason>`。这类路径上跑
+        // `git status` 必然失败，会让整个面板返回 error；解析时必须丢弃。
+        let porcelain = "\
+worktree /srv/termd-test-invalid/repo-a
+HEAD 32503d1420cbde3dfcf1dcff73bba69953b949e7
+branch refs/heads/dev
+
+worktree /srv/termd-test-invalid/repo-a/.worktrees/feat-hardening
+HEAD 0f5142fa415dffeab463185d587a5e4c4f3ba7bc
+branch refs/heads/feat/asset-transfer-task-hardening
+
+worktree /srv/termd-test-invalid/zero-head
+HEAD 0000000000000000000000000000000000000000
+detached
+
+worktree /srv/termd-test-invalid/pruned
+HEAD 7761d45cbefa5769f7fa73715a298dbbe21ef352
+detached
+prunable gitdir file points to non-existent location
+
+worktree /srv/termd-test-invalid/pruned-bare
+HEAD dcf5fac335e435284314d72716374fd0b0bfedde
+detached
+prunable
+";
+        let worktrees = parse_git_worktrees(porcelain);
+        assert_eq!(worktrees.len(), 3, "prunable worktrees must be dropped");
+        assert!(
+            worktrees
+                .iter()
+                .all(|entry| entry.path != PathBuf::from("/srv/termd-test-invalid/pruned")),
+            "dead prunable worktree must not be reported"
+        );
+        assert!(
+            worktrees
+                .iter()
+                .all(|entry| entry.path != PathBuf::from("/srv/termd-test-invalid/pruned-bare")),
+            "bare prunable marker must also be honoured"
+        );
+
+        let main = worktrees
+            .iter()
+            .find(|entry| entry.path == PathBuf::from("/srv/termd-test-invalid/repo-a"))
+            .expect("live main worktree must be kept");
+        assert_eq!(main.branch.as_deref(), Some("dev"));
+        assert_eq!(main.head.as_deref(), Some("32503d1"));
+
+        let linked = worktrees
+            .iter()
+            .find(|entry| {
+                entry.path
+                    == PathBuf::from("/srv/termd-test-invalid/repo-a/.worktrees/feat-hardening")
+            })
+            .expect("live linked worktree must be kept");
+        assert_eq!(
+            linked.branch.as_deref(),
+            Some("feat/asset-transfer-task-hardening")
+        );
+        assert_eq!(linked.head.as_deref(), Some("0f5142f"));
+
+        let unborn = worktrees
+            .iter()
+            .find(|entry| entry.path == PathBuf::from("/srv/termd-test-invalid/zero-head"))
+            .expect("live unborn worktree must be kept");
+        assert_eq!(unborn.branch, None);
+        assert_eq!(
+            unborn.head, None,
+            "all-zero HEAD must not become a fake hash"
+        );
+    }
 }
 
 fn read_git_worktree_changes(

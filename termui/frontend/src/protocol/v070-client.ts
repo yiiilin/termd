@@ -140,7 +140,8 @@ export class V070Client {
     this.deviceId = device.device_id;
     this.tokens = new AccessTokenManager(server, device);
     this.transport = transport ?? new WorkspaceTransport(server.url, this.tokens, this.diagnosticId);
-    this.jsonRequest = request ?? ((path, payload) => this.requestJson(path, payload));
+    this.jsonRequest =
+      request ?? ((path, payload, timeoutMs) => this.requestJson(path, payload, timeoutMs));
     this.httpRequest = httpRequest ?? ((path, init) => this.requestAuthorized(path, init));
     this.transport.onMetadata = (data) => this.handleMetadata(data);
     this.transport.onTerminal = (data) => this.handleTerminal(data);

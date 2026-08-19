@@ -1383,4 +1383,80 @@ describe("V070Client", () => {
     expect(rawSignals.every((signal) => !signal?.aborted)).toBe(true);
     client.close();
   });
+
+  it("uses the git-specific request timeout through the default jsonRequest wrapper", async () => {
+    vi.useFakeTimers();
+    const device = await generateDeviceIdentity("00000000-0000-0000-0000-000000000071");
+    const transport = {
+      onMetadata: undefined as ((data: unknown) => void) | undefined,
+      onTerminal: undefined as ((data: unknown) => void) | undefined,
+      onMetadataClose: undefined as (() => void) | undefined,
+      onTerminalClose: undefined as (() => void) | undefined,
+      connectMetadata: vi.fn(async () => undefined),
+      reconnectMetadata: vi.fn(async () => undefined),
+      openTerminal: vi.fn(async () => undefined),
+      closeTerminal: vi.fn(),
+      close: vi.fn(),
+      sendTerminal: vi.fn(),
+    };
+    const gitSignals: Array<AbortSignal | null | undefined> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname.endsWith("/api/auth/challenge")) {
+        return Response.json({ challenge: "challenge-a" });
+      }
+      if (url.pathname.endsWith("/api/auth/access-token")) {
+        return Response.json({
+          access_token: "access.claims.signature",
+          expires_at_ms: Date.now() + 60_000,
+          refresh_at_ms: Date.now() + 50_000,
+        });
+      }
+      if (url.pathname.endsWith("/api/control/session/session-a/git")) {
+        gitSignals.push(init.signal);
+        return new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      }
+      throw new Error(`unexpected request: ${url.pathname} ${init.method}`);
+    }));
+    // 不传入自定义 request，走默认 jsonRequest wrapper；默认超时设为 5ms。
+    const client = new V070Client(
+      {
+        server_id: "00000000-0000-0000-0000-000000000070",
+        daemon_public_key: "ed25519-v1:daemon",
+        url: "wss://relay.example/ws",
+        paired_at_ms: 1,
+        device_certificate: "device.certificate.signature",
+      },
+      device,
+      transport,
+      undefined,
+      undefined,
+      5,
+    );
+
+    const gitPromise = client.getSessionGit("session-a");
+    // 在触发超时前挂载 catch，避免 advanceTimers 产生的 rejection 被 vitest 视为未处理。
+    const errorCapture = gitPromise.catch((e) => e);
+    // 让 auth 请求先完成，git 请求真正发出。
+    await vi.advanceTimersByTimeAsync(100);
+    expect(gitSignals).toHaveLength(1);
+
+    // 默认 5ms 超时已经过去，git 请求必须仍然存活（使用 20s 专用超时）。
+    await vi.advanceTimersByTimeAsync(50);
+    expect(gitSignals[0]?.aborted).toBe(false);
+
+    // 20s 专用超时到达后请求必须被中止并报 response_timeout。
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(gitSignals[0]?.aborted).toBe(true);
+    const error = await errorCapture;
+    expect(error).toMatchObject({ code: "response_timeout" });
+
+    client.close();
+  });
 });
