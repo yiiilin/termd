@@ -1212,7 +1212,8 @@ test("版本号徽标点击后显示版本信息弹窗", async ({ page }) => {
   await badge.click();
   const dialog = page.getByRole("dialog", { name: "Version update" });
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByText("Current version")).toBeVisible();
+  // 弹窗内每个组件行展示 `vX.Y.Z` 版本号；行数随 relay 组件状态变化，取第一个即可。
+  await expect(dialog.getByText(/^v\d+\.\d+\.\d+$/).first()).toBeVisible();
   const releaseLink = dialog.getByRole("link", { name: "View GitHub release" });
   await expect(releaseLink).toHaveAttribute("href", /^https:\/\/github\.com\/yiiilin\/termd\/releases/);
 });
