@@ -2846,6 +2846,7 @@ mod tests {
             network_tx_bytes: 3 * 1024 * 1024,
             process_count: 42,
             atop_available: false,
+            version: Some("0.9.30".to_owned()),
         });
     }
 
